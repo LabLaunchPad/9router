@@ -390,6 +390,27 @@ Two further rules, both about not degrading silently:
   the comparison, rather than comparing the commit against itself. The SLO
   gate, which is the point of the workflow on a push, is unaffected.
 
+#### What this replaces
+
+The repository already had `tests/__baseline__/known-fails.txt` and
+`tests/__baseline__/verify-no-regression.mjs`: a static list of the tests
+that were known to fail, and a script that failed a test which was not on
+it. Nothing in the repository invokes either — the list is a snapshot of
+one run, and it is out of date: it names 24 failures, and the suite
+currently fails far more than that, including tests that are on the list
+and no longer fail.
+
+A static list is the wrong tool for the same reason the drift gate is the
+right one. A list of "known failures" is a snapshot of a moment, and a test
+that is on it is invisible to the gate forever — including after the
+failure it names has been fixed, and including after the failure has
+*changed*. Comparing against the base commit instead means the baseline
+moves with the code, and a test that was already broken is compared
+rather than exempted.
+
+The two files are left in place rather than deleted, because they are the
+repository's, not this branch's. Do not rely on them.
+
 The comparison itself:
 
 - The **set of failing tests** is compared, not just the count, and not just
