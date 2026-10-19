@@ -231,26 +231,41 @@ describe("writeSnapshot / readSnapshot", () => {
 // --- restore ---------------------------------------------------------------
 
 describe("restoreSnapshot", () => {
-  it("restores pending request counts", () => {
+  it("restores the dropped-on-restart counters", () => {
     const g = freshGlobals();
     const snap = buildSnapshot({
       ...g,
-      _pendingRequests: { byModel: { "m|p": 4 }, byAccount: {} },
+      _pendingRequests: { byModel: { "m (p)": 4 }, byAccount: {} },
     });
     const restored = restoreSnapshot(snap, g);
     expect(restored).toBe(true);
-    expect(g._pendingRequests.byModel["m|p"]).toBe(4);
+    // The persisted counts describe requests that were killed by the restart.
+    // They are reported separately; the live in-flight gauge stays truthful.
+    expect(g._droppedOnRestart.byModel["m (p)"]).toBe(4);
+    expect(g._pendingRequests.byModel["m (p)"]).toBeUndefined();
   });
 
-  it("merges rather than replaces, keeping newer live counts", () => {
+  it("does not inflate the live in-flight gauge", () => {
     const g = freshGlobals();
-    g._pendingRequests.byModel["m|p"] = 9;
     const snap = buildSnapshot({
       ...g,
-      _pendingRequests: { byModel: { "m|p": 2 }, byAccount: {} },
+      _pendingRequests: { byModel: { "m (p)": 4 }, byAccount: {} },
     });
     restoreSnapshot(snap, g);
-    expect(g._pendingRequests.byModel["m|p"]).toBe(9);
+    // Nothing ever decrements a counter for a request that no longer exists,
+    // so restoring into the live gauge would make it permanently non-zero.
+    expect(g._pendingRequests.byModel).toEqual({});
+  });
+
+  it("keeps the live in-flight gauge untouched when there is nothing dropped", () => {
+    const g = freshGlobals();
+    g._pendingRequests.byModel["m (p)"] = 9;
+    const snap = buildSnapshot({
+      ...g,
+      _pendingRequests: { byModel: {}, byAccount: {} },
+    });
+    restoreSnapshot(snap, g);
+    expect(g._pendingRequests.byModel["m (p)"]).toBe(9);
   });
 
   it("restores the last error provider when newer than the live value", () => {
@@ -273,11 +288,11 @@ describe("restoreSnapshot", () => {
     const g = freshGlobals();
     const snap = buildSnapshot({
       ...g,
-      _pendingRequests: { byModel: { "m|p": 4 }, byAccount: {} },
+      _pendingRequests: { byModel: { "m (p)": 4 }, byAccount: {} },
     });
     restoreSnapshot(snap, g);
     restoreSnapshot(snap, g);
-    expect(g._pendingRequests.byModel["m|p"]).toBe(4);
+    expect(g._droppedOnRestart.byModel["m (p)"]).toBe(4);
   });
 
   it("returns false for a null snapshot", () => {

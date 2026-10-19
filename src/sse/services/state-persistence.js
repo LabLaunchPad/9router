@@ -113,7 +113,13 @@ function sanitizeRingEntry(entry) {
 
 /**
  * Sanitise the pending-request counters.
- * Structure: { byModel: { "<model>|<provider>": number }, byAccount: { "<connectionId>": { "<model>|<provider>": number } } }
+ *
+ * Structure: { byModel: { "<model> (<provider>)": number },
+ *              byAccount: { "<connectionId>": { "<model> (<provider>)": number } } }
+ *
+ * The key shape is the one the producer builds in
+ * src/lib/db/repos/usageRepo.js: `${model} (${provider})` — a parenthesised
+ * provider, not a `|`-separated one.
  *
  * Only counts are kept — no identifiers beyond model/connection keys, which
  * are already operational identifiers (not user data).
@@ -190,13 +196,24 @@ function stateFilePath() {
   return path.join(CONFIG.dir, CONFIG.fileName);
 }
 
+// Every write gets its own temp file. Two writers must never share a path:
+// the periodic async writer and the synchronous shutdown writer can overlap,
+// and a shared path means the shutdown snapshot is truncated by the other
+// writer (or vice versa) — the async rename then fails with ENOENT and the
+// file on disk is the wrong snapshot.
+let tempCounter = 0;
+function tempFilePath(tag = "w") {
+  tempCounter += 1;
+  return `${stateFilePath()}.${process.pid}.${tag}.${tempCounter}.tmp`;
+}
+
 /**
  * Write a snapshot atomically: temp file -> fsync -> rename.
  * @param {object} snapshot
  */
 export async function writeSnapshot(snapshot) {
   const target = stateFilePath();
-  const tmp = `${target}.${process.pid}.tmp`;
+  const tmp = tempFilePath();
 
   await fs.mkdir(CONFIG.dir, { recursive: true });
 
@@ -213,11 +230,23 @@ export async function writeSnapshot(snapshot) {
       // The rename is still atomic, so this is a durability nicety, not a
       // correctness requirement.
     }
+  } catch (err) {
+    // Never leave a stray temp file behind: a crashed or interrupted write
+    // would otherwise leak one file per restart into the state directory.
+    await handle.close().catch(() => {});
+    await fs.rm(tmp, { force: true }).catch(() => {});
+    throw err;
   } finally {
-    await handle.close();
+    await handle.close().catch(() => {});
   }
 
-  await fs.rename(tmp, target);
+  try {
+    await fs.rename(tmp, target);
+  } catch (err) {
+    // A failed rename leaks the temp file just like a failed write did.
+    await fs.rm(tmp, { force: true }).catch(() => {});
+    throw err;
+  }
   return target;
 }
 
@@ -234,12 +263,17 @@ export async function writeSnapshot(snapshot) {
  */
 export function writeSnapshotSync(snapshot) {
   const target = stateFilePath();
-  const tmp = `${target}.${process.pid}.tmp`;
+  const tmp = tempFilePath("sync");
 
   fsSync.mkdirSync(CONFIG.dir, { recursive: true });
 
   const payload = JSON.stringify(snapshot, null, 2);
-  const fd = fsSync.openSync(tmp, "w");
+  let fd;
+  try {
+    fd = fsSync.openSync(tmp, "w");
+  } catch (err) {
+    throw err;
+  }
   try {
     fsSync.writeFileSync(fd, payload, "utf8");
     try {
@@ -247,11 +281,21 @@ export function writeSnapshotSync(snapshot) {
     } catch {
       // Not every filesystem supports fsync; the rename below is still atomic.
     }
+  } catch (err) {
+    try { fsSync.closeSync(fd); } catch { /* ignore */ }
+    try { fsSync.rmSync(tmp, { force: true }); } catch { /* ignore */ }
+    throw err;
   } finally {
-    fsSync.closeSync(fd);
+    try { fsSync.closeSync(fd); } catch { /* ignore */ }
   }
 
-  fsSync.renameSync(tmp, target);
+  try {
+    fsSync.renameSync(tmp, target);
+  } catch (err) {
+    // A failed rename leaks the temp file just like a failed write did.
+    try { fsSync.rmSync(tmp, { force: true }); } catch { /* ignore */ }
+    throw err;
+  }
   return target;
 }
 
@@ -290,35 +334,27 @@ export async function readSnapshot() {
 /**
  * Restore a persisted snapshot into the live globals.
  * Idempotent: restoring twice yields the same result.
+ *
+ * The persisted pending counters describe requests that were in flight when
+ * the previous process stopped — they were killed by the restart and will
+ * never complete. Restoring them into the live in-flight gauge would make
+ * `pendingRequests` permanently non-zero (nothing ever decrements a counter
+ * for a request that no longer exists), so they are restored as a separate
+ * "dropped on restart" figure instead. The live gauge stays truthful.
+ *
  * @returns {boolean} true when state was restored
  */
 export function restoreSnapshot(snapshot, globals = global) {
   if (!snapshot || typeof snapshot !== "object") return false;
 
   try {
-    if (snapshot.pendingRequests) {
-      if (!globals._pendingRequests) {
-        globals._pendingRequests = { byModel: {}, byAccount: {} };
-      }
-      // Merge rather than replace so in-flight counters that appeared after
-      // the snapshot are not lost.
-      for (const [k, v] of Object.entries(snapshot.pendingRequests.byModel || {})) {
-        globals._pendingRequests.byModel[k] = Math.max(
-          globals._pendingRequests.byModel[k] || 0,
-          v,
-        );
-      }
-      for (const [connId, models] of Object.entries(snapshot.pendingRequests.byAccount || {})) {
-        if (!globals._pendingRequests.byAccount[connId]) {
-          globals._pendingRequests.byAccount[connId] = {};
-        }
-        for (const [k, v] of Object.entries(models || {})) {
-          globals._pendingRequests.byAccount[connId][k] = Math.max(
-            globals._pendingRequests.byAccount[connId][k] || 0,
-            v,
-          );
-        }
-      }
+    const dropped = snapshot.pendingRequests;
+    if (dropped && (Object.keys(dropped.byModel || {}).length || Object.keys(dropped.byAccount || {}).length)) {
+      globals._droppedOnRestart = {
+        at: snapshot.persistedAt || null,
+        byModel: { ...(dropped.byModel || {}) },
+        byAccount: { ...(dropped.byAccount || {}) },
+      };
     }
 
     if (snapshot.lastErrorProvider?.provider) {
@@ -338,13 +374,19 @@ export function restoreSnapshot(snapshot, globals = global) {
         globals._recentRing = { items: [], initialized: false };
       }
       if (!globals._recentRing.initialized) {
-        globals._recentRing.items = snapshot.recentRing.items;
-        globals._recentRing.initialized = true;
+        // Deliberately NOT setting `initialized` here: usageRepo's
+        // ensureRingInitialized() uses that flag to decide whether to
+        // rehydrate the ring from SQLite. Claiming it here would silently
+        // discard the persisted request history.
+        globals._recentRing.items = [
+          ...snapshot.recentRing.items,
+          ...(globals._recentRing.items || []),
+        ].slice(-CONFIG.maxRingEntries);
       }
     }
 
     structuredInfo("sse_state_restored", {
-      pendingModels: Object.keys(snapshot.pendingRequests?.byModel || {}).length,
+      droppedModels: Object.keys(dropped?.byModel || {}).length,
       hasErrorProvider: Boolean(snapshot.lastErrorProvider?.provider),
       ringRestored: Boolean(snapshot.recentRing?.items?.length),
     });
@@ -361,7 +403,10 @@ export function restoreSnapshot(snapshot, globals = global) {
 
 let handlersRegistered = false;
 let snapshotTimer = null;
+let snapshotInterval = null;
 let pendingSnapshot = false;
+// References to what we attached, so __resetForTests() can detach it.
+const attachedHandlers = {};
 
 /**
  * Persist a snapshot now (async, non-blocking).
@@ -421,6 +466,15 @@ export async function restorePersistedState() {
  * listener; otherwise the app's own shutdown handler owns the exit and this
  * one just makes sure the snapshot is on disk first.
  *
+ * `process.on` is used rather than `process.once` on purpose. With
+ * `process.once`, Node removes the listener from the array *before* the
+ * handler body runs, so `process.listeners(signal).length` inside the handler
+ * counts only the OTHER listeners — which made the "am I the only listener?"
+ * check below fire even when the app had its own SIGTERM handler, and
+ * `process.exit(0)` truncated the app's cleanup (killing the cloudflared
+ * tunnel and the MCP bridges). The `handlersRegistered` guard is what
+ * prevents double registration; `process.once` was never needed for that.
+ *
  * @param {object} [options]
  * @param {boolean} [options.exitIfSoleListener=true] exit when no other handler owns the shutdown
  */
@@ -436,7 +490,8 @@ export function registerStatePersistence(options = {}) {
     if (persistedForShutdown) return;
     persistedForShutdown = true;
 
-    structuredInfo("sse_state_shutdown_signal", { signal });
+    structuredInfo("sse_state_shutdown_signal", { signal, pendingDebounce: pendingSnapshot });
+    pendingSnapshot = false;
     try {
       const snapshot = buildSnapshot();
       const target = writeSnapshotSync(snapshot);
@@ -449,19 +504,25 @@ export function registerStatePersistence(options = {}) {
     }
 
     // If nothing else handles the signal, the process would ignore it and
-    // hang instead of terminating the way it would have without us.
+    // hang instead of terminating the way it would have without us. With
+    // process.on, this handler is still in the listener list, so "length <= 1"
+    // means "this handler and nothing else".
     if (exitIfSoleListener && process.listeners(signal).length <= 1) {
       process.exit(0);
     }
   };
 
-  process.once("SIGTERM", () => onSignal("SIGTERM"));
-  process.once("SIGINT", () => onSignal("SIGINT"));
+  const onSigterm = () => onSignal("SIGTERM");
+  const onSigint = () => onSignal("SIGINT");
+  attachedHandlers.SIGTERM = onSigterm;
+  attachedHandlers.SIGINT = onSigint;
+  process.on("SIGTERM", onSigterm);
+  process.on("SIGINT", onSigint);
 
   // Periodic background snapshot so an ungraceful crash loses at most one
   // debounce window of state.
-  const interval = setInterval(() => scheduleSnapshot(), CONFIG.snapshotDebounceMs);
-  interval.unref?.();
+  snapshotInterval = setInterval(() => scheduleSnapshot(), CONFIG.snapshotDebounceMs);
+  snapshotInterval.unref?.();
 
   structuredInfo("sse_state_persistence_registered", {
     dir: CONFIG.dir,
@@ -474,6 +535,10 @@ export function registerStatePersistence(options = {}) {
 
 /**
  * Test helper: reset module-level scheduling state.
+ *
+ * Detaches everything this module registered. Clearing the `handlersRegistered`
+ * flag without removing the listeners would let a second registration attach
+ * another pair, so the handlers would accumulate across tests.
  */
 export function __resetForTests() {
   handlersRegistered = false;
@@ -481,6 +546,17 @@ export function __resetForTests() {
   if (snapshotTimer) {
     clearTimeout(snapshotTimer);
     snapshotTimer = null;
+  }
+  if (snapshotInterval) {
+    clearInterval(snapshotInterval);
+    snapshotInterval = null;
+  }
+  for (const signal of ["SIGTERM", "SIGINT"]) {
+    const fn = attachedHandlers[signal];
+    if (fn) {
+      process.removeListener(signal, fn);
+      delete attachedHandlers[signal];
+    }
   }
 }
 
