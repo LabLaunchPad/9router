@@ -55,8 +55,15 @@ const CONFIG = {
 
   // A kill switch. The rollback table in the PR advertises this variable, so
   // it has to exist: an operator needs a way to stop the state file being
-  // written without a redeploy. It stops the writes AND the restore; it does
-  // NOT remove a state file that already exists.
+  // written.
+  //
+  // It stops the writes AND the restore; it does NOT remove a state file that
+  // already exists.
+  //
+  // It is read ONCE, here, when this module is loaded — so it takes effect at
+  // the next process start, and a RUNNING process has to be restarted for it
+  // to apply. It is not a live switch, and it cannot be one without reading
+  // the environment on every call instead of caching it here.
   persistEnabled: process.env.SSE_STATE_PERSIST_DISABLED !== "true",
 
   // Max ring entries to persist when enabled.
@@ -147,9 +154,16 @@ function sanitizeRingEntry(entry) {
  *
  * A ring entry carries no id of its own — the allow-list keeps only
  * timestamp/provider/model/connectionId/endpoint/cost/status/tokens — so the
- * identity is the entry's own content. The `tokens` bag is an object, so its
- * keys are sorted before it is serialised: two bags with the same pairs in a
- * different order are the same entry.
+ * identity is the entry's own *persisted* content. The `tokens` bag is an
+ * object, so its keys are sorted before it is serialised: two bags with the
+ * same pairs in a different order are the same entry.
+ *
+ * The credential is deliberately NOT part of the identity. Live ring entries
+ * carry an `apiKey` (`src/lib/db/repos/usageRepo.js`), and it is not
+ * persisted, so two live entries that differ only by credential collapse to
+ * the same key. That is safe because the union only ever drops *persisted*
+ * entries: live entries are never removed from one another, and a persisted
+ * twin of a live entry is the one that is dropped.
  *
  * The trade-off is that two genuinely identical requests — the same
  * millisecond, the same model, the same cost — collapse into one. The ring
@@ -475,8 +489,15 @@ export function restoreSnapshot(snapshot, globals = global) {
         const fresh = [];
         for (const item of snapshot.recentRing.items) {
           const key = ringEntryKey(item);
-          // An entry with no content has no identity; keeping it would let
-          // it be added again on every restore.
+          // The key is derived from the entry's own persisted content, so an
+          // entry that is already in the ring produces the same key and is
+          // skipped. That is what makes the merge idempotent.
+          //
+          // The empty-key branch is the belt to that braces: `ringEntryKey`
+          // only returns "" for a value that is not an object, which a
+          // snapshot entry never is — an object with none of the allow-listed
+          // fields still produces a key. So for every entry that can reach
+          // here, the skip is the duplicate check, not the empty-key check.
           if (!key || existing.has(key)) continue;
           existing.add(key);
           fresh.push(item);
