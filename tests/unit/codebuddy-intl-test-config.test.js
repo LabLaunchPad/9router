@@ -13,13 +13,21 @@
 import { describe, it, expect } from "vitest";
 import fs from "fs";
 import path from "path";
+import { fileURLToPath } from "url";
 
 // Read the source file and verify the config entry is present.
 // testUtils.js is a Next.js server file so we inspect the source text
 // rather than importing it (avoids next/server bootstrap requirements).
 
+// The path is resolved from THIS FILE's own location, not from the process
+// working directory. The suite is run from the repository root, so the
+// cwd-relative path this used to use ("../src/...") resolved to
+// <drive>:/src/... and the file was not found — the suite failed to
+// collect this file instead of reporting anything useful.
+const repoRoot = path.resolve(fileURLToPath(new URL("../..", import.meta.url)));
+
 const src = fs.readFileSync(
-  path.resolve("../src/app/api/providers/[id]/test/testUtils.js"),
+  path.join(repoRoot, "src/app/api/providers/[id]/test/testUtils.js"),
   "utf-8"
 );
 

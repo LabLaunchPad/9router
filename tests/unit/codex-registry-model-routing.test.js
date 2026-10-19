@@ -15,13 +15,21 @@
 import { describe, it, expect } from "vitest";
 import fs from "fs";
 import path from "path";
+import { fileURLToPath } from "url";
 
-// ── #4202 Registry checks ────────────────────────────────────────────────────
+// The path is resolved from THIS FILE's own location, not from the process
+// working directory. The suite is run from the repository root, so the
+// cwd-relative path this used to use ("../open-sse/...") resolved to
+// <drive>:/open-sse/... and the file was not found — the suite failed to
+// collect this file instead of reporting anything useful.
+const repoRoot = path.resolve(fileURLToPath(new URL("../..", import.meta.url)));
 
 const codexSrc = fs.readFileSync(
-  path.resolve("../open-sse/providers/registry/codex.js"),
+  path.join(repoRoot, "open-sse/providers/registry/codex.js"),
   "utf-8"
 );
+
+// ── #4202 Registry checks ────────────────────────────────────────────────────
 
 describe("Codex registry — ghost models removed (#4202)", () => {
   it("gpt-5.4 is removed", () => {

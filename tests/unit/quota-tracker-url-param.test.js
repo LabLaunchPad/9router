@@ -15,9 +15,20 @@
 import { describe, it, expect } from "vitest";
 import fs from "fs";
 import path from "path";
+import { fileURLToPath } from "url";
+
+// The path is resolved from THIS FILE's own location, not from the process
+// working directory. The suite is run from the repository root, so the
+// cwd-relative path this used to use ("../src/...") resolved to
+// <drive>:/src/... and the file was not found — the suite failed to
+// collect this file instead of reporting anything useful.
+const repoRoot = path.resolve(fileURLToPath(new URL("../..", import.meta.url)));
 
 const src = fs.readFileSync(
-  path.resolve("../src/app/(dashboard)/dashboard/usage/components/ProviderLimits/index.js"),
+  path.join(
+    repoRoot,
+    "src/app/(dashboard)/dashboard/usage/components/ProviderLimits/index.js"
+  ),
   "utf-8"
 );
 
