@@ -8,7 +8,9 @@
  *   1 -> deployment blocked (fail-closed on missing/invalid data by default)
  *   2 -> warning: manual approval required
  *
- * All thresholds are environment-configurable; see `docs/SLO_GATE.md`.
+ * All thresholds are environment-configurable; see
+ * `PRODUCTION_READINESS_CONTROLS.md` (section "SLO Validation Gate") for the
+ * full variable table, the window semantics and the rollback procedure.
  *
  * Security: this script only reads metrics. It never logs secrets, request
  * bodies, or user data.
@@ -401,31 +403,40 @@ export function evaluate({ metricsText = null, fetchError = null, cfg = CONFIG }
   // deploy restarts the service, so the age at gate time is seconds old
   // and an enforcing check would block every deploy.
   const sampleAge = parseMetric(metricsText, "sse_metrics_sample_age_seconds");
-  const sampleAgeNote =
-    sampleAge === null
-      ? "sample age unknown (the endpoint does not publish sse_metrics_sample_age_seconds)"
-      : `sample covers ${Math.round(sampleAge)}s of the ${cfg.windowSeconds}s window`;
+  const ageUnknown = sampleAge === null;
+  const sampleAgeNote = ageUnknown
+    ? "sample age unknown (the endpoint does not publish sse_metrics_sample_age_seconds)"
+    : `sample covers ${Math.round(sampleAge)}s of the ${cfg.windowSeconds}s window`;
 
-  if (cfg.minSampleSeconds > 0 && sampleAge !== null && sampleAge < cfg.minSampleSeconds) {
+  // An explicitly-enabled check must not be silently bypassed by an
+  // endpoint that does not publish the age gauge. The operator turned the
+  // check ON; an endpoint that cannot answer the question is not a pass,
+  // it is an unknown. (With the checks off — the default — an unknown age
+  // is reported and nothing else changes.)
+  if (cfg.minSampleSeconds > 0 && (ageUnknown || sampleAge < cfg.minSampleSeconds)) {
     return {
       decision: cfg.failClosed ? "block" : "warn",
       exitCode: cfg.failClosed ? 1 : 0,
-      reason:
-        `SLO sample covers only ${Math.round(sampleAge)}s, below the required minimum of ` +
-        `${cfg.minSampleSeconds}s — the metric has too little data to judge`,
+      reason: ageUnknown
+        ? `SLO sample age is unknown — the required minimum of ${cfg.minSampleSeconds}s ` +
+          "cannot be verified (the endpoint does not publish sse_metrics_sample_age_seconds)"
+        : `SLO sample covers only ${Math.round(sampleAge)}s, below the required minimum of ` +
+          `${cfg.minSampleSeconds}s — the metric has too little data to judge`,
       consumedPercent: parsed.consumedPercent,
       override: false,
       source: parsed.source,
     };
   }
 
-  if (cfg.requireFullWindow && sampleAge !== null && sampleAge < cfg.windowSeconds) {
+  if (cfg.requireFullWindow && (ageUnknown || sampleAge < cfg.windowSeconds)) {
     return {
       decision: cfg.failClosed ? "block" : "warn",
       exitCode: cfg.failClosed ? 1 : 0,
-      reason:
-        `SLO sample covers only ${Math.round(sampleAge)}s of the ${cfg.windowSeconds}s window — ` +
-        "the sample has to span the whole SLO window (SLO_REQUIRE_FULL_WINDOW=true)",
+      reason: ageUnknown
+        ? "SLO sample age is unknown — the sample cannot be shown to span the " +
+          `${cfg.windowSeconds}s window (the endpoint does not publish sse_metrics_sample_age_seconds)`
+        : `SLO sample covers only ${Math.round(sampleAge)}s of the ${cfg.windowSeconds}s window — ` +
+          "the sample has to span the whole SLO window (SLO_REQUIRE_FULL_WINDOW=true)",
       consumedPercent: parsed.consumedPercent,
       override: false,
       source: parsed.source,

@@ -463,6 +463,48 @@ describe("SLO gate evaluate()", () => {
     expect(r.reason).toMatch(/sample age unknown/i);
   });
 
+  it("does NOT block on an unknown age by default", () => {
+    // The default must not depend on a gauge that many endpoints do not
+    // publish — otherwise the gate blocks every deploy against a
+    // Prometheus that does not expose it.
+    const r = evaluate({ metricsText: metricsWithBudgetConsumed(0.1), cfg });
+    expect(r.decision).toBe("allow");
+    expect(r.exitCode).toBe(0);
+  });
+
+  it("blocks on an unknown age when the operator explicitly required a full window", () => {
+    // An explicitly-enabled check must not be silently bypassed by an
+    // endpoint that cannot answer the question. The operator turned the
+    // check on; an unknown is not a pass.
+    const r = evaluate({
+      metricsText: metricsWithBudgetConsumed(0.1),
+      cfg: { ...cfg, requireFullWindow: true },
+    });
+    expect(r.decision).toBe("block");
+    expect(r.exitCode).toBe(1);
+    expect(r.reason).toMatch(/unknown/i);
+  });
+
+  it("blocks on an unknown age when the operator explicitly required a minimum sample", () => {
+    const r = evaluate({
+      metricsText: metricsWithBudgetConsumed(0.1),
+      cfg: { ...cfg, minSampleSeconds: 300 },
+    });
+    expect(r.decision).toBe("block");
+    expect(r.exitCode).toBe(1);
+    expect(r.reason).toMatch(/unknown/i);
+  });
+
+  it("warns instead of blocking on an unknown age when the gate fails open", () => {
+    const r = evaluate({
+      metricsText: metricsWithBudgetConsumed(0.1),
+      cfg: { ...cfg, failClosed: false, minSampleSeconds: 300 },
+    });
+    expect(r.decision).toBe("warn");
+    expect(r.exitCode).toBe(0);
+    expect(r.reason).toMatch(/unknown/i);
+  });
+
   it("the override also wins over unavailable SLO data", () => {
     const r = evaluate({
       fetchError: "HTTP 500",
