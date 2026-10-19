@@ -11,6 +11,8 @@ import {
   computeErrorBudgetConsumed,
   instrumentHandler,
   resetMetrics,
+  endpointTemplate,
+  getDroppedSeriesCount,
   LATENCY_BUCKETS,
 } from "../../src/sse/services/metrics.js";
 
@@ -232,5 +234,101 @@ describe("instrumentHandler", () => {
     const wrapped = instrumentHandler(async () => new Response("ok"), { endpoint: "/static" });
     await wrapped(fakeRequest());
     expect(getMetricsSnapshot().counters['sse_requests_total{status="2xx",endpoint="/static"}']).toBe(1);
+  });
+});
+
+// --- the endpoint label is a route template, not a path ---------------------
+
+describe("endpointTemplate", () => {
+  it("maps the known routes onto themselves", () => {
+    expect(endpointTemplate("/v1/chat/completions")).toBe("/v1/chat/completions");
+    expect(endpointTemplate("/v1/messages")).toBe("/v1/messages");
+    expect(endpointTemplate("/v1/responses")).toBe("/v1/responses");
+    expect(endpointTemplate("/v1/responses/compact")).toBe("/v1/responses/compact");
+    expect(endpointTemplate("/v1/api/chat")).toBe("/v1/api/chat");
+    expect(endpointTemplate("/api/v1beta/models")).toBe("/api/v1beta/models");
+  });
+
+  it("collapses a client-chosen path onto a template", () => {
+    // The catch-all route accepts an arbitrary suffix, and the suffix is
+    // chosen by the caller.
+    expect(endpointTemplate("/api/v1beta/models/gemini-2.0-flash:generateContent")).toBe(
+      "/api/v1beta/models",
+    );
+    expect(endpointTemplate("/api/v1beta/models/a/b/c/d/e")).toBe("/api/v1beta/models");
+  });
+
+  it("does not let a longer path smuggle a new template past a shorter one", () => {
+    // `/v1/responses/compact` must not be matched by `/v1/responses`.
+    expect(endpointTemplate("/v1/responses/compact")).toBe("/v1/responses/compact");
+  });
+
+  it("collapses an unknown path to a single value", () => {
+    expect(endpointTemplate("/whatever/this/is")).toBe("other");
+    expect(endpointTemplate("")).toBe("other");
+    expect(endpointTemplate(undefined)).toBe("other");
+  });
+
+  it("ignores a trailing slash", () => {
+    expect(endpointTemplate("/v1/chat/completions/")).toBe("/v1/chat/completions");
+  });
+});
+
+describe("the metric registry cannot be grown by the caller", () => {
+  function requestFor(path) {
+    return { url: `https://example.test${path}` };
+  }
+
+  it("records a client-chosen path as a route template, not as a path", async () => {
+    const wrapped = instrumentHandler(async () => new Response("ok"));
+    await wrapped(requestFor("/api/v1beta/models/random-1:generateContent"));
+    const counters = getMetricsSnapshot().counters;
+    expect(counters['sse_requests_total{status="2xx",endpoint="/api/v1beta/models"}']).toBe(1);
+    // No series carries the client-chosen path.
+    expect(Object.keys(counters).some((k) => k.includes("random-1"))).toBe(false);
+  });
+
+  it("keeps the number of series bounded when every request carries a new path", async () => {
+    const wrapped = instrumentHandler(async () => new Response("ok"));
+    for (let i = 0; i < 2000; i++) {
+      await wrapped(requestFor(`/api/v1beta/models/model-${i}:generateContent`));
+    }
+    const counters = getMetricsSnapshot().counters;
+    // One template, not 2000 series.
+    expect(Object.keys(counters).length).toBeLessThan(20);
+    expect(counters['sse_requests_total{status="2xx",endpoint="/api/v1beta/models"}']).toBe(2000);
+  });
+
+  it("counts a refused series as an error rather than dropping it", () => {
+    // Fill the registry with distinct label sets.
+    for (let i = 0; i < 600; i++) {
+      incrementCounter("sse_requests_total", { status: "2xx", provider: `p${i}` });
+    }
+    expect(getDroppedSeriesCount()).toBeGreaterThan(0);
+
+    // A request that cannot have its own series is counted as an error, so
+    // the error rate the SLO gate reads cannot be understated.
+    const before = computeErrorBudgetConsumed();
+    recordRequest({ status: "2xx", provider: "brand-new-provider" });
+    const after = computeErrorBudgetConsumed();
+    expect(after).toBeGreaterThan(before);
+  });
+
+  it("counts an error whose own series cannot be created", () => {
+    // The request's series exists, but the error it produced would need a
+    // new one — and the registry is full. The error still has to be
+    // counted, or the error rate the SLO gate reads is understated.
+    incrementCounter("sse_requests_total", { status: "5xx", endpoint: "/v1/chat/completions" });
+    for (let i = 0; i < 600; i++) {
+      incrementCounter("sse_requests_total", { status: "2xx", provider: `p${i}` });
+    }
+
+    const before = computeErrorBudgetConsumed();
+    recordRequest({ status: "5xx", endpoint: "/v1/chat/completions" });
+    const after = computeErrorBudgetConsumed();
+
+    const counters = getMetricsSnapshot().counters;
+    expect(counters['sse_error_responses_total{endpoint="overflow"}']).toBe(1);
+    expect(after).toBeGreaterThan(before);
   });
 });

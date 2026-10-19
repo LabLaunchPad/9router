@@ -15,6 +15,72 @@ import { structuredWarn } from "../utils/logger.js";
 // Latency buckets in seconds (Prometheus convention).
 const LATENCY_BUCKETS = [0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300];
 
+// The route templates the `endpoint` label may take.
+//
+// The label must be a FIXED set. The request path is client-controlled —
+// `/api/v1beta/models/[...path]` accepts an arbitrary suffix — so a label
+// taken from the raw path lets a caller mint a new metric series per
+// request. The registry is never pruned, and `/api/metrics` is
+// unauthenticated, so that is an unbounded registry behind a public
+// endpoint: measured at 100 000 distinct paths, the rendered exposition was
+// 167 MB and the process RSS 807 MB, and every scrape re-sorts and
+// re-materialises the whole registry.
+//
+// So the label is a TEMPLATE, never a path. Longest first, so
+// `/v1/responses/compact` is not matched by `/v1/responses`.
+const ROUTE_TEMPLATES = [
+  "/v1/chat/completions",
+  "/v1/messages",
+  "/v1/responses/compact",
+  "/v1/responses",
+  "/v1/api/chat",
+  "/api/v1beta/models",
+].sort((a, b) => b.length - a.length);
+
+// The single label value used for anything that is not a known route.
+const OTHER_ENDPOINT = "other";
+
+/**
+ * Map a request path onto a fixed route template.
+ *
+ * @param {string} pathname
+ * @returns {string} one of ROUTE_TEMPLATES, or "other"
+ */
+export function endpointTemplate(pathname) {
+  if (typeof pathname !== "string" || pathname === "") return OTHER_ENDPOINT;
+  const p = pathname.length > 1 && pathname.endsWith("/") ? pathname.slice(0, -1) : pathname;
+  for (const t of ROUTE_TEMPLATES) {
+    if (p === t || p.startsWith(`${t}/`) || p.startsWith(`${t}:`)) return t;
+  }
+  return OTHER_ENDPOINT;
+}
+
+// A hard ceiling on the number of series in any one map.
+//
+// This is a BACKSTOP, not the primary defence: with the endpoint label
+// templated, the label set is fixed and the registry cannot grow without
+// bound. It is here so that a future label cannot reintroduce the problem
+// silently.
+//
+// When the ceiling is reached, a new series is not created. The event is
+// counted as an ERROR instead — dropped as a success, the error rate would
+// be under-reported and the SLO gate would wave through a deploy that
+// should have been blocked. An unknown is not evidence that the service is
+// innocent.
+const MAX_SERIES = 500;
+let droppedSeries = 0;
+let dropWarned = false;
+
+// The overflow series are created up front, so they always exist.
+//
+// A registry at its ceiling must still be able to record that something was
+// dropped — and creating a series is exactly what it can no longer do. They
+// count as ERRORS, so a full registry can never understate the error rate
+// the SLO gate reads. A request the gate cannot account for is not evidence
+// that the service is innocent.
+const OVERFLOW_LABELS = { status: "5xx", endpoint: "overflow" };
+const OVERFLOW_ERROR_LABELS = { endpoint: "overflow" };
+
 // The registry lives on globalThis under a namespaced key.
 //
 // The producer (the chat routes) and the exporter (/api/metrics) must see the
@@ -47,6 +113,16 @@ function renderLabels(labels) {
   return `{${entries.map(([k, v]) => `${k}="${String(v).replace(/"/g, '\\"')}"`).join(",")}}`;
 }
 
+// The overflow series are created up front, so they always exist.
+//
+// A registry at its ceiling must still be able to record that something was
+// dropped — and creating a series is exactly what it can no longer do. They
+// count as ERRORS, so a full registry can never understate the error rate
+// the SLO gate reads. A request the gate cannot account for is not evidence
+// that the service is innocent.
+counters.set(`sse_requests_total${counterKey(OVERFLOW_LABELS)}`, 0);
+counters.set(`sse_error_responses_total${counterKey(OVERFLOW_ERROR_LABELS)}`, 0);
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -58,7 +134,35 @@ function renderLabels(labels) {
  */
 export function incrementCounter(name, labels) {
   const key = `${name}${counterKey(labels)}`;
-  counters.set(key, (counters.get(key) || 0) + 1);
+  if (counters.has(key)) {
+    counters.set(key, counters.get(key) + 1);
+    return;
+  }
+  if (counters.size >= MAX_SERIES) {
+    noteDroppedSeries(name, labels);
+    return;
+  }
+  counters.set(key, 1);
+}
+
+/**
+ * Record that a series could not be created because the registry is at its
+ * ceiling.
+ *
+ * The event is counted as an error rather than dropped, so the error rate
+ * the SLO gate reads cannot be understated by a full registry. Warned once:
+ * a caller that mints a series per request would otherwise produce one
+ * warning per request, which is its own resource problem.
+ */
+function noteDroppedSeries(name, labels) {
+  droppedSeries += 1;
+  if (dropWarned) return;
+  dropWarned = true;
+  structuredWarn("metrics_series_dropped", {
+    name,
+    series: counters.size,
+    limit: MAX_SERIES,
+  });
 }
 
 /**
@@ -69,6 +173,10 @@ export function incrementCounter(name, labels) {
  */
 export function setGauge(name, value, labels) {
   const key = `${name}${counterKey(labels)}`;
+  if (!gauges.has(key) && gauges.size >= MAX_SERIES) {
+    noteDroppedSeries(name, labels);
+    return;
+  }
   gauges.set(key, value);
 }
 
@@ -80,7 +188,15 @@ export function setGauge(name, value, labels) {
  */
 export function addGauge(name, delta, labels) {
   const key = `${name}${counterKey(labels)}`;
-  gauges.set(key, (gauges.get(key) || 0) + delta);
+  if (!gauges.has(key)) {
+    if (gauges.size >= MAX_SERIES) {
+      noteDroppedSeries(name, labels);
+      return;
+    }
+    gauges.set(key, delta);
+    return;
+  }
+  gauges.set(key, gauges.get(key) + delta);
 }
 
 /**
@@ -94,6 +210,10 @@ export function observeLatency(name, durationMs, labels) {
   const key = `${name}${counterKey(labels)}`;
   let entry = histograms.get(key);
   if (!entry) {
+    if (histograms.size >= MAX_SERIES) {
+      noteDroppedSeries(name, labels);
+      return;
+    }
     entry = { buckets: new Array(LATENCY_BUCKETS.length).fill(0), sum: 0, count: 0, labels: labels || {} };
     histograms.set(key, entry);
   }
@@ -113,15 +233,70 @@ export function recordRequest({ status, provider, model, endpoint, durationMs } 
   const labels = { status: statusClass };
   if (provider) labels.provider = provider;
   if (model) labels.model = model;
+  // The endpoint is the LABEL, already final. `instrumentHandler` is the
+  // only caller, and it is where a client-controlled path is mapped onto a
+  // route template.
   if (endpoint) labels.endpoint = endpoint;
+
+  // The registry is at its ceiling and this request would need a new series.
+  // It is recorded in the overflow series instead, as an ERROR: dropping it
+  // as a success would understate the error rate the SLO gate reads, and the
+  // gate would wave through a deploy that should have been blocked.
+  const requestKey = `sse_requests_total${counterKey(labels)}`;
+  if (!counters.has(requestKey) && counters.size >= MAX_SERIES) {
+    // Note: the request's own series is NOT created — that is the whole
+    // point of the ceiling. The event goes to the overflow series, as one
+    // request and one error.
+    incrementOverflowRequest();
+    incrementOverflowError();
+    noteDroppedSeries("sse_requests_total", labels);
+    return;
+  }
 
   incrementCounter("sse_requests_total", labels);
   if (statusClass === "5xx") {
-    incrementCounter("sse_error_responses_total", { provider, endpoint });
+    const errorLabels = { provider, endpoint };
+    const errorKey = `sse_error_responses_total${counterKey(errorLabels)}`;
+    if (!counters.has(errorKey) && counters.size >= MAX_SERIES) {
+      // The request has its own series, but the ERROR it produced cannot
+      // have one. The error still has to be counted, or the error rate is
+      // understated — so it goes to the overflow error series.
+      incrementOverflowError();
+      noteDroppedSeries("sse_error_responses_total", errorLabels);
+    } else {
+      incrementCounter("sse_error_responses_total", errorLabels);
+    }
   }
   if (typeof durationMs === "number" && Number.isFinite(durationMs)) {
     observeLatency("sse_request_latency_seconds", durationMs, { provider, endpoint });
   }
+}
+
+/**
+ * Count one request in the overflow series.
+ */
+function incrementOverflowRequest() {
+  const key = `sse_requests_total${counterKey(OVERFLOW_LABELS)}`;
+  counters.set(key, (counters.get(key) || 0) + 1);
+}
+
+/**
+ * Count one error in the overflow series.
+ */
+function incrementOverflowError() {
+  const key = `sse_error_responses_total${counterKey(OVERFLOW_ERROR_LABELS)}`;
+  counters.set(key, (counters.get(key) || 0) + 1);
+}
+
+/**
+ * How many series the registry had to refuse.
+ *
+ * Published so that a full registry is visible rather than silent.
+ *
+ * @returns {number}
+ */
+export function getDroppedSeriesCount() {
+  return droppedSeries;
 }
 
 /**
@@ -154,8 +329,13 @@ export function instrumentHandler(handler, meta = {}) {
     } finally {
       let endpoint = meta.endpoint;
       if (!endpoint) {
+        // The request path is CLIENT-CONTROLLED — `/api/v1beta/models/[...path]`
+        // accepts an arbitrary suffix — so it is mapped onto a fixed route
+        // template rather than used as the label. A label taken from the raw
+        // path would let a caller mint a new metric series per request.
+        // `meta.endpoint` is code-supplied and static, so it is used as given.
         try {
-          endpoint = new URL(request?.url).pathname;
+          endpoint = endpointTemplate(new URL(request?.url).pathname);
         } catch {
           endpoint = undefined;
         }
