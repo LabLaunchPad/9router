@@ -374,9 +374,20 @@ export async function handleComboChat({ body, models, handleSingleModel, log, co
       try {
         const errorBody = await result.clone().json();
         errorText = errorBody?.error?.message || errorBody?.error || errorBody?.message || errorText;
-        retryAfter = errorBody?.retryAfter || null;
+        retryAfter = errorBody?.retryAfter || errorBody?.error?.retryAfter || null;
       } catch {
         // Ignore JSON parse errors
+      }
+
+      // The retry hint normally travels in the `retry-after` header (seconds),
+      // not in the body — that is what unavailableResponse() emits. Normalise
+      // it to an ISO timestamp so the earliest-value comparison below is
+      // meaningful and the exhausted-combo response can forward the hint.
+      if (!retryAfter) {
+        const headerSeconds = Number(result.headers?.get?.("retry-after"));
+        if (Number.isFinite(headerSeconds) && headerSeconds > 0) {
+          retryAfter = new Date(Date.now() + headerSeconds * 1000).toISOString();
+        }
       }
 
       // Track earliest retryAfter across all combo models
@@ -679,5 +690,21 @@ export async function handleFusionChat({ body, models, handleSingleModel, log, c
   // 4. Judge analyzes + writes one final answer (streams to client if requested).
   const judgeBody = appendUserTurn(body, buildJudgePrompt(answers));
   log.info("FUSION", `Judging ${answers.length} answers with ${judge}`);
-  return handleSingleModel(judgeBody, judge);
+
+  // The judge is subject to the same hard cap as the panel. Without it a hung
+  // judge stalls the request forever, which is worse than losing the
+  // synthesis: the panel answers are already in hand, so degrade to the first
+  // one instead of failing the request outright.
+  const judged = await withTimeout(handleSingleModel(judgeBody, judge), cfg.panelHardTimeoutMs);
+  if (judged?.__timeout) {
+    log.warn("FUSION", `Judge ${judge} timed out — degrading to first panel answer`);
+    return handleSingleModel(body, answers[0].model);
+  }
+  if (judged?.__error) {
+    log.warn("FUSION", `Judge ${judge} threw — degrading to first panel answer`, {
+      error: judged.__error?.message || String(judged.__error),
+    });
+    return handleSingleModel(body, answers[0].model);
+  }
+  return judged;
 }
