@@ -405,6 +405,15 @@ button:focus-visible,
   transform: translateY(0);
 }
 
+/* The skip link's target.
+   The link moves focus here programmatically (`tabIndex={-1}`), so the
+   browser's default focus ring would draw a box around the entire page.
+   This is a focus target, not an interactive control, so the ring is noise —
+   the content itself is still announced to a screen reader. */
+#main:focus {
+  outline: none;
+}
+
 /* visually-hidden utility */
 .visually-hidden {
   position: absolute !important;
