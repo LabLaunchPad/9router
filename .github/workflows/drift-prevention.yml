@@ -217,6 +217,7 @@ jobs:
         env:
           BASELINE_EXIT_CODE: ${{ steps.baseline.outputs.baseline_exit_code }}
           BASELINE_AVAILABLE: ${{ steps.baseline.outputs.baseline_available }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           if [ "$BASELINE_AVAILABLE" != "true" ]; then
             echo "::warning::No base commit for this event — the drift comparison does not apply."
@@ -325,6 +326,49 @@ jobs:
             echo "No confirmed regressions."
           else
             echo "No newly failing tests."
+          fi
+
+          # What the comparison above CANNOT see.
+          #
+          # The comparison is "failed on the change AND passed on the base".
+          # A test that fails on BOTH sides is not attributed to the change —
+          # correctly, as far as it goes, but the consequence is that a change
+          # which ALTERS a test that was already broken leaves the failing
+          # set unchanged, and the gate reports green.
+          #
+          # That is not hypothetical. This branch committed a golden snapshot
+          # recorded on Windows ("X-PLATFORM": "win32"), so the suite was red
+          # on every Linux runner — and the gate said "no newly failing
+          # tests", because the base commit has no snapshot at all and fails
+          # the same 150 cases. Both sides were equally red, so the
+          # comparison, which is about DIFFERENCES, saw nothing.
+          #
+          # The masked failures are therefore reported, and the ones in files
+          # this change touched are called out: those are the ones a reviewer
+          # has to look at. This is a warning, not a gate — a failure that was
+          # already broken is not evidence that the change broke it.
+          MASKED=$(comm -12 baseline-failing-tests.txt new-failing-tests.txt || true)
+          MASKED_COUNT=$(printf '%s\n' "$MASKED" | grep -c '[^[:space:]]' || true)
+          if [ "$MASKED_COUNT" -gt 0 ]; then
+            echo "::group::Failures on BOTH sides ($MASKED_COUNT) — not attributable to the change:"
+            echo "$MASKED"
+            echo "::endgroup::"
+            if [ -n "$BASE_SHA" ]; then
+              git diff --name-only "$BASE_SHA" HEAD > changed-files.txt 2>/dev/null || true
+              TOUCHED_MASKED=$(while read -r key; do
+                [ -z "$key" ] && continue
+                file=$(printf '%s' "$key" | sed 's/ > .*//; s/ \[ .*//')
+                if grep -Fxq "$file" changed-files.txt 2>/dev/null; then
+                  printf '%s\n' "$key"
+                fi
+              done <<< "$MASKED")
+              if [ -n "$TOUCHED_MASKED" ]; then
+                echo "::warning::$MASKED_COUNT tests fail on both the base and the change. The comparison sees differences, so a change that ALTERS an already-broken test is invisible to it. These are in files this change touched:"
+                echo "::group::Masked failures in files this change touched:"
+                printf '%s\n' "$TOUCHED_MASKED"
+                echo "::endgroup::"
+              fi
+            fi
           fi
 
           # Unresolvable imports, compared the same way. This repository has
