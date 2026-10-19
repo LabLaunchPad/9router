@@ -1,0 +1,353 @@
+{
+  "$schema": "http://json-schema.org/schema/draft-07",
+  "generatedAt": "2026-10-19T00:00:00Z",
+  "repository": "C:\\9router",
+  "version": "0.5.104",
+  "systemStatus": "NOT_PRODUCTION_READY",
+  "productionReadinessScore": 45,
+  "scoreJustification": "Critical production gaps exist across circuit breaking, observability (metrics/logs), health checking, and state persistence. Core functionality works but system lacks reliability guarantees required for production deployment.",
+  "assessmentDate": "2026-10-19",
+  
+  "1_currentStateAssessment": {
+    "lowPriorityItems": {
+      "chaosEngineeringTestSuite10hrs": {
+        "status": "NOT_STARTED",
+        "description": "No chaos engineering test suite exists. SRE_ADR.md and SRE_summary.json both identify chaos engineering as MEDIUM priority with recommended experiments but no test implementation.",
+        "evidence": ["SRE_summary.json chaossEngineering.currentFailureInjectionPoints lists 7 points", "SRE_summary.json chaosEngineering.recommendedExperiments lists 6 experiments", "No chaos test files found in tests/unit/"],
+        "effortEstimate": "10 hrs",
+        "dependencies": []
+      },
+      "deploymentTimeSLOValidationGate2hrs": {
+        "status": "NOT_STARTED",
+        "description": "No deployment-time SLO validation gate exists. SRE_ADR.md Section 4.3 and SRE_summary.json both list this as a HIGH priority gap (SLO gate in deployment pipeline). Current system has no mechanism to block deployments based on error budget.",
+        "evidence": ["SRE_ADR.md Section 4.3: \"Canary deployments with SLO monitoring before full rollout\" - not implemented", "SRE_summary.json recommendations: \"SLO gate in deployment pipeline\" - not done", "No CI/CD gate found that validates SLOs before deployment"],
+        "effortEstimate": "2 hrs",
+        "dependencies": []
+      },
+      "persistInMemoryStateOnRestart4hrs": {
+        "status": "NOT_STARTED",
+        "description": "In-memory state (_pendingRequests, _lastErrorProvider, _recentRing) resets on process restart. SRE_ADR.md Section 3.2 explicitly identifies this as a gap. NETWORK_ARCHITECTURE_ADR.md confirms \"Lifetime: In-memory, resets on process restart.\"",
+        "evidence": ["SRE_ADR.md line 159: \"In-memory state volatility — _pendingRequests, _lastErrorProvider, _recentRing reset on process restart\"", "SRE_summary.json: \"in-memory state volatility on process restart\" gap listed", "NETWORK_ARCHITECTURE_ADR.md line 99: \"In-memory, resets on process restart. No persistent connection pooling across restarts.\"", "NETWORK_ARCHITECTURE_ADR.md line 364: \"persistDispatcherCache: Persist proxy dispatcher cache to the local DB\""],
+        "effortEstimate": "4 hrs",
+        "dependencies": []
+      }
+    }
+  },
+  
+  "2_gapAnalysis": {
+    "circuitBreakerRuntimeVerificationGaps": {
+      "status": "CRITICAL",
+      "description": "Circuit breaker service exists in open-sse/services/circuitBreaker.js with full CLOSED→OPEN→HALF-OPEN→CLOSED state management, failure tracking, cool-down windows, and half-open probe requests. However, the circuit breaker is NEVER called in the request pipeline. No code calls getCircuitBreaker(), recordFailure(), or recordSuccess() during request handling. Providers can fail cascade without any circuit protection.",
+      "existingInfrastructure": "CircuitBreaker class with state management, failureCount, coolDownWindowMs, resetWindowMs, canRequest(), getState() - all implemented in open-sse/services/circuitBreaker.js", "CIRCUIT_BREAKER_CONFIG in runtimeConfig.js with default {failureThreshold: 5, coolDownWindowMs: 300000, resetWindowMs: 900000} and empty providers override map", "Schema validation validates config on import and logs warnings for invalid per-provider configs", "",
+      "gap": "Circuit breaker is built but NOT INTEGRATED. The system falls back to account-level marking (markAccountUnavailable) which is slower and coarser-grained. No per-provider circuit breaker thresholds are registered in CIRCUIT_BREAKER_CONFIG.providers.",
+      "sreAdrReference": "SRE_ADR.md Section 3.2: \"No circuit breaker for consistently failing providers — fallback depends on accounts being marked unavailable, but there's no global 'circuit break' threshold\"", "SRE_summary.json: \"no circuit breaker for consistently failing providers\" gap listed", "SRE_ADR.md Section 8.4: \"Implement circuit breaker patterns for failing providers\" - not done"
+    },
+    "rTKStrictModeConfigurationGaps": {
+      "status": "HIGH",
+      "description": "RTK strict mode is fully implemented and tested (tests/unit/rtk-strict-mode.test.js with 6 describe blocks covering compressWithHeadroom, injectCaveman, injectPonytail, safeApply, and end-to-end flow). RTK_STRICT_MODE and rtkStrict are exported from runtimeConfig.js with default false (fail-open). All RTK components (headroom, caveman, ponytail, applyFilter) propagate errors when rtkStrict=true. chatCore.js passes rtkStrict to all RTK calls. However, the only way to enable strict mode is via the RTK_STRICT=true environment variable, which requires a process restart. No gradual rollout mechanism or feature-flag service exists.",
+      "existingInfrastructure": "RTK_STRICT_MODE export: process.env.RTK_STRICT === \"true\" (default false)", "rtkStrict alias: export const rtkStrict = RTK_STRICT_MODE", "All 4 RTK components updated with strict mode support per ADR-006", "chatCore.js passes rtkStrict to compressWithHeadroom, injectCaveman, injectPonytail, safeApply", "Tests verify normal mode (returns null on error) vs strict mode (throws error) vs per-call override", "", "",
+      "gap": "Configuration is complete but not operationally practical. Setting RTK_STRICT=true requires process restart. No way to enable per-deployment or per-request without restart. The per-call rtkStrict override exists but is not documented or used in the main code paths.",
+      "sreAdrReference": "SRE_ADR.md Section 8.4: \"Make token refresh attempt count configurable\" related", "SRE_ADR.md Section 8.2: \"Validate RTK fail-open semantics with corrupted bodies\" - partially done (tests exist but not in CI)", "RTK-STRICT-MODE-VERIFIED.md: Verification tests created and passing"
+    },
+    "providerCircuitBreakerConfigGaps": {
+      "status": "CRITICAL",
+      "description": "CIRCUIT_BREAKER_CONFIG.providers object is EMPTY - no per-provider overrides are configured. The default config {failureThreshold: 5, coolDownWindowMs: 300000, resetWindowMs: 900000} validates on import but has no per-provider entries. Without per-provider configs, the system uses the same threshold for all providers, which is inappropriate since different providers have different reliability characteristics.",
+      "existingInfrastructure": "CIRCUIT_BREAKER_CONFIG.default with full validation", "CIRCUIT_BREAKER_SCHEMA with JSON Schema validation", "validateCircuitBreakerConfig function validates failureThreshold, coolDownWindowMs, resetWindowMs", "for loop validates per-provider configs on import and logs warnings", "", "",
+      "gap": "Config schema and validation exist but NO PROVIDERS ARE CONFIGURED. The providers map is empty. This means the circuit breaker service cannot be provider-specific without manual config addition. Different providers (OpenAI vs Anthropic vs Gemini vs local) have vastly different reliability patterns that require different failure thresholds.",
+      "sreAdrReference": "SRE_ADR.md Section 8.4: \"Implement circuit breaker patterns for failing providers\" - not done", "SRE_summary.json: \"no circuit breaker for consistently failing providers\" gap listed", "SRE_ADR.md recommendation: \"circuit breaker pattern per provider with configurable failure threshold\" - not implemented"
+    },
+    "healthCheckEndpointCompleteness": {
+      "status": "HIGH",
+      "description": "A basic /api/health endpoint exists at src/app/api/health/route.js that returns { ok: true } with CORS headers. This is referenced in rtk.e2e.test.js and rtk.multi-provider.e2e.test.js which fetch /api/health and expect ok to be true. However, the endpoint provides NO actual health information beyond server liveness - it does NOT verify SSE handler status, pending request count, error budget remaining, active accounts per provider, circuit breaker states, or any other operational metric.",
+      "existingInfrastructure": "src/app/api/health/route.js with GET returning { ok: true } and OPTIONS returning 204", "Referenced in rtk.e2e.test.js line 69: const res = await fetch(\`\${BASE}/api/health\`)", "Referenced in rtk.multi-provider.e2e.test.js line 110-111: const health = await fetch(\`\${BASE}/api/health\`); expect(health.ok).toBe(true)", "", "",
+      "gap": "Health endpoint is minimal - only confirms the server is running. Does not verify any downstream dependencies (SSE handlers, circuit breakers, pending requests, error budgets, account status). For production, this is insufficient - operators need to know if the SSE pipeline is healthy, not just that the HTTP server is up.",
+      "sreAdrReference": "SRE_ADR.md Section 3.2: \"No health check endpoint to verify SSE handler availability\" - gap confirmed", "SRE_summary.json: \"no health check endpoint\" gap listed", "SRE_summary.json recommended: \"health check endpoint /api/health returning SSE handler status, pending count, error budget remaining, active account count per provider\" - not implemented"
+    },
+    "metricsEndpointCompleteness": {
+      "status": "CRITICAL",
+      "description": "NO metrics endpoint exists. There is no /metrics, /api/metrics, or any other endpoint that exposes Prometheus-compatible or application-specific metrics. All observability data is confined to: in-memory globals (_pendingRequests, _lastErrorProvider, _recentRing, _statsEmitTimers), SQLite usage DB (getUsageStats()), console log capture. No endpoint exists for operators to query current state, error rates, latency distributions, or request counts.",
+      "existingInfrastructure": "getUsageStats() returns totalRequests, per-provider/model/account breakdowns, cost, tokens from SQLite", "global._pendingRequests by model/account (in-memory, capped)", "global._lastErrorProvider last provider with error, 10s window timestamp", "getRecentLogs() 50-entry ring buffer", "getActiveRequests() per model/provider/account", "formatData formats error objects as JSON strings", "maskKey masks API keys as ****...****", "", "",
+      "gap": "Complete absence of metrics endpoint. Operators have no way to query the system's current state without reading logs or inspecting global variables. This violates SRE best practices of exposing metrics via a standard endpoint. All SLIs (request count, error rate, latency, success rates) cannot be validated without an endpoint.",
+      "sreAdrReference": "SRE_ADR.md Section 2.1: \"No Prometheus-compatible metrics endpoint\" - gap confirmed", "SRE_summary.json: Multiple metric gaps listed (request count aggregation, error rate aggregation, latency distribution, TTS success rate, chat completion success, stream completion)", "SRE_ADR.md Section 8.4: \"Implement Prometheus-compatible metrics (request count, error rate, latency histogram)\" - not done", "SRE_summary.json: \"Add structured JSON logs with request ID, model, provider, status, latency\" - not done"
+    },
+    "structuredLoggerCompleteness": {
+      "status": "HIGH",
+      "description": "Console logger is partially implemented with initConsoleLogCapture() that patches console methods (log, info, warn, error, debug). Provides colored session tags (🟢🔵🟣🟡🟠🔴⚪🟤 rotating per session), request/response lines with timing, stream event lines, tagged logs ([timestamp] tag symbol message), and error line that bypasses log level filter. formatData formats error objects as JSON strings. maskKey masks API keys. However, structured JSON logs with request ID, model, provider, status, latency are NOT consistently output. The logger works but does not emit the comprehensive structured data needed for production observability platforms.",
+      "existingInfrastructure": "initConsoleLogCapture() patches console methods", "Colored session tags rotating per session", "Request lines: [timestamp] 📥 POST /path (logger.js:97)", "Response lines: [timestamp] 📤 200 (1234ms) or 💥 500 (567ms) (logger.js:102-106)", "Stream lines: [timestamp] 🌊 [STREAM] event (logger.js:108-111)", "Tagged logs: [timestamp] tag symbol message — e.g., [ℹ️] [CHAT] ... (logger.js:76-81)", "errorLine() bypasses log level filter (logger.js:42-44)", "formatData → JSON string (logger.js:59-67)", "maskKey → ****...**** (logger.js:114-117)", "fmtThink → \"10k\" or \"auto\" (logger.js:47-57)", "", "",
+      "gap": "Logger exists but lacks structured JSON output with the key fields needed for production observability. While colored tags and timing lines help, they are not machine-parseable structured data. No request ID correlation across the full pipeline (translator → executor → response). No model/provider/status/latency fields in structured format.",
+      "sreAdrReference": "SRE_ADR.md Section 2.1: Logs available but no structured JSON with request ID, model, provider, status, latency", "SRE_summary.json: \"Add structured JSON logs with request ID, model, provider, status, latency\" recommended", "SRE_ADR.md Section 8.4: \"Add structured JSON logs with request ID, model, provider, status, latency\" - not done", "SRE_summary.json: \"Implement Prometheus-compatible metrics\" - related but separate"
+    }
+  },
+  
+  "3_overEngineeringAssessment": {
+    "circuitBreakerService": {
+      "isPatternUsedByExistingCode": "NO - the CircuitBreaker class in open-sse/services/circuitBreaker.js exists but is never instantiated or called in the request pipeline. No handler, executor, or service imports it.",
+      "simplerApproachAchievable": "BASIC circuit breaker logic could be added inline in the executor or handler without the full class infrastructure, but the existing service is well-designed and should be integrated rather than replaced.",
+      "complexityJustifiedByBenefit": "YES - circuit breaker is a critical reliability pattern. The service is already built with proper state management, so integrating it is lower effort than building from scratch. The complexity is justified because without it, failing providers can cascade failures across the entire system.",
+      "wouldOriginalCodeWorkWithout": "YES - the system would continue functioning without the circuit breaker, but with increased risk of cascading failures from consistently failing providers. The lack of circuit breaking is a known reliability gap.",
+      "assessment": "The circuit breaker service is over-engineered IF it remains unintegrated (wasted code), but the pattern itself is not over-engineered. The issue is integration, not the pattern."
+    },
+    "rtkStrictModeImplementation": {
+      "isPatternUsedByExistingCode": "YES - all RTK components (headroom, caveman, ponytail, applyFilter) now accept and propagate rtkStrict. chatCore.js passes it to all calls. Tests verify all 4 components.",
+      "simplerApproachAchievable": "YES - the default fail-open behavior (rtkStrict=false) is the existing behavior. Strict mode could be implemented more simply without the per-call override pattern, but the current design provides maximum flexibility.",
+      "complexityJustifiedByBenefit": "YES - RTK strict mode provides an opt-in error propagation mode while maintaining full backward compatibility. The per-call override pattern is valuable for gradual rollout. The test coverage (6 describe blocks) validates the implementation.",
+      "wouldOriginalCodeWorkWithout": "YES - with RTK_STRICT=false (default), exact existing behavior is maintained. The system would function identically without the strict mode feature.",
+      "assessment": "The RTK strict mode implementation is well-designed and not over-engineered. It provides a needed capability (error propagation) without breaking existing code. The per-call override is a nice-to-have that adds complexity but is justified by the use case."
+    },
+    "healthEndpoint": {
+      "isPatternUsedByExistingCode": "YES - the /api/health endpoint exists and is referenced in e2e tests. It's a simple GET handler.",
+      "simplerApproachable": "YES - the endpoint could be removed entirely or simplified to just return a 200 status without the JSON body.",
+      "complexityJustifiedByBenefit": "PARTIAL - a health endpoint has value for monitoring, but the CURRENT implementation is under-valued (only returns {ok: true}). A more complete health endpoint would have higher benefit, but the current minimal implementation has low complexity and low cost, so it's not really 'over-engineering' - it's just under-specified.",
+      "wouldOriginalCodeWorkWithout": "YES - removing the health endpoint would not break any functionality. The e2e tests would need updating.",
+      "assessment": "The health endpoint is not over-engineered (it's minimal), but it's under-specified. The existing implementation provides minimal value. A production-ready health endpoint would be significantly more valuable but requires more work."
+    },
+    "structuredLogger": {
+      "isPatternUsedByExistingCode": "PARTIAL - console capture and basic formatting exist, but the comprehensive structured JSON output recommended in SRE_summary.json and SRE_ADR.md is not implemented.",
+      "simplerApproachAchievable": "YES - could revert to plain console.log with no formatting. The current logger adds value but could be simplified.",
+      "complexityJustifiedByBenefit": "PARTIAL - structured logging has significant benefit for production observability, but the current implementation provides only partial structured output. The benefit is real but not fully realized.",
+      "wouldOriginalCodeWorkWithout": "YES - the application would function identically without the logger formatting. Logs would just be plain console output.",
+      "assessment": "The logger is not over-engineered but is under-utilized. The formatting infrastructure exists but doesn't deliver the full structured output needed for production observability."
+    }
+  },
+  
+  "4_productionGapsClassification": {
+    "critical": [
+      "No metrics endpoint - complete observability void (CRITICAL - prevents production deployment)",
+      "Circuit breaker not integrated into request pipeline - providers can cascade failures (CRITICAL - reliability risk)",
+      "In-memory state volatility on restart - pending requests and error state lost (CRITICAL - reliability after deploy)",
+      "No deployment-time SLO validation gate - deployments can consume error budget unchecked (CRITICAL - reliability risk)"
+    ],
+    "high": [
+      "Health check endpoint only confirms server liveness, not pipeline health (HIGH - impacts observability)",
+      "RTK strict mode not operationally practical - only via process-restart env var (HIGH - impacts reliability control)",
+      "No structured JSON logs with required fields (HIGH - impacts debuggability in production)",
+      "No circuit breaker per-provider configurations (HIGH - suboptimal risk management)",
+      "No chaos engineering test suite (HIGH - no confidence in reliability under stress)"
+    ],
+    "medium": [
+      "No full SLO/SLI tracking implementation (TTS success, chat completion, stream completion rates)",
+      "RTK strict mode configuration not easily toggleable without restart",
+      "No automated drift prevention CI check",
+      "No post-incident metrics collection framework"
+    ],
+    "low": [
+      "Font preconnect/timeout optimizations (web performance)",
+      "Tailwind v4 purge verification",
+      "Focus-visible styles (accessibility)",
+      "Splitting Monaco Editor loading",
+      "Provider capability documentation improvements"
+    ]
+  },
+  
+  "5_noOverEngineeringVerification": {
+    "circuitBreakerService": {
+      "isPatternUsedByExistingCode": false,
+      "couldSimplerApproachAchieveSameGoal": "Basic inline circuit breaker logic could provide some protection without the full service class, but would lack the sophisticated state management (half-open state, cool-down windows, per-provider configs) that the existing service provides.",
+      "isComplexityJustifiedByBenefit": "YES - the circuit breaker pattern is well-understood and critical for production reliability. The service is already built; the cost is integration effort, not pattern complexity.",
+      "wouldOriginalCodeWorkWithoutThisChange": "YES - the system continues functioning without circuit breaker integration, but with increased risk of cascading failures.",
+      "verdict": "NOT over-engineered (pattern is valuable), but integration is required to realize the benefit."
+    },
+    "rtkStrictMode": {
+      "isPatternUsedByExistingCode": true,
+      "couldSimplerApproachAchieveSameGoal": "YES - could just set RTK_STRICT=true env var without the full alias/per-call override pattern, but this would lack the per-call flexibility and backward compatibility guarantees.",
+      "isComplexityJustifiedByBenefit": "YES - provides opt-in strict mode with full backward compatibility and per-call override. Test coverage validates the implementation.",
+      "wouldOriginalCodeWorkWithoutThisChange": "YES - default false maintains exact existing behavior.",
+      "verdict": "NOT over-engineered. Well-designed feature with test coverage."
+    },
+    "healthEndpoint": {
+      "isPatternUsedByExistingCode": true,
+      "couldSimplerApproachAchieveSameGoal": "YES - could remove the endpoint entirely or simplify to just 200 OK.",
+      "isComplexityJustifiedByBenefit": "PARTIAL - minimal endpoint has low cost but also limited benefit. A complete health endpoint would have higher benefit but the current one is not over-engineered.",
+      "wouldOriginalCodeWorkWithoutThisChange": "YES - system functions identically without it.",
+      "verdict": "NOT over-engineered (it's minimal), but under-specified. Should be enhanced for production."
+    },
+    "structuredLogger": {
+      "isPatternUsedByExistingCode": true,
+      "couldSimplerApproachAchieveSameGoal": "YES - could revert to plain console.log. The formatting infrastructure exists but doesn't deliver full structured output.",
+      "isComplexityJustifiedByBenefit": "PARTIAL - structured logging is beneficial but not fully realized. The current implementation provides value but not the full benefit.",
+      "wouldOriginalCodeWorkWithoutThisChange": "YES - application functions identically without logger formatting.",
+      "verdict": "NOT over-engineered but under-utilized. Formatting exists without delivering full structured output."
+    }
+  },
+  
+  "6_finalProductionReadinessScore": 45,
+  "scoreJustification": "The 9router system is NOT production-ready. Key critical gaps:\n\n1. Circuit breaker service exists but is NOT integrated into the request pipeline - providers can cascade failures without any protection mechanism. This is the most critical reliability gap.\n\n2. No metrics endpoint exists - operators have zero way to query system state, error rates, or latency distributions. This violates fundamental SRE practices.\n\n3. In-memory state (_pendingRequests, _lastErrorProvider, _recentRing) resets on process restart - after a deploy or crash, all pending request tracking and error state is lost, forcing a \"cold start\" period where the system is blind.\n\n4. No deployment-time SLO validation gate - there is no mechanism to prevent deployments when error budgets are near exhaustion.\n\n5. Health check endpoint only confirms the HTTP server is running, not that the SSE pipeline, circuit breakers, or account status is healthy.\n\n6. No structured JSON logs with request ID, model, provider, status, latency - makes debugging production incidents extremely difficult.\n\n7. No chaos engineering test suite - no confidence in system behavior under failure conditions.\n\nThe system scores 45/100 because: core functionality works well, pattern matching is correct, RTK strict mode is properly implemented, and the drift prevention framework is documented. However, the critical production readiness gaps (observability, reliability, and operational control) are significant and would prevent a responsible SRE from approving this system for production use without substantial remediation.",
+  
+  "7_prioritizedRecommendations": {
+    "mustHaveForProduction": {
+      "title": "Must-have for production: critical + high gaps",
+      "items": [
+        {
+          "id": "M1",
+          "priority": "CRITICAL",
+          "title": "Integrate circuit breaker into request pipeline",
+          "description": "Wire getCircuitBreaker() calls in handlers/executors before upstream API calls. Record failures on errors, record successes on completion. Enable per-provider circuit breaker configurations via CIRCUIT_BREAKER_CONFIG.providers.",
+          "effort": "8-12 hrs",
+          "technicalDebtReference": "SRE_ADR.md gap: \"no circuit breaker for consistently failing providers\"",
+          "relatedAdrs": ["SRE_ADR.md", "ADR-001 (circuit breaker context)"],
+          "verification": "After integration, verify that consistently failing providers get circuit breaker OPEN state and requests are rejected with 503 before exhausting all accounts."
+        },
+        {
+          "id": "M2",
+          "priority": "CRITICAL",
+          "title": "Implement Prometheus metrics endpoint /metrics",
+          "description": "Add endpoint that exposes: sse_requests_total (count, by status, by provider, by endpoint), sse_request_latency_seconds (histogram: p50, p95, p99), sse_pending_requests (gauge by model/provider), sse_active_accounts (gauge by provider), sse_error_budget_consumed (gauge 0-1).",
+          "effort": "6-8 hrs",
+          "technicalDebtReference": "SRE_ADR.md Section 8.4: \"Implement Prometheus-compatible metrics\"",
+          "relatedAdrs": ["SRE_ADR.md", "CODE_QUALITY_ASSESSMENT.json"],
+          "verification": "After implementation, curl /metrics should return valid metric lines that can be scraped by Prometheus."
+        },
+        {
+          "id": "M3",
+          "priority": "CRITICAL",
+          "title": "Persist in-memory state on process restart",
+          "description": "Add shutdown hook (process 'beforeunload' or SIGTERM) that saves _pendingRequests, _lastErrorProvider, _recentRing to SQLite/lowdb. On startup, load persisted state. This ensures pending request tracking and error state survive deploys and crashes.",
+          "effort": "4-6 hrs",
+          "technicalDebtReference": "SRE_ADR.md Section 3.2: \"In-memory state volatility\" - \"Persist in-memory state to DB on shutdown\"",
+          "relatedAdrs": ["SRE_ADR.md", "NETWORK_ARCHITECTURE_ADR.md"],
+          "verification": "After restart, verify that _pendingRequests and _lastErrorProvider are preserved from before shutdown."
+        },
+        {
+          "id": "M4",
+          "priority": "HIGH",
+          "title": "Enhance health check endpoint with pipeline status",
+          "description": "Extend /api/health to return: SSE handler status (initialized), pending request count, error budget remaining (percentage), active accounts per provider, circuit breaker states for key providers. Keep the existing {ok: true} as a minimum but add substantial operational data.",
+          "effort": "3-4 hrs",
+          "technicalDebtReference": "SRE_ADR.md Section 3.2: \"No health check endpoint\" - recommended: returning SSE handler status, pending count, error budget, active accounts",
+          "relatedAdrs": ["SRE_ADR.md", "SRE_summary.json"],
+          "verification": "After enhancement, curl /api/health should return JSON with fields: status, pendingRequests, errorBudget, activeAccounts, circuitBreakers (partial)."
+        },
+        {
+          "id": "M5",
+          "priority": "HIGH",
+          "title": "Add structured JSON logging with request ID, model, provider, status, latency",
+          "description": "Enhance the logger to emit structured JSON entries containing: requestId, provider, model, status, latencyMs, endpoint, timestamp. Ensure correlation across the full pipeline (chatCore → translator → executor → response). Mask sensitive data (API keys) in structured output.",
+          "effort": "6-8 hrs",
+          "technicalDebtReference": "SRE_ADR.md Section 8.4: \"Add structured JSON logs with request ID, model, provider, status, latency\"",
+          "relatedAdrs": ["SRE_ADR.md", "SRE_summary.json", "open-sse/utils/error.js"],
+          "verification": "After implementation, log entries should be parseable JSON with the specified fields, and request IDs should be traceable across the full request lifecycle."
+        },
+        {
+          "id": "M6",
+          "priority": "HIGH",
+          "title": "Implement deployment-time SLO validation gate",
+          "description": "Create a deployment gate/check that validates the error budget won't be exceeded. If consuming >10% of error budget, block deployment or require canary-first approach. Integrate with CI/CD pipeline.",
+          "effort": "4-6 hrs",
+          "technicalDebtReference": "SRE_ADR.md Section 4.3: \"Canary deployments with SLO monitoring before full rollout\" and \"SLO gate in deployment pipeline\"",
+          "relatedAdrs": ["SRE_ADR.md", "PM_ADR.md", "SRE_summary.json"],
+          "verification": "After implementation, attempt a deployment when error budget is <10% remaining should fail the deployment gate or require canary flag."
+        }
+      ]
+    },
+    "niceToHave": {
+      "title": "Nice-to-have: medium + low gaps",
+      "items": [
+        {
+          "id": "N1",
+          "priority": "MEDIUM",
+          "title": "Implement full SLO/SLI tracking",
+          "description": "Track TTS success rate (target 99.9%), chat completion success rate (target 99.8%), stream continuity rate (target 99.5%). Implement SLIs and tie to error budget calculations. 30-day windows with burn rate alerts.",
+          "effort": "8-10 hrs",
+          "technicalDebtReference": "SRE_ADR.md Section 5: SLO/SLI Definitions - current SLI implementation status shows gaps in TTS, chat, and stream success rates",
+          "relatedAdrs": ["SRE_ADR.md", "SRE_summary.json"],
+          "verification": "After implementation, getUsageStats() or /metrics should include TTS success rate, chat completion success rate, and stream completion rate with 30-day windows."
+        },
+        {
+          "id": "N2",
+          "priority": "MEDIUM",
+          "title": "Create chaos engineering test suite",
+          "description": "Scripted failure injection tests for key failure modes: account kill switch (mark all accounts unavailable), latency spike (inject delay), translator corruption (malformed bodies), provider timeout (block upstream). Measure MTTR, fallback success rate, error budget impact.",
+          "effort": "10-15 hrs",
+          "technicalDebtReference": "SRE_summary.json chaosEngineeringPriority: \"MEDIUM — create failure injection scripts, test stream stall, validate RTK fail-open, design combo exhaustion experiments\"",
+          "relatedAdrs": ["SRE_ADR.md", "SRE_summary.json", "CIRCUIT_BREAKER_VERIFICATION_PLAN.md"],
+          "verification": "After implementation, run chaos tests and verify that fallback behaviors (circuit breaker, account marking, RTK fail-open) work as expected under injected failures."
+        },
+        {
+          "id": "N3",
+          "priority": "MEDIUM",
+          "title": "Make RTK strict mode operationally practical",
+          "description": "Add mechanism to enable RTK strict mode without process restart: feature flag service, dynamic config reload, or API endpoint to toggle RTK_STRICT. Keep the env var for initial deployment but add runtime toggle capability.",
+          "effort": "4-6 hrs",
+          "technicalDebtReference": "RTK-STRICT-MODE-VERIFIED.md and ADR-006 - current implementation requires RTK_STRICT=true env var which needs process restart",
+          "relatedAdrs": ["RTK-STRICT-MODE-VERIFIED.md", "ADR-006", "runtimeConfig.js"],
+          "verification": "After implementation, should be able to toggle RTK strict mode via API or config reload without restarting the process."
+        },
+        {
+          "id": "N4",
+          "priority": "LOW",
+          "title": "Add per-provider circuit breaker configurations",
+          "description": "Populate CIRCUIT_BREAKER_CONFIG.providers with appropriate thresholds per provider. E.g., OpenAI might have threshold 3 (more sensitive), Gemini might have threshold 7 (more resilient), local-device might have threshold 10 (no upstream dependency).",
+          "effort": "2-3 hrs",
+          "technicalDebtReference": "runtimeConfig.js CIRCUIT_BREAKER_CONFIG.providers is currently empty",
+          "relatedAdrs": ["runtimeConfig.js", "SRE_ADR.md"],
+          "verification": "After implementation, CIRCUIT_BREAKER_CONFIG.providers should have entries for key providers with appropriate failureThreshold values."
+        },
+        {
+          "id": "N5",
+          "priority": "LOW",
+          "title": "Web performance optimizations",
+          "description": "Add preconnect to fonts.gstatic.com (already partially done - constant defined but <link> tag needs verification), reduce font loading timeout, verify Tailwind v4 purge, add focus-visible styles.",
+          "effort": "40-60 min total",
+          "technicalDebtReference": "web-performance-analysis.md and PM_TASKS.json - top 3 high-impact/low-effort fixes",
+          "relatedAdrs": ["web-performance-analysis.md", "PM_ADR.md", "PM_TASKS.json"],
+          "verification": "After implementation, Lighthouse scores should improve for FCP and LCP metrics."
+        }
+      ]
+    },
+    "deferIndefinitely": {
+      "title": "Defer indefinitely: over-engineered or low-impact items",
+      "items": [
+        {
+          "id": "D1",
+          "priority": "LOW",
+          "title": "Split Monaco Editor loading (on-demand)",
+          "description": "Lazy-load the Monaco editor component to reduce initial bundle size. Currently a blocking dependency for the UI.",
+          "effort": "1-2 hrs",
+          "technicalDebtReference": "PM_ADR.md: \"Split Monaco loading (on-demand)\" - long-term item",
+          "relatedAdrs": ["PM_ADR.md"],
+          "verification": "After implementation, initial page load should show reduced Monaco bundle size."
+        },
+        {
+          "id": "D2",
+          "priority": "LOW",
+          "title": "Provider capability documentation improvements",
+          "description": "Add better documentation for PATTERN_CAPABILITIES ordering, provider override short-circuiting, and Math.min/max semantics. This is documentation, not code change.",
+          "effort": "15 min",
+          "technicalDebtReference": "PM_ADR.md: \"Pattern order documentation\" - \"PATTERN_CAPABILITIES order is critical, not documented\"",
+          "relatedAdrs": ["PM_ADR.md", "ARCHITECTURE_AUDIT.json"],
+          "verification": "After implementation, comments should explain pattern ordering rules and Math.min/max semantics."
+        },
+        {
+          "id": "D3",
+          "priority": "LOW",
+          "title": "Vitest alias troubleshooting documentation",
+          "description": "Document why @/ aliases fail from certain directories and the 4-point drift prevention checklist. This is documentation/organizational, not runtime code.",
+          "effort": "30 min",
+          "technicalDebtReference": "PM_ADR.md and STATUS_UPDATE.md - vitest alias resolution issue",
+          "relatedAdrs": ["PM_ADR.md", "STATUS_UPDATE.md", "ADR-002"],
+          "verification": "After implementation, should have documentation explaining the alias system and how to avoid resolution issues."
+        },
+        {
+          "id": "D4",
+          "priority": "LOW",
+          "title": "Focus-visible styles for accessibility",
+          "description": "Add :focus-visible styles to globals.css for keyboard navigation accessibility. No performance tradeoff.",
+          "effort": "10 min",
+          "technicalDebtReference": "PM_ADR.md and web-performance-analysis.md - accessibility improvement",
+          "relatedAdrs": ["PM_ADR.md", "web-performance-analysis.md"],
+          "verification": "After implementation, keyboard navigation should show appropriate focus indicators."
+        },
+        {
+          "id": "D5",
+          "priority": "LOW",
+          "title": "Tailwind v4 purge verification / CSS optimization",
+          "description": "Run build and check .next/ for unused class removal. 50-100KB potential CSS savings. This is a build-time optimization, not runtime-critical.",
+          "effort": "30 min",
+          "technicalDebtReference": "PM_TASKS.json and web-performance-analysis.md - \"Verify Tailwind v4 purge\"",
+          "relatedAdrs": ["PM_TASKS.json", "web-performance-analysis.md"],
+          "verification": "After implementation, should verify no regressions from purge and potentially reduced CSS size."
+        }
+      ]
+    }
+  }
+}

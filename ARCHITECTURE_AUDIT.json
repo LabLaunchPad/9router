@@ -1,0 +1,297 @@
+{
+  "$schema": "http://json-schema.org/schema/draft-07",
+  "title": "9router Architecture Audit Report",
+  "generatedAt": "2026-10-19T00:00:00Z",
+  "scope": "Full repository at C:\\9router",
+  "sections": {
+    "1_system_architecture_diagram": {
+      "description": "Full request lifecycle from incoming HTTP → SSE output",
+      "lifecycleStages": [
+        {
+          "stage": "HTTP Entry",
+          "description": "Client sends POST request to /api/v1beta/models/{model}:streamGenerateContent or /api/media-providers/tts",
+          "entryPoint": "src/app/api/v1beta/models/[...path]/route.js",
+          "middleware": [
+            "enforceKeyAccess (key access control)",
+            "getComboModels (combo expansion if model is combo name)"
+          ]
+        },
+        {
+          "stage": "SSE Handler",
+          "description": "Route delegates to appropriate handler based on modality",
+          "handler": "src/sse/handlers/tts.js for TTS, src/sse/handlers/chat.js for chat, etc.",
+          "keyActions": [
+            "Extract API key from request",
+            "Validate API key",
+            "Check combo expansion",
+            "Route to handleSingleModelTts or handleComboChat"
+          ]
+        },
+        {
+          "stage": "TTS Core Dispatch",
+          "description": "handleTtsCore from open-sse determines adapter vs config-driven path",
+          "openSSEPath": "open-sse/handlers/ttsCore.js",
+          "twoPaths": [
+            {
+              "name": "Adapter Path",
+              "condition": "Provider has a SPECIAL_ADAPTER in open-sse/handlers/ttsProviders/index.js",
+              "flow": "getTtsAdapter(provider) → adapter.synthesize() → createTtsResponse()",
+              "adapters": ["google-tts", "edge-tts", "local-device", "elevenlabs", "openai", "openrouter", "gemini", "xiaomi-mimo", "selfhosted-tts"]
+            },
+            {
+              "name": "Config-Driven Path",
+              "condition": "Provider does NOT have a SPECIAL_ADAPTER",
+              "flow": "synthesizeViaConfig(provider, text, model, credentials) → AI_PROVIDERS[provider]?.ttsConfig → FORMAT_HANDLERS[cfg.format] → handler()",
+              "note": "Uses dynamic import() of @/shared/constants/providers inside the function"
+            }
+          ]
+        },
+        {
+          "stage": "Executor / Upstream Call",
+          "description": "For non-OpenAI providers, executor makes the upstream API call",
+          "flow": "executors/index.js getExecutor(provider) → executor.execute() (streams upstream)",
+          "specialNote": "DefaultExecutor handles OpenAI-compatible APIs; non-standard providers have dedicated executor files in open-sse/executors/"
+        },
+        {
+          "stage": "Translation & SSE Output",
+          "description": "Response chunks translated back to client format and streamed via SSE",
+          "flow": "translateResponse (provider chunks → client format) → SSE out",
+          "middleware": "rtk/ request-token-killer compresses tool_results in-place; post-translate savers (headroom/caveman/ponytail) compress further"
+        }
+      ],
+      "dependencyChains": {
+        "tts": "src/sse/handlers/tts.js → open-sse/handlers/ttsCore.js → open-sse/handlers/ttsProviders/index.js → (adapter or synthesizeViaConfig → AI_PROVIDERS → ttsConfig → FORMAT_HANDLERS)",
+        "chat": "src/sse/handlers/chat.js → open-sse/handlers/chatCore.js → open-sse/services/model.js (parseModel) → rtk/ → open-sse/translator/index.js → open-sse/executors/index.js → executor.execute() → translateResponse → SSE"
+      }
+    },
+    "2_dependency_graph": {
+      "description": "How open-sse ↔ src/app interactions work, including all import chains",
+      "importChains": [
+        {
+          "from": "src/sse/handlers/tts.js",
+          "to": "open-sse/handlers/ttsCore.js",
+          "details": "import { handleTtsCore } from \"open-sse/handlers/ttsCore.js\";\nimport { errorResponse, unavailableResponse } from \"open-sse/utils/error.js\";\nimport { HTTP_STATUS } from \"open-sse/config/runtimeConfig.js\";\nimport { AI_PROVIDERS } from \"@/shared/constants/providers\";"
+        },
+        {
+          "from": "src/sse/handlers/tts.js",
+          "to": "@/shared/constants/providers",
+          "details": "synthesizeViaConfig does dynamic import(): import(\"@/shared/constants/providers\") inside the function body",
+          "issue": "The @/ alias resolution depends on vitest config; in production it resolves via next.config.mjs path aliases"
+        },
+        {
+          "from": "src/app/api/media-providers/tts/voices/route.js",
+          "to": "open-sse/handlers/ttsCore.js",
+          "details": "import { VOICE_FETCHERS } from \"open-sse/handlers/ttsCore.js\";"
+        },
+        {
+          "from": "src/shared/constants/providers.js",
+          "to": "open-sse/providers/registry/index.js",
+          "details": "import REGISTRY from \"open-sse/providers/registry/index.js\"; import { RISK_NOTICE } from \"@/shared/constants/providersDisplay.js\";"
+        },
+        {
+          "from": "src/shared/constants/providersDisplay.js",
+          "to": "open-sse/providers/registry/index.js",
+          "details": "import REGISTRY from \"open-sse/providers/registry/index.js\"; export const RISK_NOTICE = \"...\";"
+        },
+        {
+          "from": "src/sse/services/model.js",
+          "to": "open-sse/services/model.js",
+          "details": "import { parseModel as parseModelCore, resolveModelAliasFromMap, getModelInfoCore } from \"open-sse/services/model.js\"; import REGISTRY from \"open-sse/providers/registry/index.js\";"
+        },
+        {
+          "from": "src/sse/handlers/chat.js",
+          "to": "open-sse/index.js",
+          "details": "import \"open-sse/index.js\"; // boots open-sse translator registrations, executors, providers"
+        },
+        {
+          "from": "open-sse/translator/index.js",
+          "to": "open-sse/translator/request/*.js and open-sse/response/*.js",
+          "details": "Static side-effect imports at bottom of index.js call register() for each translator module\nExample: import \"./request/claude-to-openai.js\"; import \"./response/openai-to-claude.js\";"
+        },
+        {
+          "from": "open-sse/translator/index.js",
+          "to": "open-sse/executors/index.js",
+          "details": "import { AntigravityExecutor } from \"../executors/antigravity.js\"; import { PROVIDERS } from \"../providers/index.js\";"
+        },
+        {
+          "from": "open-sse/executors/index.js",
+          "to": "open-sse/executors/{provider}.js",
+          "details": "Map of provider → executor file; getExecutor() falls back to DefaultExecutor for OpenAI-compatible APIs",
+          "example": "import { DefaultExecutor } from \"./default.js\"; const executors = new Map([...,\"bedrock\": bedrockExecutor, ...]);"
+        }
+      ],
+      "crossContextCommunication": {
+        "pattern": "Explicit contracts, events, APIs, or anti-corruption layers",
+        "example": "Anti-corruption layer translates between models when integrating with external/legacy systems\nrtk/ modifies request body in-place as fail-open (returns null on error, leaves body untouched)"
+      }
+    },
+    "3_architectural_issues": {
+      "description": "Violations of conventions from open-sse/AGENTS.md (DRY, config-driven, no hardcode)",
+      "issues": [
+        {
+          "id": "ISSUE-001",
+          "severity": "high",
+          "category": "Hardcoded provider strings in SPECIAL_ADAPTERS",
+          "location": "open-sse/handlers/ttsProviders/index.js lines 15-25",
+          "description": "The SPECIAL_ADAPTERS object has providers hardcoded as string keys (\"google-tts\", \"edge-tts\", \"local-device\", \"elevenlabs\", \"openai\", \"openrouter\", \"gemini\", \"xiaomi-mimo\", \"selfhosted-tts\"). This violates the config-driven convention - new adapter providers require code changes rather than config updates.",
+          "conventionViolation": "Config-driven: NEVER hardcode values, models, or block/role strings — use config/ + schema/ constants. (open-sse/AGENTS.md line 11, 24)",
+          "fix": "Move adapter registry to config-driven approach where providers declare their TTS support in their registry entry, or use a naming convention that auto-maps provider IDs to adapter modules.",
+          "evidence": "synthesizeViaConfig() in the same file already demonstrates the config-driven pattern by reading AI_PROVIDERS[provider]?.ttsConfig from the provider registry."
+        },
+        {
+          "id": "ISSUE-002",
+          "severity": "high",
+          "category": "vitest import alias resolution problem",
+          "location": "tests/vitest.config.js and multiple test files using @/... imports",
+          "description": "Test files use @/... aliases (e.g., '@/app/api/providers/route.js', '@/models/index.js', '@/lib/dataDir.js', '@/lib/db/driver.js') that don't resolve properly when running vitest from certain directories. The vitest config alias {find: /^@\\//, replacement: resolve(__dirname, \"../src\") + \"/\"} works in some contexts but fails in others.",
+          "conventionViolation": "DRY: Test imports should resolve consistently without requiring relative path updates when directory structure changes.",
+          "fixOptions": [
+            {"option": "Option 1 (Relative Paths)", "": "Change @/... imports to relative paths (e.g., ../../../src/app/api/providers/route.js) - most reliable, works regardless of vitest config"},
+            {"option": "Option 2 (Fix Vitest Config)", "": "Use absolute path for @/ alias: {find: /^@\\//, replacement: resolve(__dirname, \"../../src\") + \"/\"} and ensure __dirname is correct"},
+            {"option": "Option 3 (Root Config)", "": "Create vitest config at project root that overrides tests config"}
+          ],
+          "evidence": "FIX_VITEST_ALIASES.md documents the issue completely; FIX_PLAN.md Priority 2 addresses this."
+        },
+        {
+          "id": "ISSUE-003",
+          "severity": "medium",
+          "category": "Dynamic import inside function for config",
+          "location": "open-sse/handlers/ttsProviders/index.js line 33: import(\"@/shared/constants/providers\")",
+          "description": "synthesizeViaConfig() uses a dynamic import() inside the function body to get AI_PROVIDERS. While this works, it's inconsistent with the pattern used elsewhere where AI_PROVIDERS is imported at the top level. The dynamic import creates an additional async boundary and may cause issues with module caching.",
+          "conventionViolation": "Config-driven: Values should be resolved from config at module load time, not runtime via dynamic import.",
+          "fix": "Move the AI_PROVIDERS import to module level or pass it as a parameter to synthesizeViaConfig."
+        },
+        {
+          "id": "ISSUE-004",
+          "severity": "medium",
+          "category": "Font preconnect defined but not used in layout",
+          "location": "src/app/layout.js line 28: export const fontPreconnect = \"https://fonts.gstatic.com\";",
+          "description": "The fontPreconnect constant is defined and fontPreconnect is added to viewport, but there is NO <link rel=\"preconnect\" href=\"https://fonts.gstatic.com\" crossorigin> in the <head> of the HTML. The constant and viewport property exist but have no effect.",
+          "conventionViolation": "DRY: Defining a constant and not using it wastes developer time and creates false expectations. The web-performance-analysis.md explicitly recommends adding preconnect (Phase 5, High Impact/Low Effort).",
+          "fix": "Add <link rel=\"preconnect\" href=\"https://fonts.gstatic.com\" crossorigin> to the head in layout.js alongside the existing Google Analytics script."
+        },
+        {
+          "id": "ISSUE-005",
+          "severity": "medium",
+          "category": "Font loading timeout not minimized",
+          "location": "src/app/layout.js line 49: setTimeout(f, 1000) // 1s timeout",
+          "description": "The font loading script has a 1-second timeout before forcing 'fonts-loaded' class. While 1s is better than the typical 3s, it could be further reduced or made configurable based on connection quality.",
+          "conventionViolation": "Performance: Hardcoded timeout without adaptive behavior.",
+          "fix": "Make the timeout configurable via env var or reduce further with critical font preload."
+        },
+        {
+          "id": "ISSUE-006",
+          "severity": "low",
+          "category": "handleTtsCore has adapter logic that should be config-driven",
+          "location": "open-sse/handlers/ttsCore.js lines 57-64, handleTtsCore function",
+          "description": "The handleTtsCore function has a long list of special-cased adapter providers (lines 57-64). While some adaptation logic is inherently provider-specific, the pattern of checking for and dispatching to adapters could be more systematically configured rather than hardcoded in a switch-like object.",
+          "conventionViolation": "The system claims to be config-driven but has significant hardcoded dispatch logic in handleTtsCore.",
+          "fix": "Move adapter registry to provider registry entries with a 'ttsAdapter' field, or use a naming convention convention (e.g., provider \"openai\" auto-maps to openai.js adapter)."
+        }
+      ]
+    },
+    "4_architectural_decision_records": {
+      "description": "ADRs for the four specified issues",
+      "adr1_tts_core_handler_pattern": {
+        "id": "ADR-001",
+        "title": "TTS Core Handler: Adapter Pattern vs Config-Driven Pattern",
+        "status": "proposed",
+        "context": "The TTS handling in open-sse has two coexisting patterns: (1) SPECIAL_ADAPTERS object with hardcoded provider→adapter mappings in ttsProviders/index.js, and (2) synthesizeViaConfig() that is config-driven, reading AI_PROVIDERS[provider]?.ttsConfig and using FORMAT_HANDLERS. The adapter pattern works for known providers but violates the config-driven convention when new providers need code changes.",
+        "decision": "Adopt a hybrid approach: Keep the adapter pattern for providers with significantly different API shapes (google-tts, edge-tts, local-device, elevenlabs, openai, openrouter, gemini, xiaomi-mimo, selfhosted-tts) but move the adapter registry to be populated from the provider registry entries. Each provider registry entry will have an optional 'ttsAdapter' field. For providers without a ttsAdapter field, fall through to the config-driven synthesizeViaConfig path. This preserves the performance of direct adapter calls while making the system extensible without code changes.",
+        "consequences": {
+          "easier": "New TTS providers can be added by updating the registry entry without modifying ttsProviders/index.js or handleTtsCore.js",
+          "harder": "Initial setup requires updating the registry schema and ensuring all existing providers have correct ttsAdapter field values",
+          "tradeoff": "Slightly more complex initial configuration but significantly easier long-term maintenance"
+        },
+        "relatedIssues": ["ISSUE-001", "ISSUE-006"]
+      },
+      "adr2_vitest_alias_resolution": {
+        "id": "ADR-002",
+        "title": "Vitest Import Alias Resolution Fix",
+        "status": "accepted",
+        "context": "Test files across the codebase use @/... subpath aliases (e.g., '@/app/api/providers/route.js', '@/models/index.js', '@/lib/dataDir.js', '@/lib/db/driver.js') that fail to resolve consistently when running vitest from different directories. The vitest config in tests/vitest.config.js has alias {find: /^@\\//, replacement: resolve(__dirname, \"../src\") + \"/\"} but this doesn't work reliably due to __dirname resolution issues and vitest configuration loading order.",
+        "decision": "Apply Fix Option 1 from FIX_VITEST_ALIASES.md: Update all test file imports from @/... to relative paths. Specifically:\n- tests/unit/bedrock-provider-api-secrets.test.js: @/app/api/providers/route.js → ../../../src/app/api/providers/route.js\n- tests/unit/bedrock-provider-api-secrets.test.js: @/app/api/providers/[id]/route.js → ../../../src/app/api/providers/[id]/route.js\n- tests/unit/bedrock-provider-api-secrets.test.js: @/models/index.js → ../../../src/models/index.js\n- tests/unit/force-stream-config.test.js: @/lib/dataDir.js → ../../../src/lib/dataDir.js\n- tests/unit/db-migration-chain.test.js: @/lib/db/driver.js → ../../../src/lib/db/driver.js\n\nRationale: This is the most reliable fix that works regardless of vitest configuration quirks or working directory. The test files are permanently in tests/unit/, so relative paths are predictable and stable.",
+        "consequences": {
+          "easier": "Imports will always resolve correctly; no dependency on vitest config __dirname resolution; works in any CI environment",
+          "harder": "Requires updating import paths in 5 test files; relative paths are longer to type and more fragile to directory moves (mitigated by keeping tests in stable location)",
+          "tradeoff": "One-time effort to update imports vs. ongoing vitest config maintenance"
+        },
+        "relatedIssues": ["ISSUE-002"]
+      },
+      "adr3_web_performance_fixes": {
+        "id": "ADR-003",
+        "title": "Web Performance Fixes: Font Preconnect and Timeout Reduction",
+        "status": "accepted",
+        "context": "The web-performance-analysis.md identified several high-impact, low-effort performance improvements. Two were flagged as not yet implemented: (1) font preconnect not added to layout head, and (2) font loading timeout at 1s could be optimized further. The layout.js defines fontPreconnect constant and viewport property but does not actually add a <link rel=\"preconnect\"> tag to the HTML head.",
+        "decision": "Implement both fixes:\n1. Add <link rel=\"preconnect\" href=\"https://fonts.gstatic.com\" crossorigin> to the head in src/app/layout.js alongside the Google Analytics script\n2. Reduce the font loading timeout from 1000ms to 500ms in the inline script, or make it configurable via an env var\n\nThese changes are estimated to save 100-200ms LCP (preconnect) and 200ms FCP (earlier font visibility).\n\nAdditionally, verify Tailwind v4 purge configuration by running build and checking .next/ for unused class removal (estimated 50-100KB CSS reduction).",
+        "consequences": {
+          "easier": "Measurable performance improvements with minimal code changes (5 min each); improves Core Web Vitals ratings; no user-facing behavior changes",
+          "harder": "Need to rebuild and verify no regressions; preconnect may have limited benefit if fonts are already cached by returning visitors",
+          "tradeoff": "Small code changes for measurable performance gain; preconnect has diminishing returns for cached fonts"
+        },
+        "relatedIssues": ["ISSUE-004", "ISSUE-005"]
+      },
+      "adr4_drift_prevention_framework": {
+        "id": "ADR-004",
+        "title": "Drift Prevention Framework Implementation",
+        "status": "proposed",
+        "context": "The STATUS_UPDATE.md and FINAL_SUMMARY.md document a 4-point drift prevention checklist designed to prevent AI agent code drift categories: (1) import resolution test, (2) full test suite, (3) pattern logic verification, (4) diff review. The investigation revealed that without all 4 checks, regressions are systematic and cumulative; with all 4 checks, drift is detected within 1 change, not 50 changes later.\n\nHowever, the checklist is not yet enforced in CI/CD. The codebase has existing drift issues: vitest alias resolution failures, hardcoded values that violate config-driven conventions, and test expectations that don't match actual behavior.",
+        "decision": "Enforce the 4-point drift prevention checklist in CI/CD:\n\n1. Import Resolution Test: Every PR must pass a test that validates all @/ and open-sse/ aliases resolve correctly. Run vitest with --resolveAliases and fail if any unresolved aliases exist.\n\n2. Full Test Suite: Run the complete test suite (including open-sse provider tests) as part of CI. Currently some tests fail due to API key availability, but the suite structure exists.\n\n3. Pattern Logic Verification: For any change to open-sse/providers/capabilities.js or pattern-matching logic, run the combo-caps-resolver.test.js and ensure expectations match actual behavior (or update expectations with proper rationale).\n\n4. Diff Review: Mandatory diff review for all changes to open-sse/AGENTS.md conventions (config-driven, DRY, no hardcode). Use automated lint rules to flag hardcoded strings, missing config references, and pattern matching issues.\n\nAdditionally, create an automated drift detection job that compares baseline import graphs and pattern-matching outputs against current state on each commit.\n\nThe 4-point checklist should be added to GitHub Actions workflow (referenced in STATUS_UPDATE.md line 183: \"Create drift prevention CI check\").",
+        "consequences": {
+          "easier": "Drift detected immediately within a single change rather than accumulating over 50+ changes; clearer ownership of convention violations; faster onboarding for new AI agents",
+          "harder": "Initial setup cost to add 4 CI checks and drift detection baseline; requires consistent enforcement to be effective; may slow down PR merge times initially",
+          "tradeoff": "Upfront investment in CI infrastructure pays off by preventing systematic regressions; the 4 checks create a safety net that makes experimentation safer"
+        },
+        "relatedIssues": ["ISSUE-001", "ISSUE-002", "ISSUE-003", "ISSUE-006"]
+      }
+    },
+    "5_recommendations": {
+      "description": "Recommendations for long-term architecture health",
+      "shortTerm": [
+        {"action": "Fix vitest alias resolution by updating test imports to relative paths (ADR-002)",
+         "effort": "1 hour", "impact": "high", "risk": "low"},
+        {"action": "Add font preconnect to layout.js head (ADR-003)",
+         "effort": "5 minutes", "impact": "high", "risk": "very-low"},
+        {"action": "Reduce font loading timeout from 1s to 500ms (ADR-003)",
+         "effort": "5 minutes", "impact": "medium", "risk": "very-low"},
+        {"action": "Move adapter registry to provider registry entries for config-driven TTS (ADR-001)",
+         "effort": "2-3 hours", "impact": "high", "risk": "medium"},
+        {"action": "Review and update handleTtsCore adapter logic to be more config-driven (ADR-001 follow-up)",
+         "effort": "1-2 hours", "impact": "medium", "risk": "low"}
+      ],
+      "longTerm": [
+        {"action": "Implement full drift prevention CI checklist (ADR-004)",
+         "effort": "4-6 hours setup", "impact": "very high", "risk": "low"},
+        {"action": "Create provider registry schema validation to ensure all entries conform to conventions (config-driven, no hardcode)",
+         "effort": "2-3 hours", "impact": "high", "risk": "low"},
+        {"action": "Refactor synthesizeViaConfig to avoid dynamic import() inside function body",
+         "effort": "1 hour", "impact": "medium", "risk": "low"},
+        {"action": "Add automated pattern-matching regression tests for capabilities.js changes",
+         "effort": "2-3 hours", "impact": "high", "risk": "low"},
+        {"action": "Implement comprehensive provider registry entry audit tool that validates:\n  - No hardcoded role/block/model strings\n  - All config values come from registry/config, not inline\n  - Pattern conventions are followed\n  - Translators self-register via import side-effects in index.js",
+         "effort": "3-4 hours", "impact": "high", "risk": "low"}
+      ],
+      "technicalDebt": [
+        {"item": "vitest alias resolution - 5 test files need import path updates",
+         "status": "pending", "discovered": "2026-10-19"},
+        {"item": "Font preconnect defined but not used in layout - constant exists but has no HTML effect",
+         "status": "pending", "discovered": "2026-10-19"},
+        {"item": "FONT LOADING TIMEOUT at 1s - could be optimized further",
+         "status": "pending", "discovered": "2026-10-19"},
+        {"item": "SPECIAL_ADAPTERS hardcoded in ttsProviders/index.js - violates config-driven convention",
+         "status": "pending", "discovered": "2026-10-19"},
+        {"item": "synthesizeViaConfig dynamic import() inside function body",
+         "status": "pending", "discovered": "2026-10-19"},
+        {"item": "handleTtsCore adapter logic not fully config-driven",
+         "status": "pending", "discovered": "2026-10-19"}
+      ],
+      "conventionsSummary": {
+        "configDriven": "The system aims to be config-driven: values, models, and strings should come from config/ registry, not hardcoded. Evidence: provider registry, providerModels.js, runtimeConfig.js, translator pipeline through OpenAI format.",
+        "drY": "Don't Repeat Yourself: Shared logic in concerns/, formats/, schema/. Translators self-register via register() side-effects.",
+        "noHardcode": "NEVER hardcode values, models, or block/role strings — use config/ + schema/ constants. (open-sse/AGENTS.md)",
+        "camelCase": "CamelCase for exports, functions, variables.",
+        "testImportAliases": "@/ alias must resolve from vitest config; otherwise use relative paths"
+      }
+    }
+  }
+}

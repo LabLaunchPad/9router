@@ -1,0 +1,184 @@
+{
+  "recommendations": [
+    {
+      "id": "NET-001",
+      "title": "Persist Proxy Dispatcher Cache Across Restarts",
+      "file": "open-sse/utils/proxyFetch.js",
+      "current": "proxyDispatchers Map is in-memory, resets on process restart; max size 20 via MEMORY_CONFIG.proxyDispatchersMaxSize",
+      "proposed": "Add SQLite or localStorage-backed dispatcher cache; populate on startup from persistent store; update on each use; TTL-based invalidation; expose via /api/proxy-pools cache status",
+      "effort": "1-2 hours",
+      "impact": "Medium",
+      "risk": "Low",
+      "relatedTo": ["SRE_ADR.md §4.1", "SRE_summary.json §5.2"]
+    },
+    {
+      "id": "NET-002",
+      "title": "Make FETCH_CONNECT_TIMEOUT_MS Configurable via Env Vars",
+      "file": "open-sse/config/runtimeConfig.js",
+      "current": "Hardcoded to 60000ms (60s) via envMs(\"FETCH_CONNECT_TIMEOUT_MS\", 60 * 1000)",
+      "proposed": "Keep existing env var pattern; document in .env.example; ensure all executors use the re-exported constant (verified: qoder.js, bedrock.js, base.js, grok-cli.js already use it)",
+      "effort": "30 min",
+      "impact": "Medium",
+      "risk": "Very Low",
+      "relatedTo": ["SRE_ADR.md §5.4", "SRE_summary.json §4.2"]
+    },
+    {
+      "id": "NET-003",
+      "title": "Increase DNS Cache TTL for Production Workloads",
+      "file": "open-sse/config/runtimeConfig.js",
+      "current": "dnsCacheTtlMs: 5 * 60 * 1000 (5 minutes) in MEMORY_CONFIG",
+      "proposed": "Increase to 10 minutes (10 * 60 * 1000) or make configurable via env var DNS_CACHE_TTL_MS; add monitoring for cache hit/miss ratio",
+      "effort": "30 min",
+      "impact": "Medium",
+      "risk": "Very Low",
+      "relatedTo": ["SRE_ADR.md §6.1", "SRE_summary.json §9.4"]
+    },
+    {
+      "id": "NET-004",
+      "title": "Add Health Check Endpoint /api/health",
+      "file": "src/app/api/health/route.js (new file)",
+      "current": "No health endpoint exists; proxy status must be inferred from logs or manual checks",
+      "proposed": "Create route returning JSON: { proxyEnabled, proxyType, proxyUrl, dispatcherCount, dnsCacheSize, strictProxy, pendingRequestCount, errorBudgetRemaining, activeAccountsPerProvider, fetchConnectTimeoutMs, streamStallTimeoutMs }",
+      "effort": "1 hour",
+      "impact": "High",
+      "risk": "Very Low",
+      "relatedTo": ["SRE_ADR.md §8.2", "SRE_summary.json §5.2"]
+    },
+    {
+      "id": "NET-005",
+      "title": "Implement Proxy Pool Usage Metrics",
+      "file": "src/lib/network/connectionProxy.js",
+      "current": "No per-pool metrics tracked; round-robin/random selection without visibility into usage",
+      "proposed": "Add usage counters to proxy_pools DB table: requestCount, byteCount, consecutiveFailures, lastFailureTimestamp; increment on fetchWithTlsFallback call; expose via /api/proxy-pools?includeUsage=true; add alerting on overused/underused pools",
+      "effort": "2-3 hours",
+      "impact": "Medium",
+      "risk": "Low",
+      "relatedTo": ["SRE_ADR.md §8.1", "SRE_summary.json §8.3"]
+    },
+    {
+      "id": "NET-006",
+      "title": "Configure Undici Agent Keep-Alive Settings",
+      "file": "open-sse/utils/proxyFetch.js",
+      "current": "No explicit Agent configuration; relying on undici defaults; proxyDispatchersMaxSize: 20",
+      "proposed": "Configure undici Agent with { timeout: 30000, keepAlive: true, keepAliveMsec: 10000, maxSockets: 50 } for direct connections; add configurable maxSockets per proxy pool type; document in runtimeConfig",
+      "effort": "30 min",
+      "impact": "Medium",
+      "risk": "Very Low",
+      "relatedTo": ["SRE_ADR.md §4.2", "SRE_summary.json §9.2"]
+    },
+    {
+      "id": "NET-007",
+      "title": "Add Concurrent Request Limit Per Proxy Pool",
+      "file": "src/lib/network/connectionProxy.js + open-sse/utils/proxyFetch.js",
+      "current": "No per-pool concurrent request limit; single busy pool could starve others",
+      "proposed": "Add semaphore/concurrent request counter per proxy pool; increment on fetch start, decrement on completion; reject/queue when limit exceeded (configurable per pool, default 10); prevent single-pool overload",
+      "effort": "2 hours",
+      "impact": "Medium",
+      "risk": "Low",
+      "relatedTo": ["SRE_ADR.md §9.2", "SRE_summary.json §9.2"]
+    },
+    {
+      "id": "NET-008",
+      "title": "Implement Connection Draining on Proxy Pool Disable",
+      "file": "src/lib/network/outboundProxy.js",
+      "current": "Env var clear is immediate on proxy disable; in-flight requests may abruptly switch to direct",
+      "proposed": "Add grace period or in-flight request tracking; on proxy disable, wait for pending requests to complete or timeout before clearing env vars; add /api/proxy-pools/drain endpoint",
+      "effort": "2 hours",
+      "impact": "Medium",
+      "risk": "Low",
+      "relatedTo": ["SRE_ADR.md §9.2", "SRE_summary.json §9.2"]
+    },
+    {
+      "id": "NET-009",
+      "title": "Document Proxy URL Scheme Formats",
+      "file": "src/lib/network/outboundProxy.js + README",
+      "current": "ALLOWED_PROXY_SCHEMES defined in outboundProxy.js; validated but not documented for operators",
+      "proposed": "Add section to README or docs/proxy.md with examples for each type: http://host:port, https://host:port, socks5://host:port, socks4://host:port, socks5h://host:port, socks4a://port; add validation error messages with allowed schemes list",
+      "effort": "30 min",
+      "impact": "Low",
+      "risk": "Very Low",
+      "relatedTo": ["SRE_summary.json", "outboundProxy.js"]
+    },
+    {
+      "id": "NET-010",
+      "title": "Set strictProxy Default to False with Opt-In",
+      "file": "src/lib/network/connectionProxy.js",
+      "current": "strictProxy defaults based on DB value; no explicit default in code path",
+      "proposed": "Ensure strictProxy defaults to false in DB schema and API; add warning in UI when strictProxy is enabled; explicit opt-in required for sensitive deployments",
+      "effort": "1 hour",
+      "impact": "Low",
+      "risk": "Very Low",
+      "relatedTo": ["SRE_ADR.md §8.3", "connectionProxy.js"]
+    },
+    {
+      "id": "NET-011",
+      "title": "Add Proxy Rotation Scheduling",
+      "file": "src/lib/network/connectionProxy.js",
+      "current": "Manual rotation via API; round-robin index resets on restart",
+      "proposed": "Add scheduled job (cron) that rotates round-robin index daily/weekly; add auto-rotate flag on proxy pool configuration; persist rotation state in DB",
+      "effort": "2 hours",
+      "impact": "Low",
+      "risk": "Low",
+      "relatedTo": ["SRE_ADR.md §9.2", "connectionProxy.js"]
+    },
+    {
+      "id": "NET-012",
+      "title": "Increase DNS Cache TTL Configurability",
+      "file": "open-sse/config/runtimeConfig.js",
+      "current": "dnsCacheTtlMs hardcoded in MEMORY_CONFIG as 5 minutes; readable via envMs but not exposed",
+      "proposed": "Make dnsCacheTtlMs fully configurable via env var DNS_CACHE_TTL_MS with 5min default; add monitoring for cache hit/miss ratio; expose in health endpoint",
+      "effort": "30 min",
+      "impact": "Low",
+      "risk": "Very Low",
+      "relatedTo": ["SRE_ADR.md §9.4", "SRE_summary.json §9.4"]
+    },
+    {
+      "id": "NET-013",
+      "title": "Add MITM Bypass Host List Documentation",
+      "file": "open-sse/utils/proxyFetch.js + docs",
+      "current": "MITM_BYPASS_HOSTS array with 6 hosts; no documentation on why these hosts or how to add entries",
+      "proposed": "Add section to docs explaining: these are all public-CA-issued targets; TLS verification works without extra trust; add new hosts as needed (must have valid public certs); document the DNS spoofing risk that motivates this bypass",
+      "effort": "30 min",
+      "impact": "Low",
+      "risk": "Very Low",
+      "relatedTo": ["SRE_summary.json", "proxyFetch.js"]
+    },
+    {
+      "id": "NET-014",
+      "title": "Persist Proxy Pool Rotation State Across Restarts",
+      "file": "src/lib/network/connectionProxy.js",
+      "current": "rotateState Map is in-memory, resets on process restart; providerId → { index } for round-robin",
+      "proposed": "Persist rotation index to DB; populate on startup from DB; update on each use; enables consistent round-robin across restarts; add health endpoint to view rotation state",
+      "effort": "1-2 hours",
+      "impact": "Medium",
+      "risk": "Low",
+      "relatedTo": ["SRE_ADR.md §4.3", "SRE_summary.json §5.2"]
+    },
+    {
+      "id": "NET-015",
+      "title": "Add Proxy Fallback Metrics and Alerting",
+      "file": "open-sse/utils/proxyFetch.js + monitoring",
+      "current": "Proxy failures logged via console.warn; no structured metrics on fallback frequency",
+      "proposed": "Track proxy failure counts per pool type; track fallback-to-direct frequency; add Prometheus metrics or health endpoint counters; alert on sudden increase in fallback rate (indicates proxy degradation)",
+      "effort": "2-3 hours",
+      "impact": "Medium",
+      "risk": "Low",
+      "relatedTo": ["SRE_ADR.md §5.2", "SRE_summary.json §8.1"]
+    }
+  ],
+  "summary": {
+    "totalRecommendations": 15,
+    "highImpact": 4,
+    "mediumImpact": 7,
+    "lowImpact": 4,
+    "veryLowRisk": 13,
+    "lowRisk": 2,
+    "effortDistribution": {
+      "30min": 6,
+      "1hour": 4,
+      "2hours": 3,
+      "1-2hours": 3,
+      "2-3hours": 3
+    }
+  }
+}

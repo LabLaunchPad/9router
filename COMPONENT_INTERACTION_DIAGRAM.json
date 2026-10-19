@@ -1,0 +1,99 @@
+{
+  "title": "Component Interaction Diagram - Real-Time Data Flow",
+  "status": "proposed",
+  "context": "9router application real-time infrastructure: chatCore → executors → translators → SSE out, model routing, combo caps, TTS flow",
+  "date": "2026-10-19",
+  "tags": ["architecture", "data-flow", "sse", "model-routing", "combo-caps", "tts"],
+  "components": {
+    "chatCore": {
+      "role": "Request dispatch and streaming pipeline",
+      "files": ["open-sse/handlers/chatCore/streamingHandler.js", "open-sse/handlers/chatCore/nonStreamingHandler.js", "open-sse/handlers/chatCore/sseToJsonHandler.js"],
+      "inputs": ["client request JSON", "provider response SSE/JSON"],
+      "outputs": ["SSE response stream", "JSON response", "usage statistics DB"],
+      "internal pipeline": "parseModel → RTK compress → translateRequest → post-translate savers → getExecutor → executor.execute → translateResponse → SSE out",
+      "key responsibility": "Format detection, translation orchestration, streaming pipe management, error handling for aborts and stalls"
+    },
+    "executors": {
+      "role": "Upstream API calls (provider-specific)",
+      "files": ["open-sse/executors/index.js", "open-sse/executors/codex.js", "open-sse/executors/gemini-cli.js", "open-sse/executors/ollama-local.js", "open-sse/executors/default.js"],
+      "inputs": ["translated provider request body", "credentials"],
+      "outputs": ["SSE upstream stream", "HTTP response"],
+      "specialization": "One executor per provider type (codex, gemini-cli, cursor, bedrock, etc.); DefaultExecutor falls back to OpenAI-compatible API when no specialized executor exists",
+      "key responsibility": "Execute upstream API call, stream raw response chunks back through the pipeline"
+    },
+    "translator": {
+      "role": "Format conversion (client ↔ provider)",
+      "files": ["open-sse/translator/index.js", "open-sse/translator/formats.js", "open-sse/translator/concerns/"],
+      "inputs": ["source format body", "target format", "model info"],
+      "outputs": ["provider-format request", "client-format response"],
+      "pipeline": "request translation: source→openai→target (or direct route if registered); response translation: target→openai→source (or direct route)",
+      "direct routes": "Registered translator pairs avoid double-hop through OpenAI: e.g., claude↔kiro, openai-responses↔codex, gemini↔openai",
+      "key responsibility": "Convert between client format (OpenAI chat completions/Responses) and provider-native format; handle tool_calls, thinking, reasoning, role renaming"
+    },
+    "model routing": {
+      "role": "Provider/model resolution and combo expansion",
+      "files": ["open-sse/services/model.js", "src/services/model.js", "src/app/(dashboard)/chat.js"],
+      "inputs": ["client model string (e.g. 'gpt-4o', 'composer-2.5')"],
+      "outputs": ["{provider, model} resolution", "combo models array", "capability flags"],
+      "flow": "parseModel → resolveProviderAlias → getModelInfo → getProviderCredentials → enforceKeyAccess → handleChatCore → (combo: handleComboChat/handleFusionChat) → handleSingleModelChat → chatCore",
+      "combo resolution": "getComboModels → reorderByCapabilities (by hard/soft caps) → getRotatedModels (fallback/round-robin/fusion) → auto-switch float capable models to front → handleComboChat iterates rotated list with fallback on error/zero-content",
+      "fusion": "handleFusionChat fans prompt to all panel models in parallel, collects with quorum-grace, judge model synthesizes final answer",
+      "key responsibility": "Resolve which provider/model handles each request, handle fallbacks, rotation, and fusion"
+    },
+    "combo caps resolution": {
+      "role": "Capability detection and model aggregation",
+      "files": ["open-sse/services/combo.js", "open-sse/providers/capabilities.js"],
+      "inputs": ["request body", "combo model list", "key access context"],
+      "outputs": ["required capabilities Set (vision, pdf, audioInput, videoInput, search, tools, reasoning)", "reordered model list by capability fit"],
+      "hard capabilities": "vision, pdf, audioInput, videoInput - missing one drops request data",
+      "soft capabilities": "search, tools, reasoning - degrade feature but don't drop",
+      "pattern matching": "PATTERN_CAPABILITIES array of glob patterns (ordered specific→generic) → MODEL_CAPABILITIES exact overrides → PROVIDER_CAPABILITIES provider overrides → DEFAULT_CAPABILITIES safe floor",
+      "aggregateComboCapabilities": "Merge capabilities across all models in a combo, respecting provider-specific and exact-id overrides",
+      "key responsibility": "Determine what modalities a request needs, reorder combo models to satisfy capabilities first, aggregate capability state across combo members"
+    },
+    "SSE out": {
+      "role": "Server-Sent Events streaming egress",
+      "files": ["open-sse/index.js", "open-sse/utils/stream.js", "open-sse/utils/streamHandler.js"],
+      "inputs": ["transformed SSE stream chunks", "provider response"],
+      "outputs": ["HTTP response with Content-Type: text/event-stream", "Access-Control-Allow-Origin headers"],
+      "reliability": "pipeWithDisconnect(providerResponse, transformStream, streamController, onAbortTerminal, stallTimeoutMs) - handles client disconnect mid-stream, terminal bytes on abort, stall timeout detection",
+      "terminal bytes": "buildAbortedResponsesTerminalBytes (for Responses passthrough) or buildStreamErrorBytes (for other formats) - client sees real error instead of silent truncation",
+      "key responsibility": "Stream provider SSE through format translators to client; handle disconnects, stalls, and error terminal bytes"
+    },
+    "presence": {
+      "role": "Ephemeral awareness (cursors, selection, viewport)",
+      "files": ["TBD - not in current codebase but defined in ADR"],
+      "inputs": ["cursor position, selection, viewport state per user per room"],
+      "outputs": ["Broadcast to all room clients", "TTL-scoped Redis entries, fade after 30s"],
+      "design": "TTL=60s on presence hashes; heartbeat refreshes TTL; silence = gone; coalesced to ≤10 updates/sec; never writes to document log",
+      "key responsibility": "Who's here + where their cursor is; ephemeral, lossy by design; distinct channel from durable document ops"
+    }
+  },
+  "dataFlowDiagram": {
+    "description": "Client request → chat handler (auth + combo routing) → open-sse handleChatCore → parseModel/resolve credentials → RTK compress → translator translateRequest → post-translate savers (RTK headroom/caveman) → getExecutor → executor.execute (upstream API) → streaming pipe → translator translateResponse → SSE out",
+    "sequence": [
+      "1. Client POST /v1/chat/completions with {model, messages, ...}",
+      "2. Auth check + combo routing (model → provider/credentials)",
+      "3. parseModel → resolveProviderAlias → getProviderCredentials",
+      "4. RTK: compress tool_result in-place (fail-open, never throw)",
+      "5. translateRequest: source→openai→target (or direct route)",
+      "6. post-translate savers: headroom compress proxy, caveman system prompt inject",
+      "7. getExecutor(provider) → executor.execute() streams upstream",
+      "8. Provider SSE chunks → translateResponse: provider→client format",
+      "9. pipeWithDisconnect → SSE response with CORS headers",
+      "10. saveRequestDetail → usage DB; onStreamComplete → usage tracking"
+    ],
+    "responseFlow": "Provider SSE chunks → translateResponse (target→openai→source) → client-format JSON → SSE out with proper headers",
+    "modelRoutingFlow": "client model string → parseModel → (if alias → resolveModelAliasFromMap) → getModelInfo (from DB/cache) → getProviderCredentials → enforceKeyAccess → if combo → handleComboChat (auto-switch + rotate + fallback) → handleSingleModelChat → chatCore → executor → upstream → translateResponse → SSE",
+    "comboCapsFlow": "request body → detectRequiredCapabilities (scan current user turn for vision/audio/pdf) → reorderByCapabilities (tier: all-hard=0, all-hard-only=1, rest=2) → getRotatedModels (fallback/round-robin) → auto-switch float capable models → handleComboChat iterates with zero-content fallback"
+  },
+  "keyInsights": [
+    "The open-sse pipeline is modular: chatCore → translator → executor → translator → SSE, with RTK and post-translate savers as cross-cutting concerns",
+    "Direct translator routes (e.g., claude↔kiro) skip the lossy OpenAI double-hop",
+    "Executor specialization: most providers use DefaultExecutor (OpenAI-compatible); specialized executors handle non-standard upstream APIs (cursor, kiro, commandcode, etc.)",
+    "Model routing does credential rotation + combo fallback + capability-aware reordering before dispatching to chatCore",
+    "Combo fusion is parallel panel + judge synthesis - highest quality but most expensive (N+1 calls)",
+    "SRE patterns (backpressure, stall timeout, abort terminal bytes) are baked into the streaming pipe, not bolted on",
+    "Presence (if added) must be separate from durable document ops - TTL-scoped, lossy by design"
+  ]
+}

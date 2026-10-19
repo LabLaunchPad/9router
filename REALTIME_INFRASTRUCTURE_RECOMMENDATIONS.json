@@ -1,0 +1,56 @@
+{
+  "title": "Real-Time Infrastructure Recommendations",
+  "status": "draft",
+  "date": "2026-10-19",
+  "tags": ["realtime", "performance", "stability", "reconnect", "backpressure"],
+  "system": "9router - AI provider dashboard with SSE streaming, model combos, XYFlow, DnD-kit, Monaco editor",
+  "recommendations": {
+    "realTimePerformanceOptimization": {
+      "title": "Real-Time Performance Optimization",
+      "bullets": [
+        "Coalesce DnD-kit model reorder events: batch consecutive drag ends within 50ms window before sending op to server; this reduces op flood from rapid drags",
+        "Monaco editor: use `automaticLayout: true` only during initial mount; after that, call `layout()` explicitly on content changes rather than on every keystroke. Debounce content-to-op conversion at 200ms.",
+        "XYFlow state: transmit only delta ops (changed nodes/edges) not full state. Use fractional indexing for node positions so moves merge without renumbering. Transmit opId so duplicates are impossible by construction.",
+        "SSE streaming: the existing `pipeWithDisconnect` with `STREAM_STALL_TIMEOUT_MS` (configurable via runtimeConfig) already handles stall detection. Tune this per-provider - streaming models like Claude may need longer timeouts than Chat Completions.",
+        "Combo model routing: the auto-switch capability float (reorderByCapabilities) reduces fallback rate - capable models go first. Measure fallback rate and adjust PATTERN_CAPABILITIES/PROVIDER_CAPABILITIES to reduce it further.",
+        "Response translation: the direct route registry (e.g., claude↔kiro) avoids the OpenAI double-hop latency. When adding new provider support, prioritize a direct translator pair over the source→openai→target pipeline.",
+        "TTS flow: `handleTtsCore` → upstream TTS executor → streaming SSE. The existing pipeline already handles TTS via ttsProviders. Ensure TTS ops have lower priority than chat ops on the fan-out backplane to avoid starving chat streams."
+      ]
+    },
+    "connectionStabilityPatterns": {
+      "title": "Connection Stability Patterns",
+      "bullets": [
+        "The open-sse `handleChatCore` already has account fallback: `excludeConnectionIds` set on antigravity 409/429, transient errors get cooldown before falling through (combo.js lines 403-407). This pattern should be extended - on any provider error, before giving up, refresh credentials and retry once before falling to next account.",
+        "WebSocket heartbeat: implement server-side ping/interval and client-side pong tracking. If 3 consecutive heartbeats missed, mark connection stale and trigger graceful drain + reconnect. The current code doesn't appear to have explicit heartbeat - add it in the transport layer.",
+        "Exponential backoff with jitter on reconnect: the `scheduleReconnect` pattern from the ADR (base 500ms, double to 30s, jitter = random * backoff) prevents thundering herd on deploy. Already conceptualized in the SyncConnection class - implement if not present.",
+        "Drain before deploy: Rolling restarts should send reconnect hints, drain connections gracefully, and stagger client backoff. The ADR specifies this as a critical requirement - verify the Next.js/api route handlers emit `X-Reconnect-Hint` headers during deploys.",
+        "Idempotency is non-negotiable: Every client→server op must have a client-generated opId. Server apply must be idempotent - applying the same op twice must be a no-op. The RTK already compresses tool_result in-place; ensure every subsequent translator/executor step also respects opId dedupe.",
+        "Presence TTL: If adding presence, set Redis hash TTL to 30-60s. Heartbeat must refresh before expiry. After TTL expiry, client disappears from UI. Never buffer presence indefinitely - that causes memory growth and stale state.",
+        "SSE stall handling: The `STREAM_STALL_TIMEOUT_MS` (default from runtimeConfig) + `pipeWithDisconnect` already handles client disconnect during upstream stream. Verify the timeout value is appropriate for each provider class (chat: 30s, TTS: 60s, long-running: 120s)."
+      ]
+    },
+    "disconnectionReconnectionHandling": {
+      "title": "Disconnection / Reconnection Handling",
+      "bullets": [
+        "Client-side resume from last acknowledged seq: Every WebSocket connection must track `lastServerSeq` (highest seq applied locally). On connect, send `?resumeFrom=lastServerSeq`. The server replays any ops between resumeFrom and now from the append-only per-room op log. This is the single most important reconnect guarantee - without it, every reconnect loses data.",
+        "Server op log: Every durable op must be appended to a per-room, append-only log with monotonically increasing sequence numbers. The log enables: resume on reconnect, audit trail, time-travel debugging, and replay of stale ops after hours offline.",
+        "Operation idempotency: Keyed by client-generated opId (crypto.randomUUID()). Duplicate apply is a no-op on both server and client. The pending Map in the SyncConnection class tracks sent-but-not-yet-acked ops; on reconnect, these are safely re-sent because the server dedups by opId.",
+        "Gap detection & replay: If client reconnects and lastServerSeq < server's highest seq, the server replays the gap. If the client was offline for hours with 200 queued ops, those replay in order. The document converges with concurrent remote edits because ops are sequenced and idempotent.",
+        "Two clients editing the same word simultaneously: Both ops get sequenced by the server. The CRDT/OT merge logic ensures both converge to identical bytes. Neither edit is silently lost - the merge function (e.g., Yjs insert) handles interleaving. Test this with the hostile-network suite.",
+        "Server deploy during active session: Rolling restart must drain connections gracefully: send `X-Reconnect-Hint` header, stagger client backoff with jitter, stagger drain across instances. No thundering herd. The ADR rule 7 explicitly covers this.",
+        "Kill-the-network test: Network kills mid-op, reconnect, verify exactly-once. 1 hour offline with 200 queued ops, reconnect, verify queue replays in order and document converges with concurrent remote edits. Two clients edit same word simultaneously through 500ms latency - verify convergence. These must be automated CI tests, not manual demo-day rituals.",
+        "Slow consumer backpressure: A slow consumer must never balloon server memory. Bound the op queue, coalesce updates (last-cursor-wins for DnD-kit cursor positions), and drop-then-resync rather than buffer to death. The ADR rule 6 covers this.",
+        "XYFlow + DnD-kit specific: Drag events → op → server sequences → broadcast to all clients. On reconnect, the op log replay restores the exact drag state. The fractional indexing for node positions ensures moves merge without renumbering the world. Test: drag a node mid-stream, kill network, reconnect - node should be in the correct dropped position."
+      ]
+    }
+  },
+  "implementationPriority": "High - start with exactly-once op delivery + resumeFrom + idempotent apply (foundation for everything else). Then add CRDT for XYFlow text, then presence TTL, then hostile-network CI suite.",
+  "successMetrics": [
+    "Exactly-once effect for every durable operation - duplicate-apply rate of zero, proven by opId auditing",
+    "Reconnect resume succeeds without full-document refetch for ≥ 99% of reconnects, including deploys",
+    "Op-apply latency p95 under 150ms intra-region",
+    "Presence updates coalesced to ≤ 10/sec per room under any load",
+    "Deploys cause zero lost operations and no reconnect storms - connection churn stays within 2x baseline during rollouts",
+    "Hostile-network suite runs in CI and blocks merges - 100% of realtime changes pass it before shipping"
+  ]
+}
