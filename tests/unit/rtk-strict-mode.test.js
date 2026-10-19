@@ -12,14 +12,31 @@
  * @see ADR-006
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { rtkStrict, RTK_STRICT_MODE } from "../../open-sse/config/runtimeConfig.js";
 import { compressWithHeadroom } from "../../open-sse/rtk/headroom.js";
 import { injectCaveman } from "../../open-sse/rtk/caveman.js";
 import { injectPonytail } from "../../open-sse/rtk/ponytail.js";
 import { safeApply } from "../../open-sse/rtk/applyFilter.js";
+import { compressMessages } from "../../open-sse/rtk/index.js";
 import { CAVEMAN_LEVELS } from "../../open-sse/rtk/cavemanPrompts.js";
 import { PONYTAIL_LEVELS } from "../../open-sse/rtk/ponytailPrompt.js";
+
+// The RTK filter pipeline picks a compressor with autoDetectFilter(). Mocking
+// it lets the PRODUCTION path (compressMessages -> compressText -> safeApply)
+// be exercised with a filter that always panics. Testing safeApply directly
+// is not enough: the flag used to be accepted by safeApply and never supplied
+// by its only production caller, so the strict mode looked covered while the
+// tool_result compressor stayed permanently fail-open.
+vi.mock("../../open-sse/rtk/autodetect.js", () => ({
+  autoDetectFilter: () => {
+    const boom = () => {
+      throw new Error("filter panic");
+    };
+    boom.filterName = "boom-filter";
+    return boom;
+  },
+}));
 
 // --- helpers ---------------------------------------------------------------
 
@@ -86,6 +103,38 @@ describe("safeApply", () => {
 
   it("returns the filter output on success", () => {
     expect(safeApply((t) => t.toUpperCase(), "some text")).toBe("SOME TEXT");
+  });
+});
+
+// --- the production filter path ---------------------------------------------
+
+describe("RTK strict mode on the production filter path", () => {
+  // MIN_COMPRESS_SIZE is 500 bytes, so the tool payload has to be bigger
+  // than that for the filter to be invoked at all.
+  function toolBody() {
+    return {
+      messages: [
+        { role: "user", content: "Hello" },
+        { role: "tool", content: "x".repeat(4096), tool_call_id: "call_1" },
+      ],
+    };
+  }
+
+  it("fails open on the production path by default", () => {
+    const body = toolBody();
+    expect(() => compressMessages(body, true)).not.toThrow();
+  });
+
+  it("propagates the failure on the production path in strict mode", () => {
+    const body = toolBody();
+    expect(() => compressMessages(body, true, true)).toThrow(/filter panic/);
+  });
+
+  it("leaves the body untouched when it fails open", () => {
+    const body = toolBody();
+    const before = body.messages[1].content;
+    compressMessages(body, true);
+    expect(body.messages[1].content).toBe(before);
   });
 });
 

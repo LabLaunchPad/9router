@@ -134,7 +134,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   // shapes 1:1 — keep the post-translate pass there so those providers are
   // untouched (and a retry never re-compresses an already-compressed body).
   const preTranslateRtk = provider === "cursor"
-    ? compressMessages(body, tokenSaverEnabled && rtkEnabled)
+    ? compressMessages(body, tokenSaverEnabled && rtkEnabled, rtkStrict)
     : null;
   const preTranslateRtkLine = formatRtkLog(preTranslateRtk);
   if (preTranslateRtkLine) console.log(preTranslateRtkLine);
@@ -277,7 +277,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   }
 
   // RTK: compress tool_result content. Skipped when already done pre-translate.
-  const rtkStats = preTranslateRtk || compressMessages(translatedBody, tokenSaverEnabled && rtkEnabled);
+  const rtkStats = preTranslateRtk || compressMessages(translatedBody, tokenSaverEnabled && rtkEnabled, rtkStrict);
 
   // Headroom: optional external proxy compression; fail open if proxy is absent.
   const headroomDiagnostics = {};
