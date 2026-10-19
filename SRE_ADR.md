@@ -278,7 +278,11 @@ The gate reads the `sse_error_budget_consumed` gauge exported by
 a CI-runner `localhost` endpoint — an unset `SLO_METRICS_ENDPOINT` is a
 configuration error and fails closed, and a *loopback* endpoint is refused
 outright, before any request is made, because it would measure the runner
-rather than the service. An audited emergency override
+rather than the service. The refusal covers every spelling of the address,
+and it is applied to **every redirect hop** as well as to the configured
+endpoint: the default `redirect: "follow"` would otherwise let the server
+being contacted hand the gate a `302` to the runner's own metrics. Only
+`http` and `https` endpoints are read. An audited emergency override
 (`SLO_GATE_OVERRIDE_APPROVED=true` plus a reason) is the only way to deploy
 over a block; the actor, timestamp, reason and git SHA are logged. The gate
 can be run on demand with `gh workflow run drift-prevention.yml -f

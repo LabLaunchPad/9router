@@ -28,6 +28,8 @@ deployment policy:
 | No / malformed / unreachable metrics | `block` | `1` | **Fails closed** |
 | `SLO_METRICS_ENDPOINT` not configured | `block` | `1` | **Fails closed** |
 | `SLO_METRICS_ENDPOINT` points at a loopback address | `block` | `1` | **Refused** — it would measure the CI runner, not the service |
+| `SLO_METRICS_ENDPOINT` uses a scheme other than http/https | `block` | `1` | **Refused** — only http and https are read |
+| a redirect to a loopback address or a non-http scheme | `block` | `1` | **Refused** — every hop is checked |
 
 The gate is a **fail-closed** control by default: missing, malformed, or
 unavailable SLO data blocks the deploy rather than waving it through. Set
@@ -44,19 +46,8 @@ different failures:
 * a **loopback** endpoint is a measurement of the wrong thing, and is
   refused before the request is made — the gate sends it nothing at all.
 
-The check is on the *parsed* host, so every spelling of the same address is
-caught, and a host hidden in the userinfo is not mistaken for one:
-
-| Endpoint | Result |
-|---|---|
-| `http://localhost:3000/metrics` | refused |
-| `http://foo.localhost:3000/metrics` | refused (RFC 6761 reserves `.localhost` for loopback) |
-| `http://127.0.0.1:3000/metrics`, `http://127.1:3000/metrics` | refused |
-| `http://2130706433:3000/metrics`, `http://0x7f000001:3000/metrics`, `http://0177.0.0.1:3000/metrics` | refused — the URL parser normalises them to `127.0.0.1` |
-| `http://0.0.0.0:3000/metrics` | refused |
-| `http://[::1]:3000/metrics`, `http://[::ffff:127.0.0.1]:3000/metrics` | refused |
-| `http://localhost@real.host/metrics` | **not** refused — the host is `real.host` |
-| `https://metrics.internal/metrics` | allowed |
+See *What the gate will and will not read* below for the full list of what
+is refused, including the redirect and scheme rules.
 
 The refusal is unconditional. There is no flag for it: a gate that has been
 told to read the runner's own metrics cannot tell a healthy runner from a
@@ -106,6 +97,7 @@ would divide one provider's error count by another provider's request count.
 | `SLO_MIN_SAMPLE_SECONDS` | `0` | Opt in: block when the sample is thinner than this. `0` disables the check. An unknown age also blocks. |
 | `SLO_FAIL_CLOSED` | `true` | Set `false` to fail open **on data problems**. A missing endpoint still blocks. |
 | `SLO_FETCH_TIMEOUT_MS` | `8000` | Metrics request timeout. |
+| `SLO_MAX_REDIRECTS` | `3` | Maximum redirect hops, each of which is checked. |
 | `SLO_GATE_OVERRIDE_APPROVED` | `false` | Emergency override. Audited. |
 | `SLO_GATE_OVERRIDE` | `false` | Documented alias of `SLO_GATE_OVERRIDE_APPROVED`. |
 | `SLO_GATE_OVERRIDE_REASON` | `unspecified` | Recorded in the audit log. |
@@ -116,6 +108,42 @@ would divide one provider's error count by another provider's request count.
 > the gate**, so `http://localhost:3000/metrics` on the CI runner does not
 > merely wave through every deploy: it fails the deploy, with the reason in
 > the job summary. The script does not guess an endpoint either.
+
+### What the gate will and will not read
+
+The endpoint is checked before the request is made, and the check is on the
+**parsed** host rather than the raw string, because the raw string has many
+spellings and because parsing is the only thing that gets the inverse case
+right — a host hidden in the userinfo must not be mistaken for a loopback
+host.
+
+| Endpoint | Result |
+|---|---|
+| `http://localhost:3000/metrics` | refused |
+| `http://foo.localhost:3000/metrics` | refused (RFC 6761 reserves `.localhost` for loopback) |
+| `http://127.0.0.1:3000/metrics`, `http://127.1:3000/metrics` | refused |
+| `http://2130706433:3000/metrics`, `http://0x7f000001:3000/metrics`, `http://0177.0.0.1:3000/metrics` | refused — the URL parser normalises them to `127.0.0.1` |
+| `http://0.0.0.0:3000/metrics` | refused |
+| `http://[::1]:3000/metrics`, `http://[::ffff:127.0.0.1]:3000/metrics` | refused |
+| `http://localhost@real.host/metrics` | **not** refused — the host is `real.host` |
+| `data:`, `file:`, `ftp:` | refused — only `http` and `https` are read |
+| `https://metrics.internal/metrics` | allowed |
+
+**Redirects are followed manually, and every hop is checked.** The default
+`redirect: "follow"` would hand the decision to the server being contacted:
+it could answer `302 Location: http://127.0.0.1:3000/metrics` and the gate
+would read the runner's own metrics and allow the deploy. A direct loopback
+endpoint is refused; a loopback endpoint reached by redirect has to be
+refused too, or the refusal is only a suggestion. The hop limit is
+`SLO_MAX_REDIRECTS` (default 3), and a redirect that downgrades `https` to
+`http` is refused — metrics fetched over plaintext can be rewritten in
+transit, and the budget figure would be the attacker's.
+
+The refusal is unconditional. There is no flag for it: a gate that has been
+told to read the runner's own metrics cannot tell a healthy runner from a
+healthy service, so no setting makes that safe. The release paths remain
+`SLO_GATE_SKIP` and the audited `SLO_GATE_OVERRIDE_APPROVED` — and neither
+of them queries anything, because the override exits before the fetch.
 
 ### What the 30-day window actually means
 
@@ -427,7 +455,7 @@ SLO_GATE_OVERRIDE_APPROVED=true SLO_GATE_OVERRIDE_REASON="INC-4711" \
   node scripts/ci/validate-slo.mjs; echo $?
 ```
 
-Unit tests: `tests/unit/slo-gate.test.js` (69 cases) covering the healthy /
+Unit tests: `tests/unit/slo-gate.test.js` (75 cases) covering the healthy /
 warning / blocked / exhausted decision matrix, a missing metric, invalid
 Prometheus text, an HTTP failure, a timeout, the fail-open opt-out, the
 override (including that it wins over a misconfigured endpoint), and the
@@ -437,7 +465,8 @@ The loopback refusal has its own coverage, and the assertion that matters is
 the **request count**, not the exit code: a gate that tried the endpoint and
 then refused the answer would still exit 1, and the request would already
 have happened. The tests start a metrics server that counts what it receives
-and assert that it received **nothing**.
+and assert that it received **nothing** — including for a redirect to a
+loopback address, and for a `data:` URL, which needs no server at all.
 
 ### Rollback
 
@@ -505,13 +534,23 @@ never a truncated one. `fsync` failures are tolerated (some container
 overlays do not support it); the rename is still atomic, so this is a
 durability nicety, not a correctness requirement.
 
-Every write gets its **own** temp file (`<target>.<pid>.<tag>.<n>.tmp`). Two
-writers must never share a temp path: the periodic async writer and the
-synchronous shutdown writer can overlap, and a shared path means the shutdown
-snapshot is truncated by the other writer (or vice versa) — the async rename
-then fails with ENOENT and the file on disk is the wrong snapshot. A failed
-write unlinks its temp file, and the process no longer leaks one `.tmp` file
-per interrupted restart.
+Every write gets its **own** temp file
+(`<target>.<pid>.<tag>.<n>.<random>.tmp`). Two writers must never share a
+temp path: the periodic async writer and the synchronous shutdown writer can
+overlap, and a shared path means the shutdown snapshot is truncated by the
+other writer (or vice versa) — the async rename then fails with ENOENT and
+the file on disk is the wrong snapshot. A failed write unlinks its temp file,
+and the process no longer leaks one `.tmp` file per interrupted restart.
+
+The temp file is opened with `O_CREAT | O_EXCL | O_WRONLY` and mode `0600`.
+`O_EXCL` makes a name that already exists a **failure** rather than
+something to be written through, and the random component means the name is
+not worth pre-creating in the first place: in a state directory another
+local user can write to, a pre-created symlink would otherwise be truncated
+and overwritten with the snapshot. The `0600` mode is preserved by the
+rename, so the state file itself is not world-readable either — it holds no
+secret, but it holds operational state that has no business being read by
+another user on the machine.
 
 The snapshot file is versioned (`version: 1`). A file with an unknown version
 is discarded with a `sse_state_version_mismatch` warning rather than
@@ -705,10 +744,23 @@ Two read-only endpoints were added alongside these controls.
 
 ### `GET /api/health`
 
-Operational health snapshot: pending request counts, active connections,
+Operational health snapshot: pending request count, active connections,
 requests dropped by the last restart, error-budget remaining, the last error
 provider, per-provider circuit-breaker state, and process uptime. It exposes
 no request payloads, credentials, or user data.
+
+The route is **unauthenticated**, because the dashboard pings other instances
+cross-origin without credentials. What it publishes is therefore kept to what
+an operational health check needs. The **per-model breakdown is not in the
+public body**: which models are in flight is activity data, and the aggregate
+count tells an operator the same thing without publishing it to anyone who
+can reach the host. The breakdown is in the log line, where an operator can
+still read it.
+
+For the same reason the route is **not** logged on every request: a log line
+per unauthenticated request is a log-amplification primitive. The check is
+logged at most once a minute — but a **degraded** service is always logged,
+because that is the signal that matters.
 
 The error-budget figure is derived from the **same** counters the SLO gate
 reads (`computeErrorBudgetConsumed`), so the health view and the deploy gate
@@ -789,18 +841,25 @@ supposed to be failing fast.
 Prometheus text exposition. Exports `sse_requests_total`,
 `sse_error_responses_total`, `sse_request_latency_seconds` (a fixed-bucket
 histogram, so memory is bounded regardless of traffic),
-`sse_error_budget_consumed`, `sse_circuit_breaker_state`, and
-`sse_metrics_sample_age_seconds`.
+`sse_error_budget_consumed`, `sse_circuit_breaker_state`,
+`sse_metrics_sample_age_seconds`, and `sse_metrics_dropped_series_total`.
 
 The `sse_error_budget_consumed` gauge is the signal the SLO gate reads. The
 sample-age gauge is what lets the gate tell whether the sample spans the SLO
-window — see the window note in section 1.
+window — see the window note in section 1. The dropped-series gauge is
+non-zero when the registry had to refuse a series; it should always be zero.
 
 Both routes are in the dashboard guard's `PUBLIC_API_PATHS`: the SLO gate
 fetches `/api/metrics` unauthenticated (no cookies, no bearer token), so it
 has to be reachable. The payload is operational metadata only — request
 counters, latency histograms, breaker states and the error-budget gauge. No
 request payloads, credentials, headers or user data are exposed.
+
+Because the route is unauthenticated, the scrape is **not** logged on every
+request — a log line per unauthenticated request is an amplification
+primitive, and each of those requests also re-renders the whole registry. The
+scrape is logged at most once a minute; the metrics themselves are always
+complete.
 
 ### How the counters are fed
 
@@ -810,6 +869,22 @@ response untouched. `handleChat` in `src/sse/handlers/chat.js` is wrapped with
 it, so `/v1/chat/completions`, `/v1/messages` and `/v1/responses` are all
 counted. Other modalities can be wired the same way — one call per handler.
 
+**The `endpoint` label is a route template, never a request path.** The path
+is client-controlled — `/api/v1beta/models/[...path]` accepts an arbitrary
+suffix — and the series maps are never pruned, so a label taken from the raw
+path would let a caller mint a new series per request: measured at 100 000
+distinct paths, the rendered exposition was 167 MB and the process RSS 807 MB,
+behind an unauthenticated endpoint that re-sorts the whole registry on every
+scrape. The label is therefore mapped onto one of a small fixed set of route
+templates, and anything else becomes `"other"`.
+
+A hard ceiling on the number of series per map is the backstop, so a future
+label cannot reintroduce the problem silently. When the ceiling is reached the
+event is counted as an **error** in a pre-created overflow series rather than
+dropped: a request the gate cannot account for is not evidence that the
+service is innocent, and dropping it as a success would understate the error
+rate the SLO gate reads.
+
 **Known limitation:** for a streaming response the status is fixed at 200 once
 the headers are committed, so a stream that fails mid-flight is counted as a
 success. The error budget therefore under-counts mid-stream failures. Feed
@@ -818,9 +893,10 @@ that precision — the gate prefers the gauge over the counters.
 
 ### Verification
 
-Unit tests: `tests/unit/sse-metrics.test.js` (28 cases) covering the
+Unit tests: `tests/unit/sse-metrics.test.js` (36 cases) covering the
 counters, gauges, the bounded-bucket histogram, the error-budget
-computation, the Prometheus rendering, and the handler wrapper.
+computation, the Prometheus rendering, the handler wrapper, the route
+templates, and the series ceiling.
 
 ```bash
 curl -s localhost:20127/api/metrics | head -20
