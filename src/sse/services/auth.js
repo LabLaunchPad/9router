@@ -49,6 +49,24 @@ function isProviderLevelFailure(status) {
 }
 
 /**
+ * A burst of failures for the same provider is ONE outage, not N failures.
+ *
+ * The account-fallback loop tries the next credential whenever an account
+ * fails, and `markAccountUnavailable()` is called once per account attempt.
+ * A provider that answers every request with a 500 therefore produced N
+ * provider-level failures for a single client request — which opened the
+ * circuit after ONE request and let a single client take a whole provider
+ * out of service for the cool-down window.
+ *
+ * `failureThreshold` is documented as *consecutive failures per provider*,
+ * so the counting unit has to be the outage, not the account attempt.
+ * Failures for the same provider within `PROVIDER_FAILURE_BURST_MS` are
+ * therefore collapsed into one.
+ */
+const PROVIDER_FAILURE_BURST_MS = 2000;
+const lastProviderFailureAt = new Map();
+
+/**
  * Record a provider-level failure on the circuit breaker.
  *
  * Called from the upstream error path, so a provider that is genuinely down
@@ -56,13 +74,21 @@ function isProviderLevelFailure(status) {
  *
  * @param {string|null} provider
  * @param {number|string|null} status - upstream HTTP status, if any
- * @returns {boolean} true when a failure was recorded
+ * @returns {boolean} true when a failure was recorded on the breaker
  */
 export function recordProviderFailure(provider, status) {
   if (!provider) return false;
   if (!isProviderLevelFailure(status)) return false;
 
   const providerId = resolveProviderId(provider);
+  const now = Date.now();
+  const last = lastProviderFailureAt.get(providerId) || 0;
+  lastProviderFailureAt.set(providerId, now);
+  if (now - last < PROVIDER_FAILURE_BURST_MS) {
+    // Same burst — already counted.
+    return false;
+  }
+
   const cb = getCircuitBreaker(providerId, getProviderCircuitBreakerConfig(providerId));
   cb.recordFailure();
   log.warn(
@@ -83,9 +109,23 @@ export function recordProviderSuccess(provider) {
   if (!provider) return false;
 
   const providerId = resolveProviderId(provider);
+  // A success ends the current burst: the next failure is a new outage and
+  // has to count on its own.
+  lastProviderFailureAt.delete(providerId);
   const cb = getCircuitBreaker(providerId, getProviderCircuitBreakerConfig(providerId));
   cb.recordSuccess();
   return true;
+}
+
+/**
+ * Reset the provider-failure burst tracking.
+ *
+ * Only needed by tests: the burst window is a module-level map, so a test
+ * that resets the circuit breakers would otherwise inherit the previous
+ * test's burst state and see its first failure silently suppressed.
+ */
+export function resetProviderFailureTracking() {
+  lastProviderFailureAt.clear();
 }
 
 // Mutex to prevent race conditions during account selection
@@ -119,6 +159,9 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
   let resolveMutex;
   selectionMutex = new Promise(resolve => { resolveMutex = resolve; });
 
+  // Hoisted so the catch below can release the half-open probe slot.
+  let cb = null;
+
   try {
     await currentMutex;
 
@@ -127,7 +170,7 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
 
     // Circuit breaker: fail fast if provider circuit is OPEN
     const cbConfig = getProviderCircuitBreakerConfig(providerId);
-    const cb = getCircuitBreaker(providerId, cbConfig);
+    cb = getCircuitBreaker(providerId, cbConfig);
     if (!cb.canRequest()) {
       log.warn("AUTH", `${provider} | circuit breaker OPEN — refusing request, state: ${cb.state}`);
       return null;
@@ -170,6 +213,11 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
       // here, so there is nothing for the provider circuit to protect
       // against. Tripping it would let one misconfigured account take the
       // provider out of service for every other account on it.
+      //
+      // The half-open probe slot claimed by canRequest() above has to be
+      // released: no upstream request is going to be made, so no
+      // recordSuccess()/recordFailure() will ever resolve it.
+      cb.releaseProbe();
       log.warn("AUTH", `No credentials for ${provider}`);
       return null;
     }
@@ -213,6 +261,11 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
       // call is made. The provider circuit must not open for it: doing so
       // would let one account's exhausted quota blackhole the whole
       // provider. The per-account locks are handled by accountFallback.
+      //
+      // The half-open probe slot claimed by canRequest() above has to be
+      // released: no upstream request is going to be made, so no
+      // recordSuccess()/recordFailure() will ever resolve it.
+      cb.releaseProbe();
       // Find earliest persistent lock or lazy Antigravity quota-cache reset for retry timing.
       const lockedConns = connections.filter(c => isModelLockActive(c, model));
       const expiries = lockedConns.map(c => getEarliestModelLockUntil(c)).filter(Boolean);
@@ -333,6 +386,13 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
       // Pass full connection for clearAccountError to read modelLock_* keys
       _connection: connection
     };
+  } catch (err) {
+    // The half-open probe slot was claimed by canRequest() above, but this
+    // function threw before an upstream request could be made. Nothing will
+    // ever call recordSuccess()/recordFailure() for it, so release it here
+    // rather than blocking the provider for the whole reset window.
+    cb?.releaseProbe?.();
+    throw err;
   } finally {
     if (resolveMutex) resolveMutex();
   }

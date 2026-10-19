@@ -124,6 +124,22 @@ class CircuitBreaker {
     return false;
   }
 
+  /**
+   * Release the half-open probe slot without recording an outcome.
+   *
+   * `canRequest()` claims the slot, so a caller that decides not to make an
+   * upstream request at all (no credentials, every account locked) must
+   * release it. Otherwise the circuit stays in HALF_OPEN with the slot held
+   * and every later request is refused for the whole reset window — a
+   * healthy provider blackholed by a purely local account problem.
+   */
+  releaseProbe() {
+    if (this.state !== CircuitBreakerState.HALF_OPEN) return false;
+    this.probeInFlight = false;
+    this.probeStartedAt = 0;
+    return true;
+  }
+
   transitionTo(newState) {
     this.state = newState;
     this.lastStateChangeTime = Date.now();

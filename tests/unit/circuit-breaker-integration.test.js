@@ -22,6 +22,8 @@ import {
 import {
   recordProviderFailure,
   recordProviderSuccess,
+  resetProviderFailureTracking,
+  getProviderCredentials,
 } from "../../src/sse/services/auth.js";
 
 const PROVIDER = "9router-test-provider";
@@ -36,7 +38,23 @@ function breakerFor(provider = PROVIDER) {
 
 beforeEach(() => {
   resetAllCircuitBreakers();
+  resetProviderFailureTracking();
 });
+
+/**
+ * Record `n` failures that are far enough apart to count as separate
+ * outage events. The account-fallback loop retries the next credential
+ * within milliseconds, and a burst of failures for the same provider is
+ * counted once (see PROVIDER_FAILURE_BURST_MS).
+ */
+function recordDistinctFailures(n, status = 500) {
+  const recorded = [];
+  for (let i = 0; i < n; i++) {
+    resetProviderFailureTracking();
+    recorded.push(recordProviderFailure(PROVIDER, status));
+  }
+  return recorded;
+}
 
 describe("circuit breaker: provider-level failures", () => {
   it("trips the breaker on an upstream 5xx", () => {
@@ -44,6 +62,7 @@ describe("circuit breaker: provider-level failures", () => {
 
     for (let i = 0; i < 3; i++) {
       expect(recordProviderFailure(PROVIDER, 500)).toBe(true);
+      resetProviderFailureTracking();
     }
 
     expect(cb.state).toBe("open");
@@ -55,9 +74,36 @@ describe("circuit breaker: provider-level failures", () => {
 
     for (let i = 0; i < 3; i++) {
       expect(recordProviderFailure(PROVIDER, undefined)).toBe(true);
+      resetProviderFailureTracking();
     }
 
     expect(cb.state).toBe("open");
+  });
+
+  it("counts a burst of failures for the same provider as ONE outage", () => {
+    const cb = breakerFor();
+
+    // A single client request that walks N accounts against a provider that
+    // is returning 500 records N failures. Without the burst collapse that
+    // would open the circuit after one request and let a single client take
+    // a whole provider out of service.
+    expect(recordProviderFailure(PROVIDER, 500)).toBe(true);
+    expect(recordProviderFailure(PROVIDER, 500)).toBe(false);
+    expect(recordProviderFailure(PROVIDER, 500)).toBe(false);
+
+    expect(cb.failureCount).toBe(1);
+    expect(cb.state).toBe("closed");
+  });
+
+  it("counts a failure after a success as a new outage", () => {
+    const cb = breakerFor();
+
+    expect(recordProviderFailure(PROVIDER, 500)).toBe(true);
+    expect(recordProviderSuccess(PROVIDER)).toBe(true);
+    // The success ended the burst, so the next failure counts on its own.
+    expect(recordProviderFailure(PROVIDER, 500)).toBe(true);
+
+    expect(cb.failureCount).toBe(1);
   });
 
   it("does NOT trip the breaker on a per-account problem", () => {
@@ -82,7 +128,7 @@ describe("circuit breaker: provider-level failures", () => {
   it("closes the circuit after a successful upstream response", () => {
     const cb = breakerFor();
 
-    for (let i = 0; i < 3; i++) recordProviderFailure(PROVIDER, 500);
+    recordDistinctFailures(3);
     expect(cb.state).toBe("open");
 
     expect(recordProviderSuccess(PROVIDER)).toBe(true);
@@ -93,9 +139,10 @@ describe("circuit breaker: provider-level failures", () => {
   it("resets the consecutive-failure count on a success", () => {
     const cb = breakerFor();
 
-    recordProviderFailure(PROVIDER, 500);
-    recordProviderFailure(PROVIDER, 500);
-    recordProviderSuccess(PROVIDER);
+    recordDistinctFailures(2);
+    expect(cb.failureCount).toBe(2);
+
+    expect(recordProviderSuccess(PROVIDER)).toBe(true);
 
     expect(cb.failureCount).toBe(0);
     expect(cb.state).toBe("closed");
@@ -181,5 +228,44 @@ describe("circuit breaker: half-open admits one probe", () => {
     cb.recordFailure();
     expect(cb.state).toBe("open");
     expect(cb.canRequest()).toBe(false);
+  });
+
+  it("releaseProbe() frees the slot for the next request", () => {
+    const cb = getCircuitBreaker(PROVIDER, {
+      failureThreshold: 1,
+      coolDownWindowMs: 60000,
+      resetWindowMs: 120000,
+    });
+
+    cb.recordFailure();
+    cb.lastStateChangeTime = Date.now() - 60000;
+    expect(cb.canRequest()).toBe(true);
+    expect(cb.canRequest()).toBe(false);
+
+    expect(cb.releaseProbe()).toBe(true);
+    expect(cb.canRequest()).toBe(true);
+  });
+});
+
+describe("circuit breaker: the probe slot is not leaked by a local account problem", () => {
+  it("releases the probe when the provider has no credentials at all", async () => {
+    const cb = getCircuitBreaker(PROVIDER, {
+      failureThreshold: 1,
+      coolDownWindowMs: 60000,
+      resetWindowMs: 120000,
+    });
+
+    cb.recordFailure();
+    cb.lastStateChangeTime = Date.now() - 60000;
+
+    // No upstream request is made for an unknown provider with no
+    // credentials, so no recordSuccess()/recordFailure() will ever resolve
+    // the probe. The slot has to be released explicitly, otherwise the
+    // provider is blackholed for the whole reset window.
+    const creds = await getProviderCredentials(PROVIDER, null, null);
+    expect(creds).toBeNull();
+
+    expect(cb.state).toBe("half-open");
+    expect(cb.canRequest()).toBe(true);
   });
 });
