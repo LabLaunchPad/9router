@@ -15,13 +15,19 @@ on:
       - 'next.config*'
       - 'tailwind*'
       # The control plane itself must be covered, or a PR that changes only
-      # the gate logic or the metric producer runs no CI at all.
+      # the gate logic, the metric producer or the request path runs no CI
+      # at all. Everything the production-readiness controls touch is
+      # listed here.
       - 'scripts/ci/**'
       - 'src/sse/**'
-      - 'src/app/api/metrics/**'
-      - 'src/app/api/health/**'
+      - 'src/app/**'
+      - 'src/dashboardGuard.js'
+      - 'src/lib/db/repos/usageRepo.js'
       - 'open-sse/rtk/**'
-      - 'open-sse/services/circuitBreaker.js'
+      - 'open-sse/services/**'
+      - 'open-sse/handlers/**'
+      - 'open-sse/providers/registry/**'
+      - 'open-sse/config/**'
       - '.github/workflows/drift-prevention.yml'
   push:
     branches:
@@ -55,6 +61,11 @@ jobs:
           npx vitest run --reporter=minimal 2>&1 | grep -E 'failed to load config|Cannot find package' && exit 1 || exit 0
 
       - name: 🧪 Drift detection - full test suite
+        # No `pipefail` here on purpose: the repository has a known set of
+        # pre-existing failures, and the drift gate below is what decides
+        # whether the CHANGE introduced any. Failing this step on the
+        # pre-existing failures would make the job permanently red and hide
+        # the signal that matters.
         run: |
           npx vitest run 2>&1 | tee new-results.txt
           BASELINE=$(grep -o 'Tests [0-9]* passed' baseline-results.txt || echo "Tests 0 passed")
@@ -63,17 +74,43 @@ jobs:
           echo "New: $NEW"
 
       - name: 📊 Drift detection - failure diff
+        env:
+          BASELINE_EXIT_CODE: ${{ steps.baseline.outputs.baseline_exit_code }}
         run: |
           grep -c '×\|✖' baseline-results.txt > baseline-failures.txt || echo 0 > baseline-failures.txt
           grep -c '×\|✖' new-results.txt > new-failures.txt || echo 0 > new-failures.txt
           BASELINE_FAILURES=$(cat baseline-failures.txt)
           NEW_FAILURES=$(cat new-failures.txt)
           CHANGE=$((NEW_FAILURES - BASELINE_FAILURES))
-          echo "Baseline failures: $BASELINE_FAILURES"
+          echo "Baseline failures: $BASELINE_FAILURES (baseline run exit code: $BASELINE_EXIT_CODE)"
           echo "New failures: $NEW_FAILURES"
           echo "Change: $CHANGE"
           if [ "$CHANGE" -gt 20 ]; then
             echo "::error::⚠️ Significant test drift detected: $CHANGE more failures"
+            exit 1
+          fi
+
+          # The failure COUNT alone is not enough: a change that fixes one
+          # test and breaks another leaves the count unchanged. Compare the
+          # SET of failing files instead — a file that fails now and did not
+          # fail in the baseline is a regression introduced by this change.
+          grep -oE '(FAIL|❯) +tests/[^ ]+\.test\.js' baseline-results.txt \
+            | grep -oE 'tests/[^ ]+\.test\.js' | sort -u > baseline-failing-files.txt || true
+          grep -oE '(FAIL|❯) +tests/[^ ]+\.test\.js' new-results.txt \
+            | grep -oE 'tests/[^ ]+\.test\.js' | sort -u > new-failing-files.txt || true
+          NEWLY_FAILING=$(comm -13 baseline-failing-files.txt new-failing-files.txt || true)
+          if [ -n "$NEWLY_FAILING" ]; then
+            echo "::error::⚠️ Test files that fail now but did not fail in the baseline:"
+            echo "$NEWLY_FAILING"
+            exit 1
+          fi
+          echo "No newly failing test files."
+
+          # A green baseline means the suite is expected to be green. A red
+          # new run on a green baseline is a regression regardless of the
+          # failure-count threshold above.
+          if [ "$BASELINE_EXIT_CODE" = "0" ] && [ "$NEW_FAILURES" -gt 0 ]; then
+            echo "::error::⚠️ The baseline suite was green and this run is not — the change introduced test failures"
             exit 1
           fi
 
