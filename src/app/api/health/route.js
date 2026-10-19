@@ -18,7 +18,7 @@ import { structuredInfo, structuredWarn } from "@/sse/utils/logger.js";
  * Reports:
  *  - ok: true (kept for backwards compatibility with existing probes)
  *  - status: "ok" | "degraded" (derived from the error budget)
- *  - pendingRequests: in-flight request count, by model
+ *  - pendingRequests: in-flight request count
  *  - activeConnections: connections with at least one in-flight request
  *  - droppedOnRestart: requests that were in flight when the process stopped
  *  - errorBudgetRemaining: fraction of the error budget still available
@@ -28,6 +28,15 @@ import { structuredInfo, structuredWarn } from "@/sse/utils/logger.js";
  *
  * This endpoint intentionally exposes no request payloads, credentials, or
  * user data. It is safe to expose to internal monitoring.
+ *
+ * It IS unauthenticated, because the dashboard pings other instances
+ * cross-origin without credentials. So what it exposes is kept to what an
+ * operational health check needs — counts, a status, and the breaker states
+ * (which `/api/metrics` publishes anyway, since the SLO gate needs that
+ * endpoint to be public). The per-model breakdown is NOT in the public
+ * body: which models are in flight is activity data, and the aggregate
+ * count says the same thing to an operator without publishing it to
+ * anyone who can reach the host.
  *
  * CORS: the dashboard pings other instances cross-origin (see
  * src/app/(dashboard)/dashboard/endpoint/endpointPing.js) and relies on this
@@ -42,6 +51,31 @@ const CORS_HEADERS = {
   "Access-Control-Allow-Headers": "*",
   "Cache-Control": "no-store",
 };
+
+// This endpoint is unauthenticated, so a log line per request is a log line
+// per unauthenticated request — an amplification primitive for anyone who
+// can reach the host. The check is logged at most once a minute. A
+// DEGRADED service is always logged, because that is the signal that
+// matters.
+const HEALTH_LOG_INTERVAL_MS = 60_000;
+let lastHealthLogAt = 0;
+
+/**
+ * Log a health check, at most once per interval.
+ *
+ * @param {object} fields - the structured fields
+ * @param {boolean} degraded - whether the service is degraded
+ */
+function logHealth(fields, degraded) {
+  const now = Date.now();
+  if (!degraded && now - lastHealthLogAt < HEALTH_LOG_INTERVAL_MS) return;
+  lastHealthLogAt = now;
+  if (degraded) {
+    structuredWarn("health_error_budget_low", fields);
+  } else {
+    structuredInfo("health_check", fields);
+  }
+}
 
 // Below this fraction of the error budget remaining the service is reported
 // as degraded. The HTTP status stays 200 so a load balancer does not pull a
@@ -126,30 +160,29 @@ export async function GET() {
     ok: true,
     status: degraded ? "degraded" : "ok",
     pendingRequests: pending.total,
-    pendingByModel: pending.byModel,
     activeConnections: Object.keys(pending.byAccount).length,
     droppedOnRestart: dropped.total,
     droppedOnRestartAt: dropped.at,
-    droppedByModel: dropped.byModel,
     errorBudgetRemaining: budgetRemaining,
     lastErrorProvider: lastError?.provider || null,
     circuitBreakerStates: breakerStates,
     uptime,
   };
 
+  // The per-model breakdown stays in the LOG, not in the public body: the
+  // aggregate count is what an operator needs, and the breakdown is
+  // activity data that an unauthenticated caller has no business reading.
   const logFields = {
     pendingRequests: pending.total,
+    pendingByModel: pending.byModel,
     droppedOnRestart: dropped.total,
+    droppedByModel: dropped.byModel,
     uptime,
     errorBudgetRemaining: body.errorBudgetRemaining,
     breakerCount: Object.keys(breakerStates).length,
   };
 
-  if (degraded) {
-    structuredWarn("health_error_budget_low", logFields);
-  } else {
-    structuredInfo("health_check", logFields);
-  }
+  logHealth(logFields, degraded);
 
   return Response.json(body, {
     status: 200,
