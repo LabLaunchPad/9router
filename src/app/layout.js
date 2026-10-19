@@ -24,12 +24,8 @@ export const metadata = {
   },
 };
 
-// Preconnect to Google Fonts to reduce LCP
-export const fontPreconnect = "https://fonts.gstatic.com";
-
 export const viewport = {
   themeColor: "#0a0a0a",
-  fontPreconnect: "https://fonts.gstatic.com",
 };
 
 export default function RootLayout({ children }) {
@@ -51,20 +47,23 @@ export default function RootLayout({ children }) {
         />
       </head>
       <body className={`${inter.variable} font-sans antialiased`}>
-        <a href="#main" className="skip-link visually-hidden">
+        {/*
+          Skip link. It must be focusable and visible once focused, so it
+          carries only the `skip-link` class — combining it with
+          `visually-hidden` left the element 1x1px and clipped, because
+          `.visually-hidden` sets width/height/clip unconditionally and
+          `.skip-link:focus` only changed `top`. The link points at
+          `#main`, the main landmark rendered below.
+        */}
+        <a href="#main" className="skip-link">
           Skip to main content
         </a>
         <ThemeProvider>
           <RuntimeI18nProvider>
-            {children}
+            <main id="main">{children}</main>
           </RuntimeI18nProvider>
         </ThemeProvider>
         <GoogleAnalytics gaId={"G-LC959F603F"} />
-        <script
-          dangerouslySetInnerHTML={{
-            __html: '<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />',
-          }}
-        />
       </body>
     </html>
   );

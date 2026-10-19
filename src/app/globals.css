@@ -382,19 +382,27 @@ button:focus-visible,
 /* ============================================================
    Accessibility: skip link + visually-hidden utility
    ============================================================ */
+/* The skip link is parked off-screen and slides in on focus.
+
+   It must NOT also carry the `.visually-hidden` utility: that class clips
+   the element to 1x1px with `clip: rect(0, 0, 0, 0)` unconditionally, so a
+   focused skip link stayed invisible — a focusable control that keyboard
+   users could reach but not see. */
 .skip-link {
   position: absolute;
-  top: -100px;
+  top: 0;
   left: 0;
+  transform: translateY(-120%);
   background: var(--color-primary);
   color: var(--color-bg);
   padding: 8px;
   z-index: 100;
-  transition: top 0.3s;
+  transition: transform 0.3s;
 }
 
-.skip-link:focus {
-  top: 0;
+.skip-link:focus,
+.skip-link:focus-visible {
+  transform: translateY(0);
 }
 
 /* visually-hidden utility */
