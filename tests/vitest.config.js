@@ -1,29 +1,10 @@
-import { defineConfig } from "vitest/config";
-import { resolve } from "path";
-import { fileURLToPath } from "url";
-
-const __dirname = fileURLToPath(new URL(".", import.meta.url));
-
-export default defineConfig({
-  test: {
-    environment: "node",
-    globals: true,
-    include: ["**/*.test.js"],
-    // Don't scan into git worktrees nested under .claude/ — they carry their
-    // own copies of the test files but lack an installed node_modules (open-sse,
-    // etc.), which makes provider imports fail during collection.
-    exclude: ["**/node_modules/**", "**/.claude/**", "**/dist/**"],
-    // Allow many it.concurrent cases (real provider smoke runs ~50 providers in parallel)
-    maxConcurrency: 60,
-    // Suppress noisy console output from handlers under test
-    silent: false,
-  },
-  resolve: {
-    // Use array form so subpath aliases (e.g. "@/lib/db/index.js") resolve correctly.
-    alias: [
-      { find: /^open-sse\//, replacement: resolve(__dirname, "../open-sse") + "/" },
-      { find: "open-sse", replacement: resolve(__dirname, "../open-sse") },
-      { find: /^@\//, replacement: resolve(__dirname, "../src") + "/" },
-    ],
-  },
-});
+// Backwards-compatible wrapper.
+//
+// The canonical Vitest configuration now lives at the repository root
+// (../vitest.config.js) so that a single `npm ci` at the root provides both
+// the app and the test toolchain. Running `vitest` from inside `tests/`
+// still works: Vitest walks up to find the root config.
+//
+// This file is kept so that existing tooling that points at
+// `tests/vitest.config.js` continues to resolve.
+export { default } from "../vitest.config.js";
