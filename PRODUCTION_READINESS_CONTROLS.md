@@ -49,28 +49,38 @@ sse_error_budget_consumed 0.42        # fraction 0..1 of the budget used
 If the gauge is absent, the script falls back to the request counters:
 
 ```
-sse_requests_total 1000
-sse_error_responses_total 25           # => 2.5% of requests failed
+sse_requests_total{status="2xx",...} 975
+sse_requests_total{status="5xx",...} 25
+sse_error_responses_total{...} 25           # => 2.5% of requests failed
 ```
 
-Note that the counter fallback measures the *raw* error rate, not the budget
-consumption — a 2.5% error rate is far past a 99.95% SLO. Prefer the gauge.
+The counter path computes the **same quantity** as the gauge: the error rate
+divided by the target error rate, i.e. the fraction of the error budget that
+has been spent. With the default 99.95% availability SLO, a 2.5% error rate
+is 50x the budget, so the fallback reports 100% consumed (capped) and the gate
+blocks. Every series of a labelled counter is summed — reading only one series
+would divide one provider's error count by another provider's request count.
 
 ### Configuration
 
 | Variable | Default | Notes |
 |---|---|---|
 | `SLO_METRICS_ENDPOINT` | — | **Required.** Absolute URL of the authoritative metrics endpoint. |
+| `METRICS_ENDPOINT` | — | Documented alias of `SLO_METRICS_ENDPOINT`. |
 | `SERVICE_NAME` | `9router` | Reported in the gate output. |
 | `ENVIRONMENT` | `production` | Reported in the gate output. |
 | `GITHUB_SHA` | `unknown` | Reported in the gate output. |
+| `GITHUB_ACTOR` | `unknown` | Recorded in the audit log as the actor. |
 | `SLO_WARNING_THRESHOLD` | `50` | Percent. |
 | `SLO_BLOCKED_THRESHOLD` | `75` | Percent. |
 | `SLO_EXHAUSTED_THRESHOLD` | `95` | Percent. |
-| `SLO_WINDOW_SECONDS` | `2592000` | 30 days. |
-| `SLO_FAIL_CLOSED` | `true` | Set `false` to fail open. |
+| `SLO_WINDOW_SECONDS` | `2592000` | 30 days. See the window note below. |
+| `SLO_TARGET_ERROR_RATE` | `0.0005` | The error budget allowance. Must match the app's own target (99.95% availability). |
+| `SLO_REQUIRE_FULL_WINDOW` | `true` | Block when the sample is younger than the window. |
+| `SLO_FAIL_CLOSED` | `true` | Set `false` to fail open **on data problems**. A missing endpoint still blocks. |
 | `SLO_FETCH_TIMEOUT_MS` | `8000` | Metrics request timeout. |
 | `SLO_GATE_OVERRIDE_APPROVED` | `false` | Emergency override. Audited. |
+| `SLO_GATE_OVERRIDE` | `false` | Documented alias of `SLO_GATE_OVERRIDE_APPROVED`. |
 | `SLO_GATE_OVERRIDE_REASON` | `unspecified` | Recorded in the audit log. |
 | `SLO_GATE_SKIP` | `false` | CI-only: skip the gate entirely (repo variable). |
 
@@ -79,6 +89,20 @@ consumption — a 2.5% error rate is far past a 99.95% SLO. Prefer the gauge.
 > `localhost:3000/metrics` on the CI runner: that measures the CI box, not the
 > service, and would silently wave through every deploy. The script refuses to
 > guess an endpoint.
+
+### What the 30-day window actually means
+
+The counters behind the metric live in the service process, so they cover the
+time since the last restart, not the last 30 days. `/api/metrics` publishes
+`sse_metrics_sample_age_seconds` so the gate can tell the difference.
+
+With `SLO_REQUIRE_FULL_WINDOW=true` (the default) the gate **blocks** when the
+sample is younger than `SLO_WINDOW_SECONDS`: a sample that does not span the
+window cannot say anything about the budget over that window, and reading it
+as if it could would allow exactly the deploys the gate exists to catch — a
+crash-looping service has just reset its counters. Set
+`SLO_REQUIRE_FULL_WINDOW=false` to downgrade this to a warning, or point the
+gate at a real time-series store that does span the window.
 
 The script has **zero runtime dependencies** (native `fetch`, Node 18+), so the
 CI job needs no `npm install` for it.
@@ -109,7 +133,7 @@ is a self-contained job with no dependencies on the drift steps).
   slo-validation-gate:
     runs-on: ubuntu-latest
     needs: test-drift
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -119,18 +143,25 @@ is a self-contained job with no dependencies on the drift steps).
         env:
           SLO_METRICS_ENDPOINT: ${{ secrets.SLO_METRICS_ENDPOINT }}
           SLO_GATE_SKIP: ${{ vars.SLO_GATE_SKIP }}
+          SLO_GATE_OVERRIDE_APPROVED: ${{ vars.SLO_GATE_OVERRIDE_APPROVED }}
         run: |
           if [ -n "$SLO_METRICS_ENDPOINT" ]; then exit 0; fi
           if [ "$SLO_GATE_SKIP" = "true" ]; then
             echo "::warning::SLO gate SKIPPED (SLO_GATE_SKIP=true)."
             exit 0
           fi
+          if [ "$SLO_GATE_OVERRIDE_APPROVED" = "true" ]; then
+            echo "::warning::SLO gate OVERRIDDEN (SLO_GATE_OVERRIDE_APPROVED=true)."
+            exit 0
+          fi
           echo "::error::SLO_METRICS_ENDPOINT is not configured. The SLO gate fails closed."
           exit 1
       - name: 🔍 Run SLO validation gate
+        if: env.SLO_GATE_SKIP != 'true' && env.SLO_GATE_OVERRIDE_APPROVED != 'true'
         continue-on-error: false
         env:
           SLO_METRICS_ENDPOINT: ${{ secrets.SLO_METRICS_ENDPOINT }}
+          SLO_GATE_SKIP: ${{ vars.SLO_GATE_SKIP }}
           SLO_GATE_OVERRIDE_APPROVED: ${{ vars.SLO_GATE_OVERRIDE_APPROVED }}
           SLO_GATE_OVERRIDE_REASON: ${{ vars.SLO_GATE_OVERRIDE_REASON }}
           SLO_FAIL_CLOSED: "true"
@@ -141,8 +172,23 @@ is a self-contained job with no dependencies on the drift steps).
 `continue-on-error: false` is explicit: the job must fail the workflow when
 the gate blocks. The configuration pre-check also fails closed — a missing
 secret is a configuration error, not a reason to skip the gate silently.
+
+Three things in that wiring are load-bearing and easy to get wrong:
+
+- **The branch.** This repository's default branch is `master`, not `main`.
+  The trigger and the job condition both list `main` and `master`; a workflow
+  that names only `main` never runs here.
+- **`SLO_GATE_SKIP` must reach the gate step**, not only the pre-check.
+  Otherwise the skip only changes the error message while the gate still
+  fails closed — and the log would claim a skip that never happened.
+- **The pre-check must honour the audited override**, for the same reason:
+  the script is the only place that honours it, so a pre-check that does not
+  would make the override unusable in exactly the misconfigured-endpoint case
+  it exists for.
+
 Disabling the gate is possible, but only through the explicit, visible
-`SLO_GATE_SKIP` repository variable.
+`SLO_GATE_SKIP` repository variable — and a skip is always reported in the job
+summary, never silently treated as a pass.
 
 ### Verification
 
@@ -169,8 +215,9 @@ process-level exit codes via a real child-process run.
 | Situation | Action |
 |---|---|
 | Gate blocks a legitimate deploy | Set `SLO_GATE_OVERRIDE_APPROVED=true` + a reason. The decision is logged with the actor and SHA. |
-| Gate is misconfigured / endpoint unreachable | Set `SLO_FAIL_CLOSED=false` (fail open on data problems). |
-| Endpoint secret is not set yet | Set the `SLO_GATE_SKIP` repo variable to `true` to skip the gate explicitly — it is visible in the repo settings, unlike a silent skip. |
+| Endpoint unreachable / the metrics fetch fails | Set `SLO_FAIL_CLOSED=false` (fail open on data problems). |
+| Endpoint secret is not set yet | Set the `SLO_GATE_SKIP` repo variable to `true` to skip the gate explicitly — it is visible in the repo settings, unlike a silent skip. `SLO_FAIL_CLOSED=false` does **not** cover this case: a gate with no endpoint cannot say anything about the budget, so it blocks. |
+| The service was restarted and the sample no longer spans the window | Set `SLO_REQUIRE_FULL_WINDOW=false`, or point the gate at a time-series store that does span the window. |
 | Gate must be removed entirely | Delete the `slo-validation-gate` job from `.github/workflows/drift-prevention.yml`. Nothing else depends on it — the script is standalone and is not imported by the app. |
 
 The gate is a pure CI-side control: it never runs inside the application and
@@ -228,9 +275,31 @@ never a truncated one. `fsync` failures are tolerated (some container
 overlays do not support it); the rename is still atomic, so this is a
 durability nicety, not a correctness requirement.
 
+Every write gets its **own** temp file (`<target>.<pid>.<tag>.<n>.tmp`). Two
+writers must never share a temp path: the periodic async writer and the
+synchronous shutdown writer can overlap, and a shared path means the shutdown
+snapshot is truncated by the other writer (or vice versa) — the async rename
+then fails with ENOENT and the file on disk is the wrong snapshot. A failed
+write unlinks its temp file, and the process no longer leaks one `.tmp` file
+per interrupted restart.
+
 The snapshot file is versioned (`version: 1`). A file with an unknown version
 is discarded with a `sse_state_version_mismatch` warning rather than
 mis-applied.
+
+### What is restored
+
+The persisted pending counters describe requests that were **in flight when
+the previous process stopped** — they were killed by the restart and will
+never complete. Restoring them into the live in-flight gauge would make
+`pendingRequests` permanently non-zero, because nothing ever decrements a
+counter for a request that no longer exists. They are restored as a separate
+`droppedOnRestart` figure instead, surfaced by `/api/health` as
+`droppedOnRestart` / `droppedByModel`, and the live gauge stays truthful.
+
+The ring buffer is **not** restored by claiming `initialized`. That flag is
+`usageRepo`'s: setting it during the restore would suppress the SQLite
+rehydration and silently discard the persisted request history.
 
 ### Request-path safety
 
@@ -245,6 +314,15 @@ Nothing in this module runs on the request path.
 The handler does **not** call `process.exit()` itself unless it is the only
 signal listener; the app's own handler owns the exit, and this one just makes
 sure the snapshot is on disk first.
+
+The listeners are attached with `process.on`, not `process.once`. Node removes
+a `once` listener from the array *before* the handler body runs, so a
+`process.listeners(signal).length <= 1` check inside the handler would count
+only the *other* listeners — and the handler would call `process.exit(0)` even
+though `initializeApp.js` has its own SIGTERM handler, truncating the app's
+cleanup (`killCloudflared()`, `killAllBridges()`). The `handlersRegistered`
+module guard is what prevents double registration; `process.once` was never
+needed for that and actively broke the exit check.
 
 ### Configuration
 
@@ -398,22 +476,40 @@ Two read-only endpoints were added alongside these controls.
 ### `GET /api/health`
 
 Operational health snapshot: pending request counts, active connections,
-error-budget remaining, the last error provider, per-provider circuit-breaker
-state, and process uptime. It exposes no request payloads, credentials, or
-user data.
+requests dropped by the last restart, error-budget remaining, the last error
+provider, per-provider circuit-breaker state, and process uptime. It exposes
+no request payloads, credentials, or user data.
 
 The error-budget figure is derived from the **same** counters the SLO gate
 reads (`computeErrorBudgetConsumed`), so the health view and the deploy gate
-can never disagree.
+can never disagree. `status` is derived from that budget (`"degraded"` below
+25% remaining) rather than hardcoded to `"ok"`.
+
+The route keeps its original contract: the `ok: true` field, the CORS headers
+(`Access-Control-Allow-Origin: *`) and the `OPTIONS` handler. The dashboard
+pings other instances cross-origin — see
+`src/app/(dashboard)/dashboard/endpoint/endpointPing.js`, whose own comment
+says *"/api/health route sets Access-Control-Allow-Origin: * -> CORS works
+through tunnel"* — so dropping them silently breaks the endpoint-alive
+indicator for every remote instance.
 
 ### `GET /api/metrics`
 
 Prometheus text exposition. Exports `sse_requests_total`,
 `sse_error_responses_total`, `sse_request_latency_seconds` (a fixed-bucket
 histogram, so memory is bounded regardless of traffic),
-`sse_error_budget_consumed`, and `sse_circuit_breaker_state`.
+`sse_error_budget_consumed`, `sse_circuit_breaker_state`, and
+`sse_metrics_sample_age_seconds`.
 
-The `sse_error_budget_consumed` gauge is the signal the SLO gate reads.
+The `sse_error_budget_consumed` gauge is the signal the SLO gate reads. The
+sample-age gauge is what lets the gate tell whether the sample spans the SLO
+window — see the window note in section 1.
+
+Both routes are in the dashboard guard's `PUBLIC_API_PATHS`: the SLO gate
+fetches `/api/metrics` unauthenticated (no cookies, no bearer token), so it
+has to be reachable. The payload is operational metadata only — request
+counters, latency histograms, breaker states and the error-budget gauge. No
+request payloads, credentials, headers or user data are exposed.
 
 ### How the counters are fed
 

@@ -129,9 +129,10 @@ In-Memory State
 2. **Prometheus metrics endpoint** (`/metrics` or `/api/metrics`):
    - `sse_requests_total` (count, by status, by provider, by endpoint)
    - `sse_request_latency_seconds` (histogram: p50, p95, p99)
-   - `sse_pending_requests` (gauge by model/provider)
    - `sse_error_budget_consumed` (gauge 0-1, derived from error rates)
-   - `sse_active_accounts` (gauge by provider)
+   - *not implemented:* `sse_pending_requests` (gauge by model/provider) and
+     `sse_active_accounts` (gauge by provider) — the pending-request figure is
+     reported by `/api/health` instead of as a gauge
 3. **Distributed tracing** (OpenTelemetry) for request pipeline
 4. **SLO dashboard** with error budget tracking
 5. **Alert on error rate spikes** (>5% of requests, or >2x baseline)
@@ -147,12 +148,14 @@ In-Memory State
 - **Prometheus metrics endpoint** — `GET /api/metrics` exports
   `sse_requests_total`, `sse_error_responses_total`,
   `sse_request_latency_seconds` (a fixed-bucket histogram, so memory is
-  bounded regardless of traffic), `sse_error_budget_consumed` and
-  `sse_circuit_breaker_state`.
+  bounded regardless of traffic), `sse_error_budget_consumed`,
+  `sse_circuit_breaker_state` and `sse_metrics_sample_age_seconds`.
 - **Health endpoint** — `GET /api/health` reports pending request counts,
-  active connections, the remaining error budget, the last error provider,
-  per-provider circuit-breaker state and process uptime. It exposes no
-  request payloads, credentials, or user data.
+  active connections, requests dropped by the last restart, the remaining
+  error budget, the last error provider, per-provider circuit-breaker state
+  and process uptime. It exposes no request payloads, credentials, or user
+  data, and keeps the original `ok: true` field and CORS headers that the
+  dashboard's cross-origin endpoint ping depends on.
 
 The error-budget figure in the health view is derived from the same counters
 the SLO gate reads, so the two can never disagree.
