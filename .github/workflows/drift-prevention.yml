@@ -44,8 +44,24 @@ jobs:
       - name: 📦 Checkout repository
         uses: actions/checkout@v4
 
+      - name: 🔧 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # `npm install`, not `npm ci`.
+      #
+      # `npm ci` requires a committed package-lock.json, and this repository
+      # gitignores it (.gitignore line 63). The job therefore failed at this
+      # step with EUSAGE on every run — the whole drift check, and every
+      # control downstream of it, had never executed. The upstream workflow
+      # for the gitbook pages already uses `npm install` for the same reason.
+      #
+      # The cost is that the installed tree is not pinned. That is the
+      # repository's existing policy, and changing it (committing a 400 KB
+      # lockfile) is a maintainer decision, not a side effect of this branch.
       - name: ✅ Install dependencies
-        run: npm ci --legacy-peer-deps
+        run: npm install --legacy-peer-deps --no-audit --no-fund
 
       - name: 🏁 Record baseline test results
         id: baseline
@@ -55,10 +71,16 @@ jobs:
           code=$?
           set -e
           echo "baseline_exit_code=$code" >> $GITHUB_OUTPUT
-
-      - name: 🔍 Drift detection - import resolution
-        run: |
-          npx vitest run --reporter=minimal 2>&1 | grep -E 'failed to load config|Cannot find package' && exit 1 || exit 0
+          # A config that cannot be loaded, or a package that cannot be
+          # resolved, makes the whole suite fail to collect. That is a
+          # different kind of breakage from a failing test, and it
+          # invalidates every number below — so it is checked here, on the
+          # output that is already captured, rather than in a separate step
+          # that re-runs the entire suite a third time.
+          if grep -E 'failed to load config|Cannot find package' baseline-results.txt; then
+            echo "::error::The test suite could not be collected — import resolution failed"
+            exit 1
+          fi
 
       - name: 🧪 Drift detection - full test suite
         # No `pipefail` here on purpose: the repository has a known set of
@@ -77,10 +99,13 @@ jobs:
         env:
           BASELINE_EXIT_CODE: ${{ steps.baseline.outputs.baseline_exit_code }}
         run: |
-          grep -c '×\|✖' baseline-results.txt > baseline-failures.txt || echo 0 > baseline-failures.txt
-          grep -c '×\|✖' new-results.txt > new-failures.txt || echo 0 > new-failures.txt
-          BASELINE_FAILURES=$(cat baseline-failures.txt)
-          NEW_FAILURES=$(cat new-failures.txt)
+          # The failure count is taken from vitest's own summary line
+          # ("Tests  77 failed | 3695 passed | ..."), not from the reporter's
+          # per-test marker characters. The markers differ between the
+          # verbose baseline and the default new run, so a count taken from
+          # them is not comparable between the two runs.
+          BASELINE_FAILURES=$(grep -oE 'Tests +[0-9]+ failed' baseline-results.txt | tail -1 | grep -oE '[0-9]+' || echo 0)
+          NEW_FAILURES=$(grep -oE 'Tests +[0-9]+ failed' new-results.txt | tail -1 | grep -oE '[0-9]+' || echo 0)
           CHANGE=$((NEW_FAILURES - BASELINE_FAILURES))
           echo "Baseline failures: $BASELINE_FAILURES (baseline run exit code: $BASELINE_EXIT_CODE)"
           echo "New failures: $NEW_FAILURES"
@@ -94,9 +119,12 @@ jobs:
           # test and breaks another leaves the count unchanged. Compare the
           # SET of failing files instead — a file that fails now and did not
           # fail in the baseline is a regression introduced by this change.
-          grep -oE '(FAIL|❯) +tests/[^ ]+\.test\.js' baseline-results.txt \
+          #
+          # The FAIL line is emitted by every reporter (" FAIL  tests/x.test.js
+          # > suite > test"), so the two runs are comparable.
+          grep -oE 'FAIL +tests/[^ ]+\.test\.js' baseline-results.txt \
             | grep -oE 'tests/[^ ]+\.test\.js' | sort -u > baseline-failing-files.txt || true
-          grep -oE '(FAIL|❯) +tests/[^ ]+\.test\.js' new-results.txt \
+          grep -oE 'FAIL +tests/[^ ]+\.test\.js' new-results.txt \
             | grep -oE 'tests/[^ ]+\.test\.js' | sort -u > new-failing-files.txt || true
           NEWLY_FAILING=$(comm -13 baseline-failing-files.txt new-failing-files.txt || true)
           if [ -n "$NEWLY_FAILING" ]; then
@@ -134,7 +162,11 @@ jobs:
   slo-validation-gate:
     runs-on: ubuntu-latest
     needs: test-drift
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    # `!cancelled()` rather than a bare condition: the gate still has to run
+    # and report its decision when the drift check failed, otherwise the
+    # operator sees one red job and no SLO verdict. The workflow still fails
+    # overall, because the failed dependency fails it.
+    if: '!cancelled() && github.event_name == ''push'' && (github.ref == ''refs/heads/main'' || github.ref == ''refs/heads/master'')'
     timeout-minutes: 30
 
     steps:
@@ -186,7 +218,16 @@ jobs:
         # Otherwise the skip would only change the error message while the
         # gate still failed closed, and the log would claim a skip that never
         # happened.
-        if: env.SLO_GATE_SKIP != 'true' && env.SLO_GATE_OVERRIDE_APPROVED != 'true'
+        #
+        # The condition reads `vars.`, not `env.`. The `env` context does
+        # contain step-level variables, but a step's own `if` is evaluated
+        # before that step's `env` block is applied to it, so `env.SLO_GATE_SKIP`
+        # here would resolve to the empty string regardless of what the
+        # repository variable is set to — and the documented skip would be a
+        # no-op again. `vars` is repository-scoped and has no such ordering
+        # question. The `env:` block below still carries the values to the
+        # script.
+        if: vars.SLO_GATE_SKIP != 'true' && vars.SLO_GATE_OVERRIDE_APPROVED != 'true'
         env:
           SLO_METRICS_ENDPOINT: ${{ secrets.SLO_METRICS_ENDPOINT }}
           SLO_GATE_SKIP: ${{ vars.SLO_GATE_SKIP }}

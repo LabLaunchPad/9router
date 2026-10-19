@@ -30,8 +30,11 @@ jobs:
         with:
           node-version: "20"
 
+      # `npm install`, not `npm ci`: this repository gitignores
+      # package-lock.json (.gitignore line 63), so `npm ci` fails with EUSAGE
+      # on every run. The drift-prevention workflow has the same fix.
       - name: ✅ Install dependencies
-        run: npm ci --legacy-peer-deps
+        run: npm install --legacy-peer-deps --no-audit --no-fund
 
       - name: 🧪 Run chaos suite
         run: npx vitest run --config tests/chaos/vitest.config.js --reporter=verbose
