@@ -104,9 +104,22 @@ export const CIRCUIT_BREAKER_CONFIG = {
     failureThreshold: 5,
     coolDownWindowMs: 300000, // 5 minutes
     resetWindowMs: 900000,    // 15 minutes
+    // Failures for the same provider within this window are ONE outage.
+    //
+    // The account-fallback loop retries the next credential whenever an
+    // account fails, so a single client request against a provider that is
+    // returning 500 produces one failure per account. Counting those
+    // separately would open the circuit after a single request and let one
+    // client take a whole provider out of service for the cool-down window.
+    //
+    // The window is anchored at the start of the burst; a suppressed failure
+    // does not move it. Otherwise a continuous outage would keep the window
+    // sliding and the count would never reach the threshold — the circuit
+    // would never open at all, which is the situation the breaker exists for.
+    failureBurstMs: 2000,
   },
   // Per-provider overrides (merged with default)
-  // Format: 'providerId': { failureThreshold, coolDownWindowMs, resetWindowMs }
+  // Format: 'providerId': { failureThreshold, coolDownWindowMs, resetWindowMs, failureBurstMs }
   // Each field overrides the corresponding default; omitted fields keep the default
   providers: {
     // Example: 'openai': { failureThreshold: 3 }
@@ -133,6 +146,12 @@ export function validateCircuitBreakerConfig(config) {
   if (config.resetWindowMs !== undefined) {
     if (!Number.isInteger(config.resetWindowMs) || config.resetWindowMs < 1) {
       errors.push("resetWindowMs must be a positive integer (milliseconds)");
+    }
+  }
+
+  if (config.failureBurstMs !== undefined) {
+    if (!Number.isInteger(config.failureBurstMs) || config.failureBurstMs < 0) {
+      errors.push("failureBurstMs must be a non-negative integer (milliseconds)");
     }
   }
 

@@ -6,7 +6,7 @@ import { resolveProviderId, FREE_PROVIDERS } from "@/shared/constants/providers.
 import { getAntigravityQuotaCache, getAntigravityModelQuota } from "./antigravityQuota.js";
 import * as log from "../utils/logger.js";
 import { CIRCUIT_BREAKER_CONFIG } from "open-sse/config/runtimeConfig.js";
-import { getCircuitBreaker, getAllCircuitBreakerStates } from "open-sse/services/circuitBreaker.js";
+import { getCircuitBreaker } from "open-sse/services/circuitBreaker.js";
 import REGISTRY from "open-sse/providers/registry/index.js";
 
 // Helper: get per-provider circuit breaker config, merged with defaults
@@ -30,6 +30,7 @@ function getProviderCircuitBreakerConfig(providerId) {
     failureThreshold: pick("failureThreshold"),
     coolDownWindowMs: pick("coolDownWindowMs"),
     resetWindowMs: pick("resetWindowMs"),
+    failureBurstMs: pick("failureBurstMs"),
   };
 }
 
@@ -60,10 +61,17 @@ function isProviderLevelFailure(status) {
  *
  * `failureThreshold` is documented as *consecutive failures per provider*,
  * so the counting unit has to be the outage, not the account attempt.
- * Failures for the same provider within `PROVIDER_FAILURE_BURST_MS` are
- * therefore collapsed into one.
+ * Failures for the same provider within `failureBurstMs` are therefore
+ * collapsed into one.
+ *
+ * The window is anchored at the START of the burst and is NOT refreshed by a
+ * suppressed failure. Refreshing it on every failure would make the window
+ * slide: during a continuous outage the failures keep arriving closer
+ * together than the window, so every failure after the first would be
+ * suppressed and the count would stay at 1 — the circuit would never open
+ * for the whole duration of the outage, which is the exact situation the
+ * breaker exists for.
  */
-const PROVIDER_FAILURE_BURST_MS = 2000;
 const lastProviderFailureAt = new Map();
 
 /**
@@ -78,18 +86,34 @@ const lastProviderFailureAt = new Map();
  */
 export function recordProviderFailure(provider, status) {
   if (!provider) return false;
-  if (!isProviderLevelFailure(status)) return false;
 
   const providerId = resolveProviderId(provider);
-  const now = Date.now();
-  const last = lastProviderFailureAt.get(providerId) || 0;
-  lastProviderFailureAt.set(providerId, now);
-  if (now - last < PROVIDER_FAILURE_BURST_MS) {
-    // Same burst — already counted.
+  const cbConfig = getProviderCircuitBreakerConfig(providerId);
+  const cb = getCircuitBreaker(providerId, cbConfig);
+
+  if (!isProviderLevelFailure(status)) {
+    // The provider ANSWERED (401/402/403/429) — it is alive. That is
+    // exactly what isProviderLevelFailure means, and it resolves an
+    // outstanding half-open probe: the probe asked "does this provider work
+    // now?", the provider answered, so the probe is successful. Without
+    // this the slot stays held for the whole reset window and a healthy
+    // provider is blackholed for fifteen minutes.
+    if (cb.state === "half-open") {
+      lastProviderFailureAt.delete(providerId);
+      cb.recordSuccess();
+    }
     return false;
   }
 
-  const cb = getCircuitBreaker(providerId, getProviderCircuitBreakerConfig(providerId));
+  const now = Date.now();
+  const last = lastProviderFailureAt.get(providerId) || 0;
+  if (now - last < cbConfig.failureBurstMs) {
+    // Same burst — already counted. The anchor is deliberately NOT moved:
+    // see the note above.
+    return false;
+  }
+  lastProviderFailureAt.set(providerId, now);
+
   cb.recordFailure();
   log.warn(
     "AUTH",

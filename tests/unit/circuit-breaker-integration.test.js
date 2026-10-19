@@ -14,7 +14,7 @@
  *   - HALF_OPEN admits exactly one probe request.
  */
 
-import { describe, expect, it, beforeEach } from "vitest";
+import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
 import {
   getCircuitBreaker,
   resetAllCircuitBreakers,
@@ -25,8 +25,10 @@ import {
   resetProviderFailureTracking,
   getProviderCredentials,
 } from "../../src/sse/services/auth.js";
+import { CIRCUIT_BREAKER_CONFIG } from "../../open-sse/config/runtimeConfig.js";
 
 const PROVIDER = "9router-test-provider";
+const BURST_MS = CIRCUIT_BREAKER_CONFIG.default.failureBurstMs;
 
 function breakerFor(provider = PROVIDER) {
   return getCircuitBreaker(provider, {
@@ -41,16 +43,24 @@ beforeEach(() => {
   resetProviderFailureTracking();
 });
 
+afterEach(() => {
+  vi.useRealTimers();
+});
+
 /**
  * Record `n` failures that are far enough apart to count as separate
- * outage events. The account-fallback loop retries the next credential
- * within milliseconds, and a burst of failures for the same provider is
- * counted once (see PROVIDER_FAILURE_BURST_MS).
+ * outage events.
+ *
+ * The separation is done with the CLOCK, not by clearing the tracking
+ * state: clearing it would destroy the very thing under test. An earlier
+ * version of this helper reset the burst window before every call, and that
+ * is exactly why a sliding-window defect went unnoticed — the tests never
+ * exercised two failures inside one window.
  */
 function recordDistinctFailures(n, status = 500) {
   const recorded = [];
   for (let i = 0; i < n; i++) {
-    resetProviderFailureTracking();
+    vi.advanceTimersByTime(BURST_MS + 100);
     recorded.push(recordProviderFailure(PROVIDER, status));
   }
   return recorded;
@@ -58,24 +68,20 @@ function recordDistinctFailures(n, status = 500) {
 
 describe("circuit breaker: provider-level failures", () => {
   it("trips the breaker on an upstream 5xx", () => {
+    vi.useFakeTimers();
     const cb = breakerFor();
 
-    for (let i = 0; i < 3; i++) {
-      expect(recordProviderFailure(PROVIDER, 500)).toBe(true);
-      resetProviderFailureTracking();
-    }
+    expect(recordDistinctFailures(3)).toEqual([true, true, true]);
 
     expect(cb.state).toBe("open");
     expect(cb.canRequest()).toBe(false);
   });
 
   it("trips the breaker on a transport error with no status", () => {
+    vi.useFakeTimers();
     const cb = breakerFor();
 
-    for (let i = 0; i < 3; i++) {
-      expect(recordProviderFailure(PROVIDER, undefined)).toBe(true);
-      resetProviderFailureTracking();
-    }
+    expect(recordDistinctFailures(3, undefined)).toEqual([true, true, true]);
 
     expect(cb.state).toBe("open");
   });
@@ -93,6 +99,31 @@ describe("circuit breaker: provider-level failures", () => {
 
     expect(cb.failureCount).toBe(1);
     expect(cb.state).toBe("closed");
+  });
+
+  it("still opens the circuit during a CONTINUOUS outage", () => {
+    // The regression this test exists for: the burst window is anchored at
+    // the START of the burst and is not moved by a suppressed failure.
+    //
+    // If the anchor slid, every failure in a continuous stream would fall
+    // inside the window, only the first would be counted, and the circuit
+    // would stay closed for the whole outage — the exact situation the
+    // breaker exists to handle. The provider is hammered by every request
+    // and every account is locked in the meantime.
+    vi.useFakeTimers();
+    const cb = breakerFor();
+
+    // Failures arriving every 1900 ms — closer together than the 2000 ms
+    // window, so consecutive failures are suppressed, but each one is more
+    // than 2000 ms after the last COUNTED failure.
+    const counted = [];
+    for (let i = 0; i < 6; i++) {
+      vi.advanceTimersByTime(1900);
+      counted.push(recordProviderFailure(PROVIDER, 500));
+    }
+
+    expect(counted.filter(Boolean).length).toBeGreaterThanOrEqual(3);
+    expect(cb.state).toBe("open");
   });
 
   it("counts a failure after a success as a new outage", () => {
@@ -126,6 +157,7 @@ describe("circuit breaker: provider-level failures", () => {
   });
 
   it("closes the circuit after a successful upstream response", () => {
+    vi.useFakeTimers();
     const cb = breakerFor();
 
     recordDistinctFailures(3);
@@ -137,6 +169,7 @@ describe("circuit breaker: provider-level failures", () => {
   });
 
   it("resets the consecutive-failure count on a success", () => {
+    vi.useFakeTimers();
     const cb = breakerFor();
 
     recordDistinctFailures(2);
@@ -243,6 +276,35 @@ describe("circuit breaker: half-open admits one probe", () => {
     expect(cb.canRequest()).toBe(false);
 
     expect(cb.releaseProbe()).toBe(true);
+    expect(cb.canRequest()).toBe(true);
+  });
+
+  it("resolves the probe when the provider answers with a 4xx", () => {
+    // The provider is DOWN (5xx) so the circuit opens, then it recovers and
+    // answers 429. The 429 is a per-account problem, not a provider problem,
+    // so it does not trip the breaker — but the provider DID answer, which
+    // is what the half-open probe was asking. Without resolving the probe
+    // the slot stays held for the whole reset window and the provider is
+    // blackholed for fifteen minutes even though it is working.
+    const cb = getCircuitBreaker(PROVIDER, {
+      failureThreshold: 1,
+      coolDownWindowMs: 60000,
+      resetWindowMs: 120000,
+    });
+
+    cb.recordFailure();
+    expect(cb.state).toBe("open");
+
+    // The cool-down elapses: the next request claims the probe.
+    cb.lastStateChangeTime = Date.now() - 60000;
+    expect(cb.canRequest()).toBe(true);
+    expect(cb.state).toBe("half-open");
+
+    // The provider answers 429 — alive, but throttling this account.
+    expect(recordProviderFailure(PROVIDER, 429)).toBe(false);
+
+    // The probe is resolved and the provider is usable again.
+    expect(cb.state).toBe("closed");
     expect(cb.canRequest()).toBe(true);
   });
 });
