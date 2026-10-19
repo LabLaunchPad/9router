@@ -1,6 +1,17 @@
 // open-sse/services/circuitBreaker.js
 // Circuit breaker pattern: CLOSED → OPEN → HALF-OPEN → CLOSED
 // Tracks consecutive failures per provider/executor; opens circuit when threshold exceeded
+//
+// OBSERVABILITY
+// Every state change emits a structured log line and increments a counter.
+// A breaker that opens and closes silently is a control that cannot be
+// audited: the gauge published by /api/metrics is the state at scrape time,
+// a snapshot of a moment, and it cannot say when the circuit opened, how
+// long it stayed open, or whether it has been flapping. The transition is
+// the event; the gauge is the state.
+
+import { structuredInfo, structuredWarn } from "@/sse/utils/logger.js";
+import { incrementCounter } from "@/sse/services/metrics.js";
 
 const CircuitBreakerState = {
   CLOSED: "closed",
@@ -40,23 +51,23 @@ class CircuitBreaker {
     this.lastFailureTime = Date.now();
 
     if (this.state === CircuitBreakerState.CLOSED && this.failureCount >= this.failureThreshold) {
-      this.transitionTo(CircuitBreakerState.OPEN);
+      this.transitionTo(CircuitBreakerState.OPEN, "failure threshold reached");
     } else if (this.state === CircuitBreakerState.HALF_OPEN) {
       // In half-open state, any failure re-opens the circuit
-      this.transitionTo(CircuitBreakerState.OPEN);
+      this.transitionTo(CircuitBreakerState.OPEN, "the half-open probe failed");
     }
   }
 
   // Record a successful call and reset if in half-open state
   recordSuccess() {
     if (this.state === CircuitBreakerState.HALF_OPEN) {
-      this.reset();
+      this.reset("the half-open probe succeeded");
     } else if (this.state === CircuitBreakerState.OPEN) {
       // A request that was already in flight when the circuit opened has come
       // back with a real response, so the provider is demonstrably healthy
       // again. Close the circuit rather than keeping it open until the
       // cool-down elapses.
-      this.reset();
+      this.reset("an in-flight request succeeded");
     } else if (this.state === CircuitBreakerState.CLOSED) {
       // Reset failure count on success in closed state
       this.failureCount = 0;
@@ -101,7 +112,7 @@ class CircuitBreaker {
     if (this.state === CircuitBreakerState.OPEN) {
       // Check if cool-down window has elapsed
       if (now - this.lastStateChangeTime >= this.coolDownWindowMs) {
-        this.transitionTo(CircuitBreakerState.HALF_OPEN);
+        this.transitionTo(CircuitBreakerState.HALF_OPEN, "the cool-down elapsed");
         this.probeInFlight = true;
         this.probeStartedAt = now;
         return true;
@@ -140,7 +151,8 @@ class CircuitBreaker {
     return true;
   }
 
-  transitionTo(newState) {
+  transitionTo(newState, reason = "") {
+    const from = this.state;
     this.state = newState;
     this.lastStateChangeTime = Date.now();
     this.probeInFlight = false;
@@ -150,9 +162,42 @@ class CircuitBreaker {
     } else if (newState === CircuitBreakerState.HALF_OPEN) {
       this.nextRetryTime = this.lastStateChangeTime + this.resetWindowMs;
     }
+    this.announceTransition(from, newState, reason);
   }
 
-  reset() {
+  /**
+   * Announce a state change: one structured log line and one counter.
+   *
+   * The log line carries the failure count and the threshold, so a reader can
+   * tell "the provider was briefly flaky" from "the provider is down" without
+   * correlating against another line. The counter is what makes the event
+   * queryable: `sse_circuit_breaker_transitions_total` is a rate of state
+   * changes, and a provider whose rate is not zero is flapping.
+   */
+  announceTransition(from, to, reason = "") {
+    const fields = {
+      provider: this.provider,
+      from,
+      to,
+      failureCount: this.failureCount,
+      failureThreshold: this.failureThreshold,
+      coolDownMs: this.coolDownWindowMs,
+    };
+    if (reason) fields.reason = reason;
+
+    if (to === CircuitBreakerState.OPEN) {
+      structuredWarn("sse_circuit_breaker_open", fields);
+    } else if (to === CircuitBreakerState.HALF_OPEN) {
+      structuredInfo("sse_circuit_breaker_half_open", fields);
+    } else {
+      structuredInfo("sse_circuit_breaker_closed", fields);
+    }
+
+    incrementCounter("sse_circuit_breaker_transitions_total", { provider: this.provider, to });
+  }
+
+  reset(reason = "") {
+    const from = this.state;
     this.state = CircuitBreakerState.CLOSED;
     this.failureCount = 0;
     this.lastFailureTime = 0;
@@ -160,6 +205,7 @@ class CircuitBreaker {
     this.nextRetryTime = 0;
     this.probeInFlight = false;
     this.probeStartedAt = 0;
+    this.announceTransition(from, CircuitBreakerState.CLOSED, reason);
   }
 
   // Get current state for metrics. Side-effect free: reading the state must
@@ -208,7 +254,7 @@ function getAllCircuitBreakerStates() {
   return states;
 }
 
-module.exports = {
+export {
   CircuitBreaker,
   CircuitBreakerState,
   getCircuitBreaker,
