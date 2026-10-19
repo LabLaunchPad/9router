@@ -56,56 +56,78 @@ const PLATFORM_LITERALS = [
 ];
 
 function headersFor(providerId) {
+  return sanitize(rawHeadersFor(providerId));
+}
+
+function rawHeadersFor(providerId) {
   const ex = new DefaultExecutor(providerId);
   const cred = PROVIDERS[providerId].noAuth ? {} : API_KEY_CRED;
   try {
-    return sanitize(ex.buildHeaders(cred, true));
+    return ex.buildHeaders(cred, true);
   } catch {
     return null;
   }
 }
 
+// The descriptors as they were when the module was loaded. `process.platform`
+// and `process.version` are non-writable but CONFIGURABLE own properties of
+// the process object, so they can be redefined — and they have to be put
+// back exactly as they were, whatever the runner's platform is.
+const ORIGINAL_PLATFORM = Object.getOwnPropertyDescriptor(process, "platform");
+const ORIGINAL_VERSION = Object.getOwnPropertyDescriptor(process, "version");
+
 /**
  * Run `fn` with process.platform and process.version replaced.
- *
- * `process.platform` is a non-writable but CONFIGURABLE own property of the
- * process object, so it can be redefined and restored.
  */
 function withMachine(platform, version, fn) {
-  const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
-  const originalVersion = Object.getOwnPropertyDescriptor(process, "version");
   Object.defineProperty(process, "platform", { value: platform, configurable: true });
   Object.defineProperty(process, "version", { value: version, configurable: true });
   try {
     return fn();
   } finally {
-    Object.defineProperty(process, "platform", originalPlatform);
-    Object.defineProperty(process, "version", originalVersion);
+    Object.defineProperty(process, "platform", ORIGINAL_PLATFORM);
+    Object.defineProperty(process, "version", ORIGINAL_VERSION);
   }
 }
 
 describe("the golden snapshot is portable", () => {
   afterEach(() => {
-    // The property test restores the descriptors itself; this is a belt for
-    // the case where it threw before the restore.
-    if (!Object.getOwnPropertyDescriptor(process, "platform").value) {
-      Object.defineProperty(process, "platform", { value: "win32", configurable: true });
-    }
+    // The property test restores the descriptors itself; this is the belt for
+    // the case where it threw before the restore. The originals are captured
+    // at load time, so this puts back THIS runner's platform — a hard-coded
+    // "win32" here would corrupt a Linux runner.
+    Object.defineProperty(process, "platform", ORIGINAL_PLATFORM);
+    Object.defineProperty(process, "version", ORIGINAL_VERSION);
   });
 
   it("produces the same headers on a different platform and Node version", () => {
     const providerIds = Object.keys(PROVIDERS).filter((p) => !SPECIALIZED.has(p)).sort();
 
+    // A platform and a Node version that are guaranteed to differ from this
+    // runner's. "linux" would be a poor choice: the CI runner IS linux, and
+    // the check would then compare linux against linux.
+    const otherPlatform = process.platform === "darwin" ? "linux" : "darwin";
+    const otherVersion = process.version === "v99.0.0" ? "v98.0.0" : "v99.0.0";
+
+    const hereRaw = withMachine(process.platform, process.version, () =>
+      providerIds.map((id) => [id, rawHeadersFor(id)])
+    );
+    const elsewhereRaw = withMachine(otherPlatform, otherVersion, () =>
+      providerIds.map((id) => [id, rawHeadersFor(id)])
+    );
     const here = withMachine(process.platform, process.version, () =>
       providerIds.map((id) => [id, headersFor(id)])
     );
-    const elsewhere = withMachine("linux", "v99.0.0", () =>
+    const elsewhere = withMachine(otherPlatform, otherVersion, () =>
       providerIds.map((id) => [id, headersFor(id)])
     );
 
-    // The platform and the Node version genuinely differ between the two runs,
-    // so the check is not vacuous.
-    expect(process.platform).not.toBe("linux");
+    // The RAW headers differ — the machine state really does reach them, so
+    // the check below is not vacuous.
+    expect(JSON.stringify(elsewhereRaw)).not.toBe(JSON.stringify(hereRaw));
+
+    // The SANITISED headers do not. That is the property the snapshot relies
+    // on: the baseline reproduces on any machine.
     expect(here).toEqual(elsewhere);
   });
 
