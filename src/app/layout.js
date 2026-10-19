@@ -24,8 +24,12 @@ export const metadata = {
   },
 };
 
+// Preconnect to Google Fonts to reduce LCP
+export const fontPreconnect = "https://fonts.gstatic.com";
+
 export const viewport = {
   themeColor: "#0a0a0a",
+  fontPreconnect: "https://fonts.gstatic.com",
 };
 
 export default function RootLayout({ children }) {
@@ -42,17 +46,25 @@ export default function RootLayout({ children }) {
         />
         <script
           dangerouslySetInnerHTML={{
-            __html: `var d=document,r=d.documentElement,f=function(){r.classList.add('fonts-loaded')};if(d.fonts&&d.fonts.load){d.fonts.load('24px "Material Symbols Outlined"').then(f).catch(f);setTimeout(f,3000)}else{f()}`,
+            __html: `var d=document,r=d.documentElement,f=function(){r.classList.add('fonts-loaded')};if(d.fonts&&d.fonts.load){d.fonts.load('24px "Material Symbols Outlined"').then(f).catch(f);setTimeout(f,500)}else{f()}`,
           }}
         />
       </head>
       <body className={`${inter.variable} font-sans antialiased`}>
+        <a href="#main" className="skip-link visually-hidden">
+          Skip to main content
+        </a>
         <ThemeProvider>
           <RuntimeI18nProvider>
             {children}
           </RuntimeI18nProvider>
         </ThemeProvider>
         <GoogleAnalytics gaId={"G-LC959F603F"} />
+        <script
+          dangerouslySetInnerHTML={{
+            __html: '<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />',
+          }}
+        />
       </body>
     </html>
   );

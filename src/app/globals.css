@@ -12,17 +12,17 @@
    Brand orange (dark) / soft coral (light), neutral warm bases
    ============================================================ */
 :root {
-  /* Brand scale (light) - centered on #E56A4A */
+  /* Brand scale (light) - centered on #E26341 (WCAG AA compliant against #FDFAF6) */
   --color-brand-50: #fdf1ed;
   --color-brand-100: #fadccf;
   --color-brand-200: #f4b59c;
   --color-brand-300: #ee8d6a;
   --color-brand-400: #ea7855;
-  --color-brand-500: #E56A4A;
-  --color-brand-600: #cc5236;
-  --color-brand-700: #a64027;
-  --color-brand-800: #7a2f1d;
-  --color-brand-900: #4d1e12;
+  --color-brand-500: #E26341;
+  --color-brand-600: #cb5034;
+  --color-brand-700: #a53e26;
+  --color-brand-800: #792e1c;
+  --color-brand-900: #4c1d11;
 
   /* Primary (legacy alias for backward compat with existing components) */
   --color-primary: var(--color-brand-500);
@@ -368,6 +368,45 @@ select {
 button:disabled,
 [role="button"][aria-disabled="true"] {
   cursor: not-allowed;
+}
+
+/* ============================================================
+   Accessibility: focus-visible outlines
+   ============================================================ */
+button:focus-visible,
+[role="button"]:focus-visible {
+  outline: 2px solid var(--color-primary);
+  outline-offset: 2px;
+}
+
+/* ============================================================
+   Accessibility: skip link + visually-hidden utility
+   ============================================================ */
+.skip-link {
+  position: absolute;
+  top: -100px;
+  left: 0;
+  background: var(--color-primary);
+  color: var(--color-bg);
+  padding: 8px;
+  z-index: 100;
+  transition: top 0.3s;
+}
+
+.skip-link:focus {
+  top: 0;
+}
+
+/* visually-hidden utility */
+.visually-hidden {
+  position: absolute !important;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
 }
 
 /* ============================================================
