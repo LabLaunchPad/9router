@@ -7,6 +7,7 @@ import { getAntigravityQuotaCache, getAntigravityModelQuota } from "./antigravit
 import * as log from "../utils/logger.js";
 import { CIRCUIT_BREAKER_CONFIG } from "open-sse/config/runtimeConfig.js";
 import { getCircuitBreaker } from "open-sse/services/circuitBreaker.js";
+import { recordBreakerRejection } from "@/sse/services/metrics.js";
 import REGISTRY from "open-sse/providers/registry/index.js";
 
 // Helper: get per-provider circuit breaker config, merged with defaults
@@ -197,6 +198,12 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     cb = getCircuitBreaker(providerId, cbConfig);
     if (!cb.canRequest()) {
       log.warn("AUTH", `${provider} | circuit breaker OPEN — refusing request, state: ${cb.state}`);
+      // The refusal is counted as an ERROR, not as a 404 the error budget
+      // cannot see. Without this, a provider that is entirely down consumes
+      // no error budget at all and the SLO gate allows the deploy — the
+      // refusals are counted as requests but never as errors, so the
+      // measured error rate FALLS as the outage gets worse.
+      recordBreakerRejection(providerId);
       return null;
     }
 
@@ -217,6 +224,14 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
         connectionName: "Public",
         isActive: true,
         accessToken: "public",
+        // The provider has to be ON the credential. `clearAccountError`
+        // resolves it from here to record the success on the breaker, and a
+        // synthetic credential without it meant that a no-auth provider's
+        // half-open probe was never resolved: the circuit stayed half-open
+        // with its probe slot claimed, and every later request was refused
+        // for the whole reset window — a provider that had recovered was
+        // blackholed for good.
+        provider: providerId,
         providerSpecificData: {
           connectionProxyEnabled: resolvedProxy.connectionProxyEnabled,
           connectionProxyUrl: resolvedProxy.connectionProxyUrl,

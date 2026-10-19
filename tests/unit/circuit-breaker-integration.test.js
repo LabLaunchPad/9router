@@ -24,10 +24,14 @@ import {
   recordProviderSuccess,
   resetProviderFailureTracking,
   getProviderCredentials,
+  clearAccountError,
 } from "../../src/sse/services/auth.js";
 import { CIRCUIT_BREAKER_CONFIG } from "../../open-sse/config/runtimeConfig.js";
 
 const PROVIDER = "9router-test-provider";
+// A real no-auth free provider: it takes the early return in
+// `getProviderCredentials` that hands back a synthetic credential.
+const NO_AUTH_PROVIDER = "opencode";
 const BURST_MS = CIRCUIT_BREAKER_CONFIG.default.failureBurstMs;
 
 function breakerFor(provider = PROVIDER) {
@@ -329,5 +333,68 @@ describe("circuit breaker: the probe slot is not leaked by a local account probl
 
     expect(cb.state).toBe("half-open");
     expect(cb.canRequest()).toBe(true);
+  });
+});
+
+describe("circuit breaker: the no-auth path resolves its own probe", () => {
+  it("closes the circuit when a no-auth provider answers", async () => {
+    // The no-auth free providers take an early return that hands back a
+    // SYNTHETIC credential. The success path resolves the provider from
+    // that credential, so a credential without one meant the success was
+    // never recorded: the circuit stayed half-open with its probe slot
+    // claimed, and every later request was refused — for the whole reset
+    // window, and again in the next one. A provider that had recovered was
+    // blackholed for good.
+    const cb = getCircuitBreaker(NO_AUTH_PROVIDER, {
+      failureThreshold: 1,
+      coolDownWindowMs: 60000,
+      resetWindowMs: 120000,
+    });
+
+    cb.recordFailure();
+    expect(cb.state).toBe("open");
+    cb.lastStateChangeTime = Date.now() - 60000;
+
+    // The credential lookup claims the probe: the cool-down has elapsed, so
+    // the circuit is half-open and this request is the one probe.
+    const creds = await getProviderCredentials(NO_AUTH_PROVIDER, null, null);
+    expect(creds).toBeTruthy();
+    expect(cb.state).toBe("half-open");
+
+    // The synthetic credential carries its provider. This is the fix.
+    expect(creds.provider).toBe(NO_AUTH_PROVIDER);
+
+    // The upstream request is made with that credential and succeeds. The
+    // handler reports the success the way it does for every provider —
+    // three arguments, with the provider resolved from the credential.
+    await clearAccountError(creds.connectionId, creds, null);
+
+    expect(cb.state).toBe("closed");
+    expect(cb.canRequest()).toBe(true);
+  });
+
+  it("holds the probe until the upstream response resolves it", async () => {
+    // The sibling early returns release the probe, because they make NO
+    // upstream request. The no-auth path DOES make one, so it has to HOLD
+    // the probe and let the response resolve it — releasing it there would
+    // admit a second concurrent probe while the first is still in flight.
+    const cb = getCircuitBreaker(NO_AUTH_PROVIDER, {
+      failureThreshold: 1,
+      coolDownWindowMs: 60000,
+      resetWindowMs: 120000,
+    });
+
+    cb.recordFailure();
+    expect(cb.state).toBe("open");
+    cb.lastStateChangeTime = Date.now() - 60000;
+
+    // The credential lookup claims the probe — the cool-down has elapsed.
+    const creds = await getProviderCredentials(NO_AUTH_PROVIDER, null, null);
+    expect(creds).toBeTruthy();
+    expect(cb.state).toBe("half-open");
+
+    // The slot is still held: the upstream request has not been made yet,
+    // so nothing has resolved it.
+    expect(cb.canRequest()).toBe(false);
   });
 });
