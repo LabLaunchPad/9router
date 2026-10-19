@@ -144,16 +144,22 @@ export function getModelStrip(alias, modelId) {
   return modelStrip(findModel(PROVIDER_MODELS[alias], modelId, alias));
 }
 
-// Example model entry showing circuitBreaker field structure.
-// In practice, per-provider circuitBreaker config is defined in the provider
-// registry entries (providers/registry/{id}.js) and merged with CIRCUIT_BREAKER_CONFIG.default.
-// The field shape per model: { circuitBreaker: { failureThreshold, coolDownWindowMs, resetWindowMs } }
-export const CIRCUIT_BREAKER_EXAMPLE_MODEL = {
-  id: "example-model",
-  name: "Example Model",
-  circuitBreaker: {
-    failureThreshold: 3,     // Per-provider override (default: 5 from runtimeConfig.js)
-    coolDownWindowMs: 120000, // Per-provider override (default: 300000 ms / 5 min)
-    resetWindowMs: 600000,    // Per-provider override (default: 900000 ms / 15 min)
-  },
-};
+// Circuit breaker configuration is PER PROVIDER, not per model.
+//
+// It is resolved in `getProviderCircuitBreakerConfig()`
+// (src/sse/services/auth.js) with this precedence:
+//
+//   1. CIRCUIT_BREAKER_CONFIG.providers[providerId]   (open-sse/config/runtimeConfig.js)
+//   2. the provider registry entry's `circuitBreaker`  (open-sse/providers/registry/{id}.js)
+//   3. CIRCUIT_BREAKER_CONFIG.default
+//
+// There is no per-model lookup: a `circuitBreaker` field on a MODEL entry is
+// never read. An earlier version of this file exported an
+// `CIRCUIT_BREAKER_EXAMPLE_MODEL` constant to show the field shape. It was
+// imported by nothing, and its shape was per-model — so an operator who
+// followed it set a knob that was silently ignored. That is the same class of
+// defect this branch set out to remove (a documented override that is not
+// connected to the code), so the constant is gone rather than corrected.
+//
+// For the real shape, read providers/registry/gemini.js, which overrides the
+// threshold and the cool-down for one provider.

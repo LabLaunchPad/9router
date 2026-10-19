@@ -32,7 +32,7 @@
     },
     "model routing": {
       "role": "Provider/model resolution and combo expansion",
-      "files": ["open-sse/services/model.js", "src/services/model.js", "src/app/(dashboard)/chat.js"],
+      "files": ["open-sse/services/model.js", "src/sse/services/model.js", "src/app/(dashboard)/chat.js"],
       "inputs": ["client model string (e.g. 'gpt-4o', 'composer-2.5')"],
       "outputs": ["{provider, model} resolution", "combo models array", "capability flags"],
       "flow": "parseModel → resolveProviderAlias → getModelInfo → getProviderCredentials → enforceKeyAccess → handleChatCore → (combo: handleComboChat/handleFusionChat) → handleSingleModelChat → chatCore",
