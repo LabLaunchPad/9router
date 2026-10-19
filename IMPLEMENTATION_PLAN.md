@@ -18,7 +18,7 @@ This plan covers the refactoring of identified code quality issues with proper r
 |------|---------|-------|-----|
 | **TTS Adapters** | `SPECIAL_ADAPTERS` hardcoded in `ttsProviders/index.js` (9 providers) | Provider registry entries with `ttsAdapter` field | Requires code changes for new providers |
 | **Import Aliases** | `@/` works in source, fails in 5 test files | All imports resolve consistently | 5 test files need path updates |
-| **Font Preconnect** | `fontPreconnect` constant defined but `<link>` not in HTML head | `<link rel="preconnect">` added to head | Visual improvement only |
+| **Font Preconnect** | ~~`fontPreconnect` constant defined but `<link>` not in HTML head~~ | **RESOLVED** — `next/font`'s `Inter()` emits the preconnect itself; the dead constant and the invalid inline `<script>` were removed | No manual `<link>` needed |
 | **Font Timeout** | `setTimeout(f, 1000)` (1s) | `setTimeout(f, 500)` (500ms) | 500ms earlier font visibility |
 | **synthesizeViaConfig** | Dynamic `import()` inside function body | Module-level import at top | Inconsistent pattern |
 | **handleTtsCore** | Hardcoded adapter dispatch logic | Registry-based adapter lookup | Violates config-driven convention |

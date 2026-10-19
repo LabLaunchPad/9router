@@ -51,8 +51,9 @@
       "location": "src/app/layout.js:28",
       "pattern": "fontPreconnect defined but not used",
       "severity": "MEDIUM",
-      "description": "export const fontPreconnect = \"https://fonts.gstatic.com\" defined but no <link rel=\"preconnect\"> in HTML head",
-      "conventionViolation": "DRY: Defining constant and not using it wastes developer time"
+      "description": "RESOLVED: export const fontPreconnect = \"https://fonts.gstatic.com\" was defined but produced no <link rel=\"preconnect\"> in the HTML head. The constant, the viewport entry and the invalid inline <script> that tried to inject the <link> were removed; next/font's Inter() emits the preconnect itself.",
+      "conventionViolation": "DRY: Defining constant and not using it wastes developer time",
+      "status": "resolved"
     },
     {
       "location": "src/app/layout.js:49",
@@ -100,7 +101,6 @@
       "SPECIAL_ADAPTERS: 9 provider→adapter mappings hardcoded",
       "handleTtsCore adapter dispatch: provider list hardcoded",
       "synthesizeViaConfig(): dynamic import inside function",
-      "fontPreconnect: defined but not used in HTML head",
       "font loading timeout: hardcoded 1000ms"
     ],
     "convention": "open-sse/AGENTS.md line 24: NEVER hardcode values, models, or block/role strings — use config/ + schema/ constants"

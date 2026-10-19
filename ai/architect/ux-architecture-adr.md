@@ -13,7 +13,7 @@
 - **Inter font**: Loaded via `next/font/google` with `subsets: ["latin"]` and `variable: "--font-inter"` (layout.js line 14-17)
 - **Material Symbols Outlined**: Loaded via `import "material-symbols/outlined.css"` (layout.js line 3), with `.material-symbols-outlined { opacity: 0; }` in globals.css (line 7)
 - **Font loading script**: Inline script (layout.js line 47-51) with 1s timeout (reduced from 3s per perf analysis) to add `fonts-loaded` class
-- **Preconnect**: Already configured `fontPreconnect = "https://fonts.gstatic.com"` (layout.js line 28) and in viewport (line 32)
+- **Preconnect**: Emitted automatically by `next/font`'s `Inter()` — the dead `fontPreconnect` constant, the dead viewport entry and the invalid inline `<script>` that tried to inject the `<link>` were removed
 
 ### Decision: Font Loading Strategy
 - **Strategy**: Critical font preloading with invisible fallback transition
@@ -36,8 +36,7 @@
 ## 2. Preimplementation Plan
 
 ### Current State
-- **Preconnect configured**: `fontPreconnect = "https://fonts.gstatic.com"` (layout.js line 28)
-- **Viewport includes**: `fontPreconnect: "https://fonts.gstatic.com"` (line 32)
+- **Preconnect**: emitted by `next/font`'s `Inter()` — no manual `<link>` in the head, and none needed
 - **No explicit preload links** in head for critical fonts
 
 ### Decision: Preconnect Enhancement

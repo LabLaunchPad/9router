@@ -6,8 +6,7 @@
 | Element | Line | Details |
 |---------|------|---------|
 | Inter font import & config | 14-17 | `const inter = Inter({ subsets: ["latin"], variable: "--font-inter" })` |
-| Font preconnect declaration | 28 | `export const fontPreconnect = "https://fonts.gstatic.com"` |
-| Viewport preconnect | 32 | `fontPreconnect: "https://fonts.gstatic.com"` |
+| ~~Font preconnect declaration~~ | — | **Removed.** `next/font`'s `Inter()` emits the preconnect to `fonts.gstatic.com` itself; the dead constant, the dead viewport entry and the invalid inline `<script>` that tried to inject the `<link>` are gone. |
 | Theme persistence script | 42-46 | `dangerouslySetInnerHTML` with localStorage theme check |
 | Font loading script | 47-51 | 1s timeout (`setTimeout(f,1000)`) to add `fonts-loaded` class |
 | Google Analytics | 59 | `<GoogleAnalytics gaId={"G-LC959F603F"} />` |
@@ -60,13 +59,13 @@
 - **Decision**: Critical font preloading with invisible fallback transition
 - **Current**: Inter via next/font/google + preconnect; Material Symbols with opacity 0→1 transition
 - **1s timeout**: Balances visual completeness vs perceived performance (reduced from 3s)
-- **Preconnect**: Already configured via `fontPreconnect` variable and viewport meta
+- **Preconnect**: Emitted automatically by `next/font`'s `Inter()` — no manual `<link>` needed
 - **Target**: <500ms text rendering, immediate Inter visibility
 
 ### 2. Preconnect Implementation Plan
-- **Status**: Partially implemented (preconnect variable + viewport meta configured)
-- **Missing**: Explicit `<link rel="preconnect">` in head + `<link rel="preload">` for Inter font
-- **Action**: Add preconnect/preload links while avoiding duplication with viewport
+- **Status**: Resolved — `next/font`'s `Inter()` emits the preconnect to `fonts.gstatic.com` itself
+- **Missing**: A `<link rel="preload">` for the Inter font (optional)
+- **Action**: Do not add a manual preconnect — it would duplicate what `next/font` already emits
 - **Expected impact**: 100-200ms LCP reduction
 
 ### 3. Tailwind v4 purge Configuration

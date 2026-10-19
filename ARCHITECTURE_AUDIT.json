@@ -166,9 +166,10 @@
           "severity": "medium",
           "category": "Font preconnect defined but not used in layout",
           "location": "src/app/layout.js line 28: export const fontPreconnect = \"https://fonts.gstatic.com\";",
-          "description": "The fontPreconnect constant is defined and fontPreconnect is added to viewport, but there is NO <link rel=\"preconnect\" href=\"https://fonts.gstatic.com\" crossorigin> in the <head> of the HTML. The constant and viewport property exist but have no effect.",
+          "description": "RESOLVED. The fontPreconnect constant and the viewport.fontPreconnect entry were defined but never produced a <link rel=\"preconnect\"> in the HTML head. The attempt that did exist injected the <link> inside a <script> element, whose body is not valid script content, so the browser parsed it as script source and the preconnect never happened.",
           "conventionViolation": "DRY: Defining a constant and not using it wastes developer time and creates false expectations. The web-performance-analysis.md explicitly recommends adding preconnect (Phase 5, High Impact/Low Effort).",
-          "fix": "Add <link rel=\"preconnect\" href=\"https://fonts.gstatic.com\" crossorigin> to the head in layout.js alongside the existing Google Analytics script."
+          "fix": "DONE. next/font's Inter() already emits the preconnect to fonts.gstatic.com itself, so the dead constant, the dead viewport entry and the invalid inline <script> were removed. No manual <link> is needed.",
+          "status": "resolved"
         },
         {
           "id": "ISSUE-005",
@@ -222,8 +223,8 @@
         "id": "ADR-003",
         "title": "Web Performance Fixes: Font Preconnect and Timeout Reduction",
         "status": "accepted",
-        "context": "The web-performance-analysis.md identified several high-impact, low-effort performance improvements. Two were flagged as not yet implemented: (1) font preconnect not added to layout head, and (2) font loading timeout at 1s could be optimized further. The layout.js defines fontPreconnect constant and viewport property but does not actually add a <link rel=\"preconnect\"> tag to the HTML head.",
-        "decision": "Implement both fixes:\n1. Add <link rel=\"preconnect\" href=\"https://fonts.gstatic.com\" crossorigin> to the head in src/app/layout.js alongside the Google Analytics script\n2. Reduce the font loading timeout from 1000ms to 500ms in the inline script, or make it configurable via an env var\n\nThese changes are estimated to save 100-200ms LCP (preconnect) and 200ms FCP (earlier font visibility).\n\nAdditionally, verify Tailwind v4 purge configuration by running build and checking .next/ for unused class removal (estimated 50-100KB CSS reduction).",
+        "context": "The web-performance-analysis.md identified several high-impact, low-effort performance improvements. Two were flagged as not yet implemented: (1) font preconnect not added to layout head, and (2) font loading timeout at 1s could be optimized further. The layout.js defined a fontPreconnect constant and a viewport.fontPreconnect property but never produced a <link rel=\"preconnect\"> tag in the HTML head; the one attempt that did exist injected the <link> inside a <script> element, whose body is not valid script content.",
+        "decision": "IMPLEMENTED AS REVISED. The font preconnect is emitted by next/font's Inter() itself, so no manual <link> is needed: the dead constant, the dead viewport entry and the invalid inline <script> were removed rather than adding a second, redundant preconnect. The font loading timeout was reduced from 1000ms to 500ms in the inline script.\n\nAdditionally, verify Tailwind v4 purge configuration by running build and checking .next/ for unused class removal (estimated 50-100KB CSS reduction).",
         "consequences": {
           "easier": "Measurable performance improvements with minimal code changes (5 min each); improves Core Web Vitals ratings; no user-facing behavior changes",
           "harder": "Need to rebuild and verify no regressions; preconnect may have limited benefit if fonts are already cached by returning visitors",

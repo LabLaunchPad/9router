@@ -34,7 +34,7 @@
 | `open-sse/handlers/ttsCore.js:57-64` | Adapter dispatch hardcoded in `handleTtsCore` | MEDIUM |
 | `open-sse/handlers/ttsProviders/index.js:33` | Dynamic `import()` inside `synthesizeViaConfig()` | MEDIUM |
 | `src/app/layout.js:49` | Hardcoded `setTimeout(f, 1000)` for font loading | MEDIUM |
-| `src/app/layout.js:28` | `fontPreconnect` defined but `<link rel="preconnect">` not added to HTML head | MEDIUM |
+| `src/app/layout.js:28` | ~~`fontPreconnect` defined but `<link rel="preconnect">` not added to HTML head~~ | **RESOLVED** — removed; `next/font`'s `Inter()` emits the preconnect itself |
 
 ### 1.4 Error Handling Consistency
 - **Consistent Patterns**:

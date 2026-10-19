@@ -76,7 +76,8 @@ would divide one provider's error count by another provider's request count.
 | `SLO_EXHAUSTED_THRESHOLD` | `95` | Percent. |
 | `SLO_WINDOW_SECONDS` | `2592000` | 30 days. See the window note below. |
 | `SLO_TARGET_ERROR_RATE` | `0.0005` | The error budget allowance. Must match the app's own target (99.95% availability). |
-| `SLO_REQUIRE_FULL_WINDOW` | `true` | Block when the sample is younger than the window. |
+| `SLO_REQUIRE_FULL_WINDOW` | `false` | Opt in: block when the sample is younger than the window. |
+| `SLO_MIN_SAMPLE_SECONDS` | `0` | Opt in: block when the sample is thinner than this. `0` disables the check. |
 | `SLO_FAIL_CLOSED` | `true` | Set `false` to fail open **on data problems**. A missing endpoint still blocks. |
 | `SLO_FETCH_TIMEOUT_MS` | `8000` | Metrics request timeout. |
 | `SLO_GATE_OVERRIDE_APPROVED` | `false` | Emergency override. Audited. |
@@ -94,15 +95,28 @@ would divide one provider's error count by another provider's request count.
 
 The counters behind the metric live in the service process, so they cover the
 time since the last restart, not the last 30 days. `/api/metrics` publishes
-`sse_metrics_sample_age_seconds` so the gate can tell the difference.
+`sse_metrics_sample_age_seconds` so the gate can tell the difference, and the
+gate always includes the age in its decision reason — a reader of the job
+summary always sees how much of the window the figure covers.
 
-With `SLO_REQUIRE_FULL_WINDOW=true` (the default) the gate **blocks** when the
-sample is younger than `SLO_WINDOW_SECONDS`: a sample that does not span the
-window cannot say anything about the budget over that window, and reading it
-as if it could would allow exactly the deploys the gate exists to catch — a
-crash-looping service has just reset its counters. Set
-`SLO_REQUIRE_FULL_WINDOW=false` to downgrade this to a warning, or point the
-gate at a real time-series store that does span the window.
+The age is **reported, not enforced, by default**, and that is deliberate:
+
+- A deploy restarts the service, so the sample age at gate time is *seconds*
+  old. A check that blocked on the age would block **every** deploy, and a
+  gate that can never pass is not a gate — it is an outage with extra steps.
+- The figure is still a real measurement of the error rate over the observed
+  period, and that is what the thresholds are applied to.
+
+Two opt-in knobs change that:
+
+| Variable | Effect |
+|---|---|
+| `SLO_REQUIRE_FULL_WINDOW=true` | Block when the sample does not span `SLO_WINDOW_SECONDS`. Only meaningful when the endpoint is a time-series store that outlives a single process lifetime. |
+| `SLO_MIN_SAMPLE_SECONDS=300` | Block when the sample is thinner than the given number of seconds — too little data to judge at all. |
+
+When the endpoint does not publish the sample-age gauge at all, the gate says
+so in the reason (`sample age unknown`) rather than pretending the window was
+covered.
 
 The script has **zero runtime dependencies** (native `fetch`, Node 18+), so the
 CI job needs no `npm install` for it.
@@ -215,9 +229,10 @@ process-level exit codes via a real child-process run.
 | Situation | Action |
 |---|---|
 | Gate blocks a legitimate deploy | Set `SLO_GATE_OVERRIDE_APPROVED=true` + a reason. The decision is logged with the actor and SHA. |
-| Endpoint unreachable / the metrics fetch fails | Set `SLO_FAIL_CLOSED=false` (fail open on data problems). |
+| Endpoint unreachable / the metrics fetch fails | Set `SLO_FAIL_CLOSED=false` (fail open on data problems). The decision is reported as `warn`, not `block`, so the summary does not claim a block that did not happen. |
 | Endpoint secret is not set yet | Set the `SLO_GATE_SKIP` repo variable to `true` to skip the gate explicitly — it is visible in the repo settings, unlike a silent skip. `SLO_FAIL_CLOSED=false` does **not** cover this case: a gate with no endpoint cannot say anything about the budget, so it blocks. |
-| The service was restarted and the sample no longer spans the window | Set `SLO_REQUIRE_FULL_WINDOW=false`, or point the gate at a time-series store that does span the window. |
+| The figure covers less than the SLO window | Nothing to do — that is the default and the coverage is reported in the decision reason. Set `SLO_REQUIRE_FULL_WINDOW=true` to enforce it, or point the gate at a time-series store that does span the window. |
+| The metric has almost no data | Set `SLO_MIN_SAMPLE_SECONDS=300` to refuse to judge a sample that is too thin to be meaningful. |
 | Gate must be removed entirely | Delete the `slo-validation-gate` job from `.github/workflows/drift-prevention.yml`. Nothing else depends on it — the script is standalone and is not imported by the app. |
 
 The gate is a pure CI-side control: it never runs inside the application and
@@ -485,6 +500,18 @@ reads (`computeErrorBudgetConsumed`), so the health view and the deploy gate
 can never disagree. `status` is derived from that budget (`"degraded"` below
 25% remaining) rather than hardcoded to `"ok"`.
 
+The route carries two deliberately separate signals:
+
+| Field | Meaning |
+|---|---|
+| `ok` | **Liveness.** The service answered. Always `true` for a 200 response, so an existing probe that reads `ok` keeps working. |
+| `status` | **Readiness.** The SLO state: `"ok"` or `"degraded"`. |
+
+The HTTP status stays 200 even when the service is degraded: a load balancer
+should not pull a still-serving instance out of rotation over a soft SLO
+signal. A probe that wants the SLO state reads `status`; one that only wants
+to know the process is up reads `ok` or the HTTP status.
+
 The route keeps its original contract: the `ok: true` field, the CORS headers
 (`Access-Control-Allow-Origin: *`) and the `OPTIONS` handler. The dashboard
 pings other instances cross-origin — see
@@ -492,6 +519,41 @@ pings other instances cross-origin — see
 says *"/api/health route sets Access-Control-Allow-Origin: * -> CORS works
 through tunnel"* — so dropping them silently breaks the endpoint-alive
 indicator for every remote instance.
+
+### Circuit breaker semantics
+
+The breaker is a **provider-level** control, and the distinction matters:
+
+| Signal | Trips the provider circuit? | Why |
+|---|---|---|
+| `5xx`, transport error (no status) | **Yes** | The provider is failing; every account will fail the same way. |
+| `401`, `402`, `403`, `429` | **No** | About one credential. The provider itself is healthy. |
+| "no credentials configured" | **No** | A local configuration problem, and no upstream call is made. |
+| "every account locked or rate-limited" | **No** | Same: the provider is healthy and no upstream call is made. |
+| A successful upstream response | Closes the circuit | The provider demonstrably answered. |
+
+Two details that are easy to get wrong, and that this implementation gets
+right:
+
+- **A success is recorded on the response, not on credential selection.**
+  Picking a credential says nothing about whether the provider answered; a
+  provider that is down still hands out credentials happily.
+- **A burst of failures for the same provider is ONE outage.** The
+  account-fallback loop tries the next credential whenever an account fails,
+  so a single client request against a provider returning 500 produces one
+  failure *per account*. Counting those separately would open the circuit
+  after a single request and let one client take a whole provider out of
+  service for the cool-down window. Failures for the same provider within
+  `PROVIDER_FAILURE_BURST_MS` (2 s) are therefore collapsed into one.
+
+The half-open state admits exactly **one** probe request. The probe slot is
+claimed by `canRequest()` and released by the success/failure record — and
+explicitly by `releaseProbe()` on the paths where no upstream request is made
+at all (no credentials, every account locked), because otherwise the
+provider would be blackholed for the whole reset window by a purely local
+problem. Reading the breaker's state (`getState()`, used by `/api/health` and
+`/api/metrics`) is side-effect free: a metrics scrape must never half-open a
+circuit that is supposed to be failing fast.
 
 ### `GET /api/metrics`
 

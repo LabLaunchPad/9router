@@ -5,6 +5,16 @@ import { structuredInfo, structuredWarn } from "@/sse/utils/logger.js";
 /**
  * GET /api/health — operational health snapshot.
  *
+ * Two distinct signals, deliberately kept separate:
+ *
+ *  - `ok` is LIVENESS: the service answered. It is always true for a 200
+ *    response, so an existing probe that reads `ok` keeps working.
+ *  - `status` is READINESS: the SLO state, derived from the remaining error
+ *    budget ("ok" | "degraded"). A service whose error budget is burned
+ *    reports `status: "degraded"` while still answering, because the HTTP
+ *    status stays 200 — a load balancer should not pull a still-serving
+ *    instance out of rotation over a soft SLO signal.
+ *
  * Reports:
  *  - ok: true (kept for backwards compatibility with existing probes)
  *  - status: "ok" | "degraded" (derived from the error budget)

@@ -399,7 +399,7 @@ User calls /api/tts with {provider: "openai", model: "gpt-4o-mini-tts"}
 | `open-sse/handlers/ttsProviders/index.js:15-25` | `SPECIAL_ADAPTERS` with 9 provider→adapter mappings | Provider registry entries with `ttsAdapter` field |
 | `open-sse/handlers/ttsCore.js:57-64` | Adapter dispatch: `if (getTtsAdapter(provider))` | Check provider registry for `ttsAdapter` field |
 | `open-sse/handlers/ttsProviders/index.js:33` | `import("@/shared/constants/providers")` inside `synthesizeViaConfig()` | Module-level `import { AI_PROVIDERS } from "@/shared/constants/providers"` |
-| `src/app/layout.js:28` | `fontPreconnect = "https://fonts.gstatic.com"` | Used in `<link rel="preconnect">` tag in HTML head |
+| `src/app/layout.js:28` | ~~`fontPreconnect = "https://fonts.gstatic.com"`~~ | **RESOLVED** — removed; `next/font`'s `Inter()` emits the preconnect itself |
 | `src/app/layout.js:49` | `setTimeout(f, 1000)` | Configurable via env var or reduced to 500ms |
 
 ### 4.3 The SPECIAL_ADAPTERS Problem (ISSUE-001)
