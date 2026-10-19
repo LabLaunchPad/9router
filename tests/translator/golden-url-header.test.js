@@ -4,6 +4,7 @@
 import { describe, it, expect } from "vitest";
 import { PROVIDERS } from "../../open-sse/config/providers.js";
 import { DefaultExecutor } from "../../open-sse/executors/default.js";
+import { sanitize } from "./golden-sanitize.js";
 
 // Credentials mẫu cố định (deterministic) — KHÔNG dùng Date.now/random.
 const API_KEY_CRED = { apiKey: "sk-test-APIKEY", providerSpecificData: {} };
@@ -26,34 +27,14 @@ const SPECIALIZED = new Set([
 // Sanitize header: khử token + field thời gian động (kimi X-Msh-Device-Id) để snapshot ổn định.
 // Các value phụ thuộc máy / thời gian cũng phải chuẩn hoá — nếu không, baseline chỉ tái lập
 // được trên đúng máy này và sẽ hỏng ở mọi runner khác (và mỗi lần bump version).
-const MACHINE_DEPENDENT_HEADERS = {
-  // randomUUID() mới cho mỗi request
-  "X-Mavis-Session-Id": "<UUID>",
-  // timezone của máy chạy
-  "X-Mavis-Timezone-Offset": "<TZ>",
-  // hostname của máy chạy
-  "X-Msh-Device-Name": "<HOST>",
-  // OS/arch của máy chạy
-  "X-Msh-Device-Model": "<MODEL>",
-  // version của app — đổi mỗi lần release
-  "X-Msh-Version": "<VERSION>",
-};
-
-function sanitize(headers) {
-  const out = {};
-  for (const [k, v] of Object.entries(headers)) {
-    if (typeof v !== "string") {
-      out[k] = v;
-      continue;
-    }
-    out[k] = MACHINE_DEPENDENT_HEADERS[k]
-      ?? v
-        .replace(/Bearer .+/, "Bearer <TOK>")
-        .replace(/sk-test-APIKEY|tok-test-ACCESS/g, "<CRED>")
-        .replace(/kimi-\d{10,}/g, "kimi-<TS>");
-  }
-  return out;
-}
+//
+// Sanitiser nằm ở ./golden-sanitize.js — dùng chung với
+// golden-snapshot-portability.test.js để test chống hồi quy cũng dùng đúng
+// hàm mà snapshot được sinh ra. `X-PLATFORM` (process.platform) và
+// `X-PLATFORM-VERSION` (process.version) từng là ví dụ bị sót: snapshot ghi
+// "win32" và "v22.23.2", nên suite đỏ trên mọi runner Linux — và CI báo xanh
+// vì base không có snapshot nên cũng đỏ, hai bên bằng nhau nên "không có
+// failure mới".
 
 const providerIds = Object.keys(PROVIDERS).filter((p) => !SPECIALIZED.has(p)).sort();
 
