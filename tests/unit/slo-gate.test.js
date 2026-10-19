@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { spawn } from "node:child_process";
+import { createServer } from "node:http";
+import { networkInterfaces } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -11,6 +13,8 @@ import {
   parseBudgetConsumed,
   decide,
   evaluate,
+  isLoopbackEndpoint,
+  expandIPv6,
 } from "../../scripts/ci/validate-slo.mjs";
 
 const SCRIPT_PATH = path.join(
@@ -520,6 +524,70 @@ describe("SLO gate evaluate()", () => {
   });
 });
 
+// --- the loopback refusal ----------------------------------------------------
+
+describe("isLoopbackEndpoint", () => {
+  it("recognises the loopback host by every spelling the parser normalises", () => {
+    // The requirement is that the gate must NEVER query localhost:3000.
+    // Every one of these is the same address, and the URL parser
+    // normalises the numeric spellings to the dotted quad — which is why
+    // the check is done on the parsed host.
+    for (const url of [
+      "http://localhost:3000/metrics",
+      "http://LOCALHOST:3000/metrics",
+      "http://foo.localhost:3000/metrics",
+      "http://127.0.0.1:3000/metrics",
+      "http://127.1:3000/metrics",
+      "http://2130706433:3000/metrics",
+      "http://0x7f000001:3000/metrics",
+      "http://0177.0.0.1:3000/metrics",
+      "http://0.0.0.0:3000/metrics",
+      "http://[::1]:3000/metrics",
+      "http://[::]:3000/metrics",
+      "http://[::ffff:127.0.0.1]:3000/metrics",
+      "http://[::ffff:7f00:1]:3000/metrics",
+    ]) {
+      expect(isLoopbackEndpoint(url), url).toBe(true);
+    }
+  });
+
+  it("does not treat a real host as loopback", () => {
+    for (const url of [
+      "https://metrics.example.com/metrics",
+      "http://10.0.0.5:3000/metrics",
+      "http://192.168.1.20:9090/metrics",
+      "http://[2001:db8::1]:9090/metrics",
+    ]) {
+      expect(isLoopbackEndpoint(url), url).toBe(false);
+    }
+  });
+
+  it("does not treat a host that merely mentions localhost as loopback", () => {
+    // `localhost.example.com` is a real host, and `localhost@real.host`
+    // has the host `real.host` — the substring is in the userinfo, not in
+    // the host. A raw-string match would refuse both.
+    expect(isLoopbackEndpoint("http://localhost.example.com/metrics")).toBe(false);
+    expect(isLoopbackEndpoint("http://localhost@evil.example.com/metrics")).toBe(false);
+    expect(isLoopbackEndpoint("http://evil.example.com#@localhost/metrics")).toBe(false);
+  });
+
+  it("returns false for an unparseable URL, which fails closed in the fetch path", () => {
+    expect(isLoopbackEndpoint("not a url")).toBe(false);
+  });
+});
+
+describe("expandIPv6", () => {
+  it("expands the compressed form into eight groups", () => {
+    expect(expandIPv6("::1")).toEqual([0, 0, 0, 0, 0, 0, 0, 1]);
+    expect(expandIPv6("::")).toEqual([0, 0, 0, 0, 0, 0, 0, 0]);
+    expect(expandIPv6("::ffff:7f00:1")).toEqual([0, 0, 0, 0, 0, 0xffff, 0x7f00, 1]);
+  });
+
+  it("returns nothing for a malformed address", () => {
+    expect(expandIPv6("1:2:3")).toEqual([]);
+  });
+});
+
 // --- process-level contract (what CI actually depends on) ------------------
 
 describe("SLO gate process exit codes", () => {
@@ -561,5 +629,90 @@ describe("SLO gate process exit codes", () => {
     expect(res.stderr).toContain("release-bot");
     expect(res.stderr).toContain("87a74e1b");
     expect(res.stderr).toContain("hotfix INC-4711");
+  });
+});
+
+describe("the gate never queries a loopback endpoint", () => {
+  /**
+   * Start a metrics server that counts the requests it receives.
+   *
+   * The assertion that matters is the REQUEST COUNT, not the exit code. A
+   * gate that tried the endpoint and then refused the answer would still
+   * exit 1 — and the request it made would already have happened.
+   */
+  async function withCountingMetricsServer(fn) {
+    let requests = 0;
+    const server = createServer((req, res) => {
+      requests += 1;
+      res.writeHead(200, { "content-type": "text/plain" });
+      res.end("sse_error_budget_consumed 0.05\nsse_metrics_sample_age_seconds 3600\n");
+    });
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const { port } = server.address();
+    try {
+      return await fn({ port, requestCount: () => requests });
+    } finally {
+      await new Promise((resolve) => server.close(resolve));
+    }
+  }
+
+  it("exits 1 without sending a single request to a loopback endpoint", async () => {
+    await withCountingMetricsServer(async ({ port, requestCount }) => {
+      const res = await runGate({
+        SLO_METRICS_ENDPOINT: `http://127.0.0.1:${port}/metrics`,
+        SLO_FETCH_TIMEOUT_MS: "1500",
+      });
+      expect(res.code).toBe(1);
+      expect(res.stderr).toMatch(/loopback/i);
+      // The requirement: it must NEVER query it.
+      expect(requestCount()).toBe(0);
+    });
+  });
+
+  it("exits 1 without sending a single request to localhost:3000/metrics", async () => {
+    // The address the requirement names by hand. The server is on an
+    // ephemeral port, so this is about the HOST, not the port.
+    await withCountingMetricsServer(async ({ port, requestCount }) => {
+      const res = await runGate({
+        SLO_METRICS_ENDPOINT: `http://localhost:${port}/metrics`,
+        SLO_FETCH_TIMEOUT_MS: "1500",
+      });
+      expect(res.code).toBe(1);
+      expect(requestCount()).toBe(0);
+    });
+  });
+
+  it("still queries a non-loopback endpoint, and allows the deploy", async () => {
+    // The refusal must not break the legitimate path. The server listens on
+    // 127.0.0.1, so the endpoint is addressed by the machine's own
+    // non-loopback address where one is available; where it is not, the
+    // test asserts only that the request count is what the endpoint
+    // semantics require.
+    const addresses = [];
+    for (const list of Object.values(networkInterfaces())) {
+      for (const ni of list || []) {
+        if (ni.family === "IPv4" && !ni.internal) addresses.push(ni.address);
+      }
+    }
+    if (addresses.length === 0) return;
+
+    let requests = 0;
+    const server = createServer((req, res) => {
+      requests += 1;
+      res.writeHead(200, { "content-type": "text/plain" });
+      res.end("sse_error_budget_consumed 0.05\nsse_metrics_sample_age_seconds 3600\n");
+    });
+    await new Promise((resolve) => server.listen(0, resolve));
+    const { port } = server.address();
+    try {
+      const res = await runGate({
+        SLO_METRICS_ENDPOINT: `http://${addresses[0]}:${port}/metrics`,
+        SLO_FETCH_TIMEOUT_MS: "5000",
+      });
+      expect(requests).toBe(1);
+      expect(res.code).toBe(0);
+    } finally {
+      await new Promise((resolve) => server.close(resolve));
+    }
   });
 });

@@ -33,6 +33,29 @@ on:
     branches:
       - main
       - master
+  # The SLO gate runs on a push to the default branch — and that is the ONLY
+  # event that runs it, which means the gate could not be executed on demand
+  # at all: on every pull request the job is skipped, and the only way to
+  # reach it was a push to the default branch. A control that can only be
+  # reached by the thing it is meant to gate, and that nobody has run, is a
+  # control whose behaviour is a matter of opinion.
+  #
+  # This trigger is how the gate is verified: an operator can run it, with
+  # their own SLO_METRICS_ENDPOINT configured, BEFORE merging to the default
+  # branch — and can see it fail closed, with the reason, when it is not.
+  #
+  # The drift comparison does not apply to this event (there is no base
+  # commit to compare against), so the drift job reports that and skips.
+  workflow_dispatch:
+    inputs:
+      slo_gate:
+        description: "Run the SLO validation gate"
+        type: boolean
+        default: true
+      reason:
+        description: "Why this manual run is happening (recorded in the job summary)"
+        type: string
+        required: true
 
 jobs:
   test-drift:
@@ -359,7 +382,12 @@ jobs:
     # and report its decision when the drift check failed, otherwise the
     # operator sees one red job and no SLO verdict. The workflow still fails
     # overall, because the failed dependency fails it.
-    if: '!cancelled() && github.event_name == ''push'' && (github.ref == ''refs/heads/main'' || github.ref == ''refs/heads/master'')'
+    #
+    # The `workflow_dispatch` branch is how the gate is run on demand. It is
+    # deliberately NOT limited to the default branch: the point of a manual
+    # run is to check the gate (and the operator's endpoint) before the
+    # deploy that would trigger it.
+    if: '!cancelled() && ((github.event_name == ''push'' && (github.ref == ''refs/heads/main'' || github.ref == ''refs/heads/master'')) || (github.event_name == ''workflow_dispatch'' && inputs.slo_gate))'
     timeout-minutes: 30
 
     steps:
@@ -443,11 +471,16 @@ jobs:
         env:
           SLO_GATE_SKIP: ${{ vars.SLO_GATE_SKIP }}
           SLO_GATE_OVERRIDE_APPROVED: ${{ vars.SLO_GATE_OVERRIDE_APPROVED }}
+          MANUAL_RUN_REASON: ${{ inputs.reason }}
         run: |
           echo "Service: 9router"
           echo "Environment: production"
           echo "Git SHA: ${{ github.sha }}"
           echo "SLO gate exit code: ${{ job.status }}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "Event: manual run"
+            echo "Reason: ${{ inputs.reason }}"
+          fi
           if [ "$SLO_GATE_SKIP" = "true" ]; then
             echo "::warning::SLO gate was SKIPPED via SLO_GATE_SKIP. This deploy was NOT validated against the error budget."
           elif [ "$SLO_GATE_OVERRIDE_APPROVED" = "true" ]; then

@@ -16,6 +16,8 @@
  * bodies, or user data.
  */
 
+import { isIP } from "node:net";
+
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
@@ -339,6 +341,96 @@ async function fetchMetrics(url) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Loopback refusal
+// ---------------------------------------------------------------------------
+
+/**
+ * Expand an IPv6 address into its eight 16-bit groups.
+ *
+ * `URL` normalises IPv6 into the compressed hex form, so `::ffff:127.0.0.1`
+ * arrives as `::ffff:7f00:1` and cannot be compared as a dotted quad.
+ *
+ * @param {string} host - an IPv6 address without brackets
+ * @returns {number[]} eight groups, or [] when the address is malformed
+ */
+export function expandIPv6(host) {
+  const parts = host.split("::");
+  let groups;
+  if (parts.length === 1) {
+    groups = parts[0].split(":");
+  } else {
+    const head = parts[0] ? parts[0].split(":") : [];
+    const tail = parts[1] ? parts[1].split(":") : [];
+    const fill = 8 - head.length - tail.length;
+    if (fill < 0) return [];
+    groups = [...head, ...new Array(fill).fill("0"), ...tail];
+  }
+  if (groups.length !== 8) return [];
+  const out = groups.map((g) => parseInt(g, 16));
+  return out.every((n) => Number.isInteger(n) && n >= 0 && n <= 0xffff) ? out : [];
+}
+
+/**
+ * True when the endpoint's host is a loopback address.
+ *
+ * The gate must never read a loopback endpoint. On a CI runner,
+ * `http://localhost:3000/metrics` measures the runner rather than the
+ * service, so it reports a healthy error budget and waves every deploy
+ * through — silently, because the summary looks exactly like a healthy
+ * service.
+ *
+ * The check is on the PARSED host, not on the raw string, because the raw
+ * string has many spellings of the same address and because parsing is the
+ * only thing that gets the inverse case right: `http://localhost@real.host/`
+ * has the host `real.host`, and a substring match on "localhost" would
+ * refuse a perfectly good endpoint.
+ *
+ * @param {string} url
+ * @returns {boolean}
+ */
+export function isLoopbackEndpoint(url) {
+  let hostname;
+  try {
+    hostname = new URL(url).hostname.toLowerCase();
+  } catch {
+    // An unparseable URL is not a loopback address; it fails closed in the
+    // fetch path instead, where the error is reported as a fetch failure.
+    return false;
+  }
+
+  // RFC 6761 reserves `localhost` and everything under `.localhost` for the
+  // loopback interface.
+  if (hostname === "localhost" || hostname.endsWith(".localhost")) return true;
+
+  // `URL` keeps the brackets on an IPv6 host.
+  const bare = hostname.startsWith("[") && hostname.endsWith("]")
+    ? hostname.slice(1, -1)
+    : hostname;
+
+  if (isIP(bare) === 4) {
+    // The parser normalises every spelling of 127.0.0.1 to the dotted quad
+    // (127.1, 2130706433, 0x7f000001 and 0177.0.0.1 all become 127.0.0.1).
+    // 0.0.0.0 is the unspecified address and routes to loopback.
+    return bare === "0.0.0.0" || bare.startsWith("127.");
+  }
+
+  if (isIP(bare) === 6) {
+    const g = expandIPv6(bare);
+    if (g.length !== 8) return false;
+    if (g.every((x) => x === 0)) return true; // ::
+    if (g.slice(0, 7).every((x) => x === 0) && g[7] === 1) return true; // ::1
+    // IPv4-mapped (::ffff:a.b.c.d) and IPv4-compatible addresses.
+    if (g.slice(0, 5).every((x) => x === 0) && g[5] === 0xffff) {
+      if (g[6] === 0x7f00) return true; // ::ffff:127.0.0.0/8
+      if (g[6] === 0 && g[7] === 0) return true; // ::ffff:0.0.0.0
+    }
+    return false;
+  }
+
+  return false;
+}
+
 /**
  * Evaluate a gate run against an already-fetched metrics payload.
  *
@@ -530,6 +622,46 @@ export async function main() {
   }
 
   const endpoint = cfg.metricsEndpoint;
+
+  // ---- Refuse a loopback endpoint ----
+  //
+  // The requirement is absolute: the gate must NEVER read a loopback
+  // endpoint. On a CI runner `http://localhost:3000/metrics` measures the
+  // runner, not the service, so it reports a healthy error budget and waves
+  // every deploy through — silently, because the summary of a healthy runner
+  // is indistinguishable from the summary of a healthy service.
+  //
+  // The check above refuses an UNSET endpoint. This one refuses a SET but
+  // loopback endpoint. Both are needed, and neither substitutes for the
+  // other: an unset endpoint is a configuration error, a loopback endpoint is
+  // a measurement of the wrong thing.
+  //
+  // The refusal is unconditional. There is no flag for it: a gate that has
+  // been told to read the runner's own metrics cannot tell a healthy runner
+  // from a healthy service, so no setting makes that safe. The release paths
+  // remain SLO_GATE_SKIP and the audited SLO_GATE_OVERRIDE_APPROVED, and
+  // neither of them queries anything — the override exits before this point.
+  if (isLoopbackEndpoint(endpoint)) {
+    const decision = {
+      decision: "block",
+      exitCode: 1,
+      reason: "SLO_METRICS_ENDPOINT points at a loopback address",
+    };
+    emitStructuredLog(cfg, decision, null, { loopbackEndpoint: true, endpoint });
+    console.error(
+      buildSummary(cfg, decision, null, {
+        note:
+          "SLO_METRICS_ENDPOINT points at a loopback address (" +
+          endpoint +
+          "). A loopback endpoint measures the CI runner, not the deployed " +
+          "service, so the gate would report a healthy error budget and " +
+          "allow a deploy that was never validated. Point " +
+          "SLO_METRICS_ENDPOINT at the deployed service's metrics URL, or at " +
+          "the authoritative Prometheus.",
+      }),
+    );
+    process.exit(1);
+  }
 
   // ---- Fetch ----
   let metricsText = null;

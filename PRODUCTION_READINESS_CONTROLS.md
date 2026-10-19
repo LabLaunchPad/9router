@@ -26,17 +26,43 @@ deployment policy:
 | `75% – 95%` | `block` | `1` | Deployment blocked |
 | `>= 95%` | `block` | `1` | Budget exhausted — blocked |
 | No / malformed / unreachable metrics | `block` | `1` | **Fails closed** |
-| `SLO_METRICS_ENDPOINT` not configured | `block` | `1` | **Fails closed** — no localhost fallback |
+| `SLO_METRICS_ENDPOINT` not configured | `block` | `1` | **Fails closed** |
+| `SLO_METRICS_ENDPOINT` points at a loopback address | `block` | `1` | **Refused** — it would measure the CI runner, not the service |
 
 The gate is a **fail-closed** control by default: missing, malformed, or
 unavailable SLO data blocks the deploy rather than waving it through. Set
 `SLO_FAIL_CLOSED=false` to invert the data-unavailable cases (not
 recommended).
 
-There is deliberately **no localhost fallback**. A CI runner's
-`http://localhost:3000/metrics` measures the *runner*, not the service, so it
-would report a healthy budget and wave through every deploy. An unset
-endpoint is a configuration error and fails closed.
+There is deliberately **no localhost fallback**, and a loopback endpoint is
+**refused outright**. A CI runner's `http://localhost:3000/metrics` measures
+the *runner*, not the service, so it would report a healthy budget and wave
+through every deploy. Two separate failures are covered, because they are
+different failures:
+
+* an **unset** endpoint is a configuration error and fails closed;
+* a **loopback** endpoint is a measurement of the wrong thing, and is
+  refused before the request is made — the gate sends it nothing at all.
+
+The check is on the *parsed* host, so every spelling of the same address is
+caught, and a host hidden in the userinfo is not mistaken for one:
+
+| Endpoint | Result |
+|---|---|
+| `http://localhost:3000/metrics` | refused |
+| `http://foo.localhost:3000/metrics` | refused (RFC 6761 reserves `.localhost` for loopback) |
+| `http://127.0.0.1:3000/metrics`, `http://127.1:3000/metrics` | refused |
+| `http://2130706433:3000/metrics`, `http://0x7f000001:3000/metrics`, `http://0177.0.0.1:3000/metrics` | refused — the URL parser normalises them to `127.0.0.1` |
+| `http://0.0.0.0:3000/metrics` | refused |
+| `http://[::1]:3000/metrics`, `http://[::ffff:127.0.0.1]:3000/metrics` | refused |
+| `http://localhost@real.host/metrics` | **not** refused — the host is `real.host` |
+| `https://metrics.internal/metrics` | allowed |
+
+The refusal is unconditional. There is no flag for it: a gate that has been
+told to read the runner's own metrics cannot tell a healthy runner from a
+healthy service, so no setting makes that safe. The release paths remain
+`SLO_GATE_SKIP` and the audited `SLO_GATE_OVERRIDE_APPROVED` — and neither
+of them queries anything, because the override exits before the fetch.
 
 ### The signal it reads
 
@@ -86,10 +112,10 @@ would divide one provider's error count by another provider's request count.
 | `SLO_GATE_SKIP` | `false` | CI-only: skip the gate entirely (repo variable). |
 
 > **The endpoint must be the authoritative one** — a production Prometheus or
-> the deployed instance's `/api/metrics`. Do **not** point it at
-> `localhost:3000/metrics` on the CI runner: that measures the CI box, not the
-> service, and would silently wave through every deploy. The script refuses to
-> guess an endpoint.
+> the deployed instance's `/api/metrics`. A loopback endpoint is **refused by
+> the gate**, so `http://localhost:3000/metrics` on the CI runner does not
+> merely wave through every deploy: it fails the deploy, with the reason in
+> the job summary. The script does not guess an endpoint either.
 
 ### What the 30-day window actually means
 
@@ -155,7 +181,7 @@ is a self-contained job with no dependencies on the drift steps).
   slo-validation-gate:
     runs-on: ubuntu-latest
     needs: test-drift
-    if: '!cancelled() && github.event_name == ''push'' && (github.ref == ''refs/heads/main'' || github.ref == ''refs/heads/master'')'
+    if: '!cancelled() && ((github.event_name == ''push'' && (github.ref == ''refs/heads/main'' || github.ref == ''refs/heads/master'')) || (github.event_name == ''workflow_dispatch'' && inputs.slo_gate))'
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -190,6 +216,32 @@ is a self-contained job with no dependencies on the drift steps).
           ...
         run: node scripts/ci/validate-slo.mjs
 ```
+
+### Running the gate on demand
+
+The gate's job condition is a push to the default branch, which means it can
+only be reached by the thing it is meant to gate — and a control that can
+only be reached that way, and that has never been run, has a behaviour that
+is a matter of opinion rather than of fact.
+
+The workflow therefore also has a `workflow_dispatch` trigger:
+
+```bash
+gh workflow run drift-prevention.yml \
+  --repo LabLaunchPad/9router \
+  -f slo_gate=true \
+  -f reason="verifying the gate before the release"
+```
+
+It runs the gate against the repository's own `SLO_METRICS_ENDPOINT`, so an
+operator can check their endpoint **before** the deploy that depends on it —
+and can watch it fail closed, with the reason, when the endpoint is missing
+or is a loopback address. The reason is echoed into the job summary, so a
+manual run is auditable in the same way the override is.
+
+The drift comparison does not apply to a manual run: there is no base commit
+to compare against, so the drift job says so and skips rather than comparing
+the commit against itself.
 
 `continue-on-error: false` is explicit: the job must fail the workflow when
 the gate blocks. The configuration pre-check also fails closed — a missing
@@ -364,19 +416,28 @@ arrangement changes, and a suite that was already red will not tell you.**
 # Healthy budget -> exit 0
 SLO_METRICS_ENDPOINT=https://metrics.internal/metrics node scripts/ci/validate-slo.mjs; echo $?
 
-# Missing endpoint -> exit 1 (fail closed, no localhost fallback)
+# Missing endpoint -> exit 1 (fail closed)
 node scripts/ci/validate-slo.mjs; echo $?
+
+# A loopback endpoint -> exit 1, and nothing is requested
+SLO_METRICS_ENDPOINT=http://localhost:3000/metrics node scripts/ci/validate-slo.mjs; echo $?
 
 # Emergency override -> exit 0, audited
 SLO_GATE_OVERRIDE_APPROVED=true SLO_GATE_OVERRIDE_REASON="INC-4711" \
   node scripts/ci/validate-slo.mjs; echo $?
 ```
 
-Unit tests: `tests/unit/slo-gate.test.js` (42 cases) covering the healthy /
+Unit tests: `tests/unit/slo-gate.test.js` (69 cases) covering the healthy /
 warning / blocked / exhausted decision matrix, a missing metric, invalid
 Prometheus text, an HTTP failure, a timeout, the fail-open opt-out, the
 override (including that it wins over a misconfigured endpoint), and the
 process-level exit codes via a real child-process run.
+
+The loopback refusal has its own coverage, and the assertion that matters is
+the **request count**, not the exit code: a gate that tried the endpoint and
+then refused the answer would still exit 1, and the request would already
+have happened. The tests start a metrics server that counts what it receives
+and assert that it received **nothing**.
 
 ### Rollback
 
