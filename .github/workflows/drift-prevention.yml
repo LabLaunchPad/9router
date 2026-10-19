@@ -76,36 +76,86 @@ jobs:
           # regression: with identical code on both sides the failure sets
           # are identical, so the comparison only ever detects FLAKES — and
           # it hard-fails the job on them. The comparison is against the
-          # merge base instead, so "fails now, passed on the base" means
+          # base commit instead, so "fails now, passed on the base" means
           # what it says.
+          #
+          # The base is EXTRACTED with `git archive` into a directory inside
+          # the repository, rather than checked out over the working tree.
+          # Two reasons, both found by running this:
+          #
+          #   * The base's own test configuration is not used. This branch
+          #     adds a root `vitest.config.js` carrying the path aliases;
+          #     the base commit has no root config (its aliases live in
+          #     `tests/vitest.config.js`, which vitest does not pick up
+          #     when it runs from the repository root). Running the base
+          #     from the root therefore leaves every `open-sse/...` and
+          #     `@/...` import unresolvable: 224 of the base's test files
+          #     fail for that reason alone, and 284 tests fail against the
+          #     change's 77. A file that fails in the baseline for an
+          #     import error would then MASK a real regression.
+          #   * The head's `node_modules` are reused. The base's
+          #     package.json does not declare `vitest` — this branch adds
+          #     it — so a separate install for the base would have to
+          #     install a test runner the base never declared.
+          #
+          # The directory lives inside the repository so that Node's module
+          # resolution walks up from it and finds the head's node_modules.
           if [ -n "$BASE_SHA" ] && [ "$BASE_SHA" != "$HEAD_SHA" ]; then
             echo "::group::Baseline: the base commit $BASE_SHA"
+            rm -rf .drift-base
+            mkdir -p .drift-base
             if git fetch --no-tags --depth=1 origin "+$BASE_SHA:refs/remotes/origin/pr-base" \
-               && git rev-parse --verify --quiet refs/remotes/origin/pr-base >/dev/null; then
-              git checkout --detach refs/remotes/origin/pr-base
-              # The base may declare different dependencies than the change.
-              if ! git diff --quiet refs/remotes/origin/pr-base "$HEAD_SHA" -- package.json; then
-                npm install --legacy-peer-deps --no-audit --no-fund
-              fi
-              npx vitest run --reporter=verbose > baseline-results.txt 2>&1
+               && git archive "$BASE_SHA" > /tmp/drift-base.tar 2>/dev/null \
+               && tar -xf /tmp/drift-base.tar -C .drift-base \
+               && cp vitest.config.js .drift-base/vitest.config.js; then
+              # The run happens from inside the extracted tree, with the
+              # project root one level above it:
+              #
+              #   process.cwd()  = <base>/tests  -> the base's own test files
+              #     resolve their fixtures with path.resolve("../src/..."),
+              #     which is relative to the cwd. The base ran vitest from
+              #     `tests/`, so `..` was the repository root; running the
+              #     base from the root instead would make its tests read
+              #     the CHANGE's source files.
+              #   project root   = <base>        -> the reported test paths
+              #     are `tests/...`, the same format as the change's run, so
+              #     the two failing-file sets are directly comparable.
+              ( cd .drift-base/tests && npx vitest run --root .. --reporter=verbose ) \
+                > baseline-raw.txt 2>&1
               code=$?
-              git checkout --detach "$HEAD_SHA"
-              if ! git diff --quiet refs/remotes/origin/pr-base "$HEAD_SHA" -- package.json; then
-                npm install --legacy-peer-deps --no-audit --no-fund
-              fi
             else
-              echo "::warning::Could not fetch the base commit; the baseline is this commit."
-              npx vitest run --reporter=verbose > baseline-results.txt 2>&1
-              code=$?
+              # Falling back to "the baseline is this commit" would compare
+              # the commit against itself, which detects only flakes — and
+              # after the flake re-run below, nothing at all. A gate that
+              # silently stops gating is worse than a red job.
+              echo "::error::Could not obtain the base commit $BASE_SHA — the drift comparison is meaningless without it"
+              rm -rf .drift-base
+              exit 1
             fi
+            rm -rf .drift-base
             echo "::endgroup::"
           else
             # Not a pull request (a push to the default branch): there is no
-            # base to compare against, so the baseline is this commit.
-            npx vitest run --reporter=verbose > baseline-results.txt 2>&1
-            code=$?
+            # base to compare against, so the comparison does not apply to
+            # this event. Say so, rather than comparing the commit against
+            # itself.
+            echo "::warning::No base commit for this event — the drift comparison does not apply."
+            echo "baseline_available=false" >> $GITHUB_OUTPUT
+            echo "baseline_exit_code=0" >> $GITHUB_OUTPUT
+            exit 0
           fi
+          # The vitest output carries ANSI escape sequences in CI, and they
+          # break every pattern in the comparison below. Vitest colours the
+          # summary numbers separately from the words, so the file contains
+          #
+          #   "Tests <ESC>[22m <ESC>[1m<ESC>[31m284 failed<ESC>[39m"
+          #
+          # and not "Tests  284 failed" — and the same for the " FAIL " lines.
+          # The result files that are parsed are therefore the ANSI-stripped
+          # ones.
+          sed -r 's/\x1B\[[0-9;]*[a-zA-Z]//g' baseline-raw.txt > baseline-results.txt
           set -e
+          echo "baseline_available=true" >> $GITHUB_OUTPUT
           echo "baseline_exit_code=$code" >> $GITHUB_OUTPUT
           # A suite that could not be COLLECTED produces no summary line at
           # all — a config that will not load, or a missing test runner.
@@ -131,7 +181,10 @@ jobs:
         # pre-existing failures would make the job permanently red and hide
         # the signal that matters.
         run: |
-          npx vitest run 2>&1 | tee new-results.txt
+          npx vitest run 2>&1 | tee new-raw.txt
+          # Strip the ANSI escape sequences before anything parses the output
+          # (see the baseline step for why).
+          sed -r 's/\x1B\[[0-9;]*[a-zA-Z]//g' new-raw.txt > new-results.txt
           BASELINE=$(grep -o 'Tests [0-9]* passed' baseline-results.txt || echo "Tests 0 passed")
           NEW=$(grep -o 'Tests [0-9]* passed' new-results.txt || echo "Tests 0 passed")
           echo "Baseline: $BASELINE"
@@ -140,7 +193,12 @@ jobs:
       - name: 📊 Drift detection - failure diff
         env:
           BASELINE_EXIT_CODE: ${{ steps.baseline.outputs.baseline_exit_code }}
+          BASELINE_AVAILABLE: ${{ steps.baseline.outputs.baseline_available }}
         run: |
+          if [ "$BASELINE_AVAILABLE" != "true" ]; then
+            echo "::warning::No base commit for this event — the drift comparison does not apply."
+            exit 0
+          fi
           # The failure count is taken from vitest's own summary line
           # ("Tests  77 failed | 3695 passed | ..."), not from the reporter's
           # per-test marker characters. The markers differ between the
@@ -242,13 +300,18 @@ jobs:
           fi
 
       - name: 📋 Drift prevention summary
+        env:
+          BASELINE_AVAILABLE: ${{ steps.baseline.outputs.baseline_available }}
         run: |
           echo "=== Drift Prevention Check Complete ==="
-          echo "✅ Import resolution: Checked"
-          echo "✅ Full test suite: Run"
-          echo "✅ Failure diff: Analyzed (change threshold: >20 failures)"
-          echo "✅ Pattern logic: Verified (capabilities.js pattern order)"
-          echo "✅ Math.min/max: Verified (combo caps aggregation)"
+          if [ "$BASELINE_AVAILABLE" = "true" ]; then
+            echo "✅ Baseline: the base commit, run with the same test configuration"
+            echo "✅ Failure diff: the failing-file SET, compared file by file"
+            echo "✅ Flake re-run: each candidate re-run on its own, judged by its exit code"
+            echo "✅ Import resolution: unresolvable imports COMPARED between the two runs"
+          else
+            echo "ℹ️  No base commit for this event — the comparison did not apply"
+          fi
           echo "========================================"
 
       - name: 📊 Performance summary

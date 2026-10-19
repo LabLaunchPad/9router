@@ -226,8 +226,9 @@ summary, never silently treated as a pass.
 ### The drift check the gate rides on
 
 The gate job lives inside `.github/workflows/drift-prevention.yml`, so that
-workflow has to actually work for the gate to ever run. It had three
-independent reasons not to, all of them fixed here:
+workflow has to actually work for the gate to ever run. It had **five**
+independent reasons not to, all of them found by running it rather than
+reading it, and all of them fixed here:
 
 - **`npm ci` can never work in this repository.** `package-lock.json` is
   gitignored (`.gitignore` line 63), so `npm ci` fails with `EUSAGE` on every
@@ -240,14 +241,60 @@ independent reasons not to, all of them fixed here:
   Running the suite twice on one tree cannot detect a regression: with
   identical code on both sides the failure sets are identical, so the
   comparison only ever detects *flakes* — and it hard-failed the job on them.
-  The baseline is now the **base commit**: the workflow checks it out, runs the
-  suite there, and checks the change back out. "Fails now, passed on the
-  base" then means what it says.
+  The baseline is now the **base commit**.
+- **The vitest output carries ANSI escape sequences in CI, and every pattern
+  in the comparison matched nothing.** Vitest colours the summary numbers
+  separately from the words around them, so the file contains
+
+  ```
+  <ESC>[2m      Tests <ESC>[22m <ESC>[1m<ESC>[31m284 failed<ESC>[39m
+  ```
+
+  and not `Tests  284 failed`. The `FAIL` lines are split the same way. The
+  comparison therefore extracted zero failing files, zero counts and zero
+  import errors from either run, compared two empty sets, and reported
+  "No newly failing test files." The results that are parsed are now the
+  ANSI-stripped ones.
+- **The base commit has no root `vitest.config.js`**, so running it from the
+  repository root left every `open-sse/...` import unresolvable: 224 of the
+  base's test files failed for that reason alone, and 284 tests failed
+  against the change's 77. That is not just noise — a file that fails in the
+  baseline for an import error **masks** a real regression in that file.
 - **The failure count was read from reporter-specific marker characters**
   (`×` / `✖`), and the baseline used a different reporter from the new run, so
   the two counts were not comparable. The count now comes from vitest's own
   summary line (`Tests  77 failed | 3695 passed | …`), which every reporter
   emits identically.
+
+#### How the baseline is produced
+
+The base commit is extracted with `git archive` into `.drift-base/` **inside**
+the repository, the change's own `vitest.config.js` is copied into it, and
+the suite is run from `.drift-base/tests` with the project root one level up:
+
+```
+( cd .drift-base/tests && npx vitest run --root .. --reporter=verbose )
+```
+
+Each part of that is load-bearing:
+
+| Choice | Why |
+|---|---|
+| `git archive` into a directory, rather than checking the base out over the working tree | The change's dependencies stay installed; the base is never made the working tree |
+| Inside the repository | Node's module resolution walks up from it and finds the change's `node_modules` |
+| The change's `vitest.config.js`, copied in | The base has no root config, and without the aliases 224 of its test files fail to import. The two runs then differ only in the code under test |
+| `cwd = <base>/tests`, project root = `<base>` | The base's own test files resolve their fixtures with `path.resolve("../src/...")`, which is relative to the **cwd**. The base ran vitest from `tests/`, so `..` was the repository root; running the base from the root would make its tests read the *change's* source files. With the cwd inside the extracted tree they read the base's |
+| Project root one level up | The reported test paths are `tests/...` in both runs, so the two failing-file sets are directly comparable |
+
+Two further rules, both about not degrading silently:
+
+- A base that **cannot be obtained** is a hard failure. Falling back to "the
+  baseline is this commit" would compare the commit against itself, which
+  detects only flakes — and after the flake re-run, nothing at all. A gate
+  that silently stops gating is worse than a red job.
+- An event with **no base** (a push to the default branch) says so and skips
+  the comparison, rather than comparing the commit against itself. The SLO
+  gate, which is the point of the workflow on a push, is unaffected.
 
 The comparison itself:
 
@@ -255,7 +302,7 @@ The comparison itself:
   fixes one test and breaks another leaves the count unchanged; the file set
   does not.
 - A **newly failing file is re-run on its own** and judged by its exit code.
-  A test that passes on the second run was flaky, and a flaky test must not
+  A test that passes the second run was flaky, and a flaky test must not
   fail the build. A candidate that cannot be run at all is *not* a pass — it
   stays a regression, because an unknown is not evidence that the change is
   innocent.
@@ -270,6 +317,31 @@ The comparison itself:
   `src/shared/constants/providers.js` — which keys the breaker and the
   failure-burst map — and `src/lib/localDb.js`, and a pull request touching
   either ran no CI at all. A hand-maintained list cannot stay correct.
+
+#### The defect the drift check itself found
+
+The first run of the repaired workflow found **three test suites that this
+branch had broken** and nobody had noticed.
+
+Moving the suite's working directory from `tests/` to the repository root
+broke three test files that resolved their fixture paths with
+`path.resolve("../src/...")` — relative to the *process working directory*:
+
+```
+Error: ENOENT: no such file or directory, open 'C:\src\app\api\providers\[id]\test\testUtils.js'
+Error: ENOENT: no such file or directory, open 'C:\open-sse\providers\registry\codex.js'
+Error: ENOENT: no such file or directory, open 'C:\src\app\(dashboard)\dashboard\usage\components\ProviderLimits\index.js'
+```
+
+All three **failed to collect** — a suite-level failure, not a test failure —
+so they were invisible among the 45 failing files the branch already had.
+They were passing on the base commit; the harness change is what broke them.
+
+They are now the only files in the suite that did this, and each resolves the
+path from its own location, so it is correct whatever the working directory
+is. The lesson is the one this branch keeps rediscovering: **something that
+was correct in the old arrangement can silently stop being correct when the
+arrangement changes, and a suite that was already red will not tell you.**
 
 ### Verification
 
