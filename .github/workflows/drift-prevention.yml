@@ -14,20 +14,20 @@ on:
       - '**.config.*'
       - 'next.config*'
       - 'tailwind*'
-      # The control plane itself must be covered, or a PR that changes only
-      # the gate logic, the metric producer or the request path runs no CI
-      # at all. Everything the production-readiness controls touch is
-      # listed here.
-      - 'scripts/ci/**'
-      - 'src/sse/**'
-      - 'src/app/**'
-      - 'src/dashboardGuard.js'
-      - 'src/lib/db/repos/usageRepo.js'
-      - 'open-sse/rtk/**'
-      - 'open-sse/services/**'
-      - 'open-sse/handlers/**'
-      - 'open-sse/providers/registry/**'
-      - 'open-sse/config/**'
+      # The control plane itself must be covered, or a pull request that
+      # changes only the gate logic, the metric producer, the request path
+      # or the breaker wiring runs no CI at all.
+      #
+      # This is deliberately the whole source tree rather than an
+      # enumeration of the files the controls happen to touch today. An
+      # earlier version of this list missed `src/shared/constants/providers.js`
+      # — which keys the breaker and the failure-burst map — and
+      # `src/lib/localDb.js`, and a pull request touching either ran no CI.
+      # The list cannot stay correct if it is maintained by hand.
+      - 'scripts/**'
+      - 'src/**'
+      - 'open-sse/**'
+      - 'tests/**'
       - '.github/workflows/drift-prevention.yml'
   push:
     branches:
@@ -65,20 +65,62 @@ jobs:
 
       - name: 🏁 Record baseline test results
         id: baseline
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.sha }}
         run: |
           set +e
-          npx vitest run --reporter=verbose > baseline-results.txt 2>&1
-          code=$?
+          # The baseline is the BASE COMMIT, not this commit.
+          #
+          # Running the suite twice on the same tree cannot detect a
+          # regression: with identical code on both sides the failure sets
+          # are identical, so the comparison only ever detects FLAKES — and
+          # it hard-fails the job on them. The comparison is against the
+          # merge base instead, so "fails now, passed on the base" means
+          # what it says.
+          if [ -n "$BASE_SHA" ] && [ "$BASE_SHA" != "$HEAD_SHA" ]; then
+            echo "::group::Baseline: the base commit $BASE_SHA"
+            if git fetch --no-tags --depth=1 origin "+$BASE_SHA:refs/remotes/origin/pr-base" \
+               && git rev-parse --verify --quiet refs/remotes/origin/pr-base >/dev/null; then
+              git checkout --detach refs/remotes/origin/pr-base
+              # The base may declare different dependencies than the change.
+              if ! git diff --quiet refs/remotes/origin/pr-base "$HEAD_SHA" -- package.json; then
+                npm install --legacy-peer-deps --no-audit --no-fund
+              fi
+              npx vitest run --reporter=verbose > baseline-results.txt 2>&1
+              code=$?
+              git checkout --detach "$HEAD_SHA"
+              if ! git diff --quiet refs/remotes/origin/pr-base "$HEAD_SHA" -- package.json; then
+                npm install --legacy-peer-deps --no-audit --no-fund
+              fi
+            else
+              echo "::warning::Could not fetch the base commit; the baseline is this commit."
+              npx vitest run --reporter=verbose > baseline-results.txt 2>&1
+              code=$?
+            fi
+            echo "::endgroup::"
+          else
+            # Not a pull request (a push to the default branch): there is no
+            # base to compare against, so the baseline is this commit.
+            npx vitest run --reporter=verbose > baseline-results.txt 2>&1
+            code=$?
+          fi
           set -e
           echo "baseline_exit_code=$code" >> $GITHUB_OUTPUT
-          # A config that cannot be loaded, or a package that cannot be
-          # resolved, makes the whole suite fail to collect. That is a
-          # different kind of breakage from a failing test, and it
-          # invalidates every number below — so it is checked here, on the
-          # output that is already captured, rather than in a separate step
-          # that re-runs the entire suite a third time.
-          if grep -E 'failed to load config|Cannot find package' baseline-results.txt; then
-            echo "::error::The test suite could not be collected — import resolution failed"
+          # A suite that could not be COLLECTED produces no summary line at
+          # all — a config that will not load, or a missing test runner.
+          # Every number below is derived from that summary, so there is
+          # nothing to compare against and the job stops here rather than
+          # reporting a meaningless comparison.
+          #
+          # An unresolvable import is a different thing: this repository has
+          # test files that import packages nobody declared (`lowdb`), and
+          # they are part of the known pre-existing failures. Those are
+          # COMPARED between the two runs below, not failed on absolutely —
+          # a new one is a regression, an old one is not.
+          if ! grep -qE 'Tests +[0-9]+ (failed|passed)' baseline-results.txt; then
+            echo "::error::The baseline test run produced no results — the suite could not be collected"
+            tail -40 baseline-results.txt || true
             exit 1
           fi
 
@@ -128,11 +170,68 @@ jobs:
             | grep -oE 'tests/[^ ]+\.test\.js' | sort -u > new-failing-files.txt || true
           NEWLY_FAILING=$(comm -13 baseline-failing-files.txt new-failing-files.txt || true)
           if [ -n "$NEWLY_FAILING" ]; then
-            echo "::error::⚠️ Test files that fail now but did not fail in the baseline:"
+            echo "::group::Candidate regressions (failed on the change, passed on the base):"
             echo "$NEWLY_FAILING"
+            echo "::endgroup::"
+            # Re-run just those files. A test that passes on the second run
+            # was flaky, not broken — and a flaky test must not fail the
+            # build. (This repository has at least one 5s-timeout flake.)
+            #
+            # Each candidate is run on its OWN and judged by its exit code
+            # (0 = every test in that file passed). Parsing the reporter's
+            # output is not usable here: a reporter does not necessarily
+            # print a line for a file whose tests all passed, so "no line"
+            # cannot be told apart from "not run".
+            #
+            # A candidate that cannot be run at all is NOT a pass: it stays
+            # a regression. An unknown is not evidence that the change is
+            # innocent.
+            echo "$NEWLY_FAILING" | grep -v '^[[:space:]]*$' | sort -u > candidate-failing-files.txt
+            : > still-failing.txt
+            while read -r candidate; do
+              [ -z "$candidate" ] && continue
+              if [ ! -f "$candidate" ]; then
+                echo "::warning::$candidate does not exist in the working tree"
+                echo "$candidate" >> still-failing.txt
+                continue
+              fi
+              set +e
+              npx vitest run "$candidate" > /dev/null 2>&1
+              code=$?
+              set -e
+              if [ "$code" -ne 0 ]; then
+                echo "$candidate" >> still-failing.txt
+              else
+                echo "::warning::$candidate passed on the re-run — flaky, not broken."
+              fi
+            done < candidate-failing-files.txt
+            if [ -s still-failing.txt ]; then
+              echo "::error::⚠️ Regression: these files fail on the change and passed on the base:"
+              cat still-failing.txt
+              exit 1
+            fi
+            echo "No confirmed regressions."
+          else
+            echo "No newly failing test files."
+          fi
+
+          # Unresolvable imports, compared the same way. This repository has
+          # test files that import packages nobody declared, and they are
+          # part of the known pre-existing failures — so an unresolvable
+          # import is not a failure on its own. A NEW one is: it means this
+          # change added a dependency that does not exist, and the file it
+          # breaks is a file the drift check would otherwise call clean.
+          grep -oE "Cannot find package '[^']+'" baseline-results.txt \
+            | sort -u > baseline-import-errors.txt || true
+          grep -oE "Cannot find package '[^']+'" new-results.txt \
+            | sort -u > new-import-errors.txt || true
+          NEW_IMPORT_ERRORS=$(comm -13 baseline-import-errors.txt new-import-errors.txt || true)
+          if [ -n "$NEW_IMPORT_ERRORS" ]; then
+            echo "::error::⚠️ New unresolvable imports — the change added a dependency that does not exist:"
+            echo "$NEW_IMPORT_ERRORS"
             exit 1
           fi
-          echo "No newly failing test files."
+          echo "No new unresolvable imports."
 
           # A green baseline means the suite is expected to be green. A red
           # new run on a green baseline is a regression regardless of the
