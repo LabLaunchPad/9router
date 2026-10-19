@@ -101,3 +101,16 @@ graphify-out/*
 .start-dev.ps1
 start-dev-silent.cjs
 debug.log
+
+# The drift gate's transient working files. The workflow writes them into the
+# repository root while it runs; on a CI runner that workspace is disposable,
+# but a local rehearsal of the gate's shell left them behind as untracked
+# files, and an untracked file in a clean tree is a nuisance.
+/baseline-*.txt
+/new-*.txt
+/rerun-*.txt
+/candidate-*.txt
+/changed-files.txt
+/confirmed-regressions.txt
+/still-failing.txt
+/.drift-base/

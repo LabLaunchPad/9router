@@ -28,7 +28,28 @@ on:
       - 'src/**'
       - 'open-sse/**'
       - 'tests/**'
-      - '.github/workflows/drift-prevention.yml'
+      # The control plane's own configuration and documentation. A change to
+      # any of these can change what the controls DO, or what they are
+      # CONTRACTED to do, without a single test failing.
+      #
+      #   .github/workflows/**  another workflow can change this one — or be
+      #                        changed to disable it
+      #   package.json          the test script and the vitest dependency set
+      #   .gitattributes        pins `scripts/ci/validate-slo.mjs text eol=lf`;
+      #                        without it a Windows checkout gives the gate
+      #                        script CRLF and its own test cannot import it
+      #   the two ADRs           the documented contract of every control
+      #   docs/**               the repository's documentation directory
+      #
+      # A pull request that touches ONLY one of these used to run no CI at
+      # all: this is the only workflow in the repository with a
+      # `pull_request:` trigger.
+      - '.github/workflows/**'
+      - 'package.json'
+      - '.gitattributes'
+      - 'PRODUCTION_READINESS_CONTROLS.md'
+      - 'SRE_ADR.md'
+      - 'docs/**'
   push:
     branches:
       - main
@@ -112,10 +133,16 @@ jobs:
           #     `tests/vitest.config.js`, which vitest does not pick up
           #     when it runs from the repository root). Running the base
           #     from the root therefore leaves every `open-sse/...` and
-          #     `@/...` import unresolvable: 224 of the base's test files
-          #     fail for that reason alone, and 284 tests fail against the
-          #     change's 77. A file that fails in the baseline for an
-          #     import error would then MASK a real regression.
+          #     `@/...` import unresolvable: many of the base's test files
+          #     fail for that reason alone, and the base then fails far more
+          #     tests than the change does. A file that fails in the
+          #     baseline for an import error would then MASK a real
+          #     regression.
+          #
+          #     The exact counts are a property of this run, not of the
+          #     repository: they depend on the runner, the dependency tree
+          #     and the base commit. The document says the same, and quotes
+          #     the comparison rather than the numbers.
           #   * The head's `node_modules` are reused. The base's
           #     package.json does not declare `vitest` — this branch adds
           #     it — so a separate install for the base would have to
@@ -171,9 +198,9 @@ jobs:
           # break every pattern in the comparison below. Vitest colours the
           # summary numbers separately from the words, so the file contains
           #
-          #   "Tests <ESC>[22m <ESC>[1m<ESC>[31m284 failed<ESC>[39m"
+          #   "Tests <ESC>[22m <ESC>[1m<ESC>[31m42 failed<ESC>[39m"
           #
-          # and not "Tests  284 failed" — and the same for the " FAIL " lines.
+          # and not "Tests  42 failed" — and the same for the " FAIL " lines.
           # The result files that are parsed are therefore the ANSI-stripped
           # ones.
           sed -r 's/\x1B\[[0-9;]*[a-zA-Z]//g' baseline-raw.txt > baseline-results.txt
@@ -208,10 +235,16 @@ jobs:
           # Strip the ANSI escape sequences before anything parses the output
           # (see the baseline step for why).
           sed -r 's/\x1B\[[0-9;]*[a-zA-Z]//g' new-raw.txt > new-results.txt
-          BASELINE=$(grep -o 'Tests [0-9]* passed' baseline-results.txt || echo "Tests 0 passed")
-          NEW=$(grep -o 'Tests [0-9]* passed' new-results.txt || echo "Tests 0 passed")
-          echo "Baseline: $BASELINE"
-          echo "New: $NEW"
+          # The summary line is "Tests  82 failed | 3760 passed | ...". vitest
+          # prints TWO spaces, and the passed count is not always next to the
+          # word "Tests" — in a failing run it is the second field. The
+          # pattern that asked for exactly one space never matched anything,
+          # so every run reported "Tests 0 passed" and the fallback hid it.
+          # The field is taken out of the summary line instead.
+          BASELINE_PASSED=$(grep -E '^[[:space:]]*Tests[[:space:]]+' baseline-results.txt | tail -1 | grep -oE '[0-9]+ passed' | head -1 || true)
+          NEW_PASSED=$(grep -E '^[[:space:]]*Tests[[:space:]]+' new-results.txt | tail -1 | grep -oE '[0-9]+ passed' | head -1 || true)
+          echo "Baseline: Tests ${BASELINE_PASSED:-0} passed"
+          echo "New: Tests ${NEW_PASSED:-0} passed"
 
       - name: 📊 Drift detection - failure diff
         env:
@@ -224,7 +257,7 @@ jobs:
             exit 0
           fi
           # The failure count is taken from vitest's own summary line
-          # ("Tests  77 failed | 3695 passed | ..."), not from the reporter's
+          # ("Tests  42 failed | 3695 passed | ..."), not from the reporter's
           # per-test marker characters. The markers differ between the
           # verbose baseline and the default new run, so a count taken from
           # them is not comparable between the two runs.
@@ -361,24 +394,33 @@ jobs:
               # refinement that is not there.
               CHANGED_COUNT=$(grep -c '[^[:space:]]' changed-files.txt 2>/dev/null || true)
               if [ "${CHANGED_COUNT:-0}" -eq 0 ]; then
+                # An empty list means either that nothing changed or that
+                # `git diff` failed. Those are different facts, and only one
+                # of them supports a conclusion about the masked failures —
+                # so no conclusion is drawn here. The masked failures are
+                # still listed above, just without the refinement.
                 echo "::warning::Could not list the files this change touched — the masked failures are reported without the 'in a file this change touched' refinement."
               else
                 echo "Files changed by this branch: $CHANGED_COUNT"
-              fi
-              TOUCHED_MASKED=$(while read -r key; do
-                [ -z "$key" ] && continue
-                file=$(printf '%s' "$key" | sed 's/ > .*//; s/ \[ .*//')
-                if grep -Fxq "$file" changed-files.txt 2>/dev/null; then
-                  printf '%s\n' "$key"
+                TOUCHED_MASKED=$(while read -r key; do
+                  [ -z "$key" ] && continue
+                  file=$(printf '%s' "$key" | sed 's/ > .*//; s/ \[ .*//')
+                  if grep -Fxq "$file" changed-files.txt 2>/dev/null; then
+                    printf '%s\n' "$key"
+                  fi
+                done <<< "$MASKED")
+                TOUCHED_COUNT=$(printf '%s\n' "$TOUCHED_MASKED" | grep -c '[^[:space:]]' || true)
+                if [ "${TOUCHED_COUNT:-0}" -gt 0 ]; then
+                  # Both numbers are quoted: the total, and the size of the
+                  # list that follows. One number and a shorter list read as
+                  # a list that was truncated.
+                  echo "::warning::$MASKED_COUNT tests fail on both the base and the change. The comparison sees differences, so a change that ALTERS an already-broken test is invisible to it. Files this change touched account for $TOUCHED_COUNT of them:"
+                  echo "::group::Masked failures in files this change touched:"
+                  printf '%s\n' "$TOUCHED_MASKED"
+                  echo "::endgroup::"
+                else
+                  echo "::warning::$MASKED_COUNT tests fail on both the base and the change. The comparison sees differences, so a change that ALTERS an already-broken test is invisible to it. None of them is in a file this change touched."
                 fi
-              done <<< "$MASKED")
-              if [ -n "$TOUCHED_MASKED" ]; then
-                echo "::warning::$MASKED_COUNT tests fail on both the base and the change. The comparison sees differences, so a change that ALTERS an already-broken test is invisible to it. These are in files this change touched:"
-                echo "::group::Masked failures in files this change touched:"
-                printf '%s\n' "$TOUCHED_MASKED"
-                echo "::endgroup::"
-              else
-                echo "No masked failure is in a file this change touched."
               fi
             fi
           fi
@@ -468,10 +510,14 @@ jobs:
       - name: 📋 Check SLO gate configuration
         env:
           SLO_METRICS_ENDPOINT: ${{ secrets.SLO_METRICS_ENDPOINT }}
+          # The documented alias of the endpoint. The script prefers the
+          # canonical name and falls back to this one, so an operator who set
+          # the alias as a secret gets the gate they asked for.
+          METRICS_ENDPOINT: ${{ secrets.METRICS_ENDPOINT }}
           SLO_GATE_SKIP: ${{ vars.SLO_GATE_SKIP }}
           SLO_GATE_OVERRIDE_APPROVED: ${{ vars.SLO_GATE_OVERRIDE_APPROVED }}
         run: |
-          if [ -n "$SLO_METRICS_ENDPOINT" ]; then
+          if [ -n "$SLO_METRICS_ENDPOINT" ] || [ -n "$METRICS_ENDPOINT" ]; then
             echo "SLO metrics endpoint configured"
             exit 0
           fi
@@ -507,16 +553,38 @@ jobs:
         if: vars.SLO_GATE_SKIP != 'true' && vars.SLO_GATE_OVERRIDE_APPROVED != 'true'
         env:
           SLO_METRICS_ENDPOINT: ${{ secrets.SLO_METRICS_ENDPOINT }}
+          # The documented alias of the endpoint, forwarded for the same
+          # reason: the script prefers the canonical name and falls back to
+          # this one.
+          METRICS_ENDPOINT: ${{ secrets.METRICS_ENDPOINT }}
           SLO_GATE_SKIP: ${{ vars.SLO_GATE_SKIP }}
           SERVICE_NAME: 9router
           ENVIRONMENT: production
           GITHUB_SHA: ${{ github.sha }}
           GITHUB_ACTOR: ${{ github.actor }}
-          SLO_WARNING_THRESHOLD: "50"
-          SLO_BLOCKED_THRESHOLD: "75"
-          SLO_EXHAUSTED_THRESHOLD: "95"
-          SLO_WINDOW_SECONDS: "2592000"
-          SLO_FAIL_CLOSED: "true"
+          # Every knob the documented operator table lists is forwarded here.
+          #
+          # A repository variable is NOT injected into a step's environment:
+          # it has to be named explicitly. A knob the gate script reads but
+          # the workflow does not forward is a knob an operator can turn on
+          # and never see take effect — the script's own default takes its
+          # place, silently.
+          #
+          # An unset variable arrives as an empty string, and the script
+          # falls back to its documented default for an empty value, so
+          # forwarding an unset knob changes nothing. The defaults here are
+          # the same as the ones the table documents.
+          SLO_WARNING_THRESHOLD: ${{ vars.SLO_WARNING_THRESHOLD }}
+          SLO_BLOCKED_THRESHOLD: ${{ vars.SLO_BLOCKED_THRESHOLD }}
+          SLO_EXHAUSTED_THRESHOLD: ${{ vars.SLO_EXHAUSTED_THRESHOLD }}
+          SLO_WINDOW_SECONDS: ${{ vars.SLO_WINDOW_SECONDS }}
+          SLO_TARGET_ERROR_RATE: ${{ vars.SLO_TARGET_ERROR_RATE }}
+          SLO_REQUIRE_FULL_WINDOW: ${{ vars.SLO_REQUIRE_FULL_WINDOW }}
+          SLO_MIN_SAMPLE_SECONDS: ${{ vars.SLO_MIN_SAMPLE_SECONDS }}
+          SLO_FAIL_CLOSED: ${{ vars.SLO_FAIL_CLOSED }}
+          SLO_FETCH_TIMEOUT_MS: ${{ vars.SLO_FETCH_TIMEOUT_MS }}
+          SLO_MAX_REDIRECTS: ${{ vars.SLO_MAX_REDIRECTS }}
+          SLO_GATE_OVERRIDE: ${{ vars.SLO_GATE_OVERRIDE }}
           SLO_GATE_OVERRIDE_APPROVED: ${{ vars.SLO_GATE_OVERRIDE_APPROVED }}
           SLO_GATE_OVERRIDE_REASON: ${{ vars.SLO_GATE_OVERRIDE_REASON }}
         run: node scripts/ci/validate-slo.mjs
