@@ -24,14 +24,33 @@ const SPECIALIZED = new Set([
 ]);
 
 // Sanitize header: khử token + field thời gian động (kimi X-Msh-Device-Id) để snapshot ổn định.
+// Các value phụ thuộc máy / thời gian cũng phải chuẩn hoá — nếu không, baseline chỉ tái lập
+// được trên đúng máy này và sẽ hỏng ở mọi runner khác (và mỗi lần bump version).
+const MACHINE_DEPENDENT_HEADERS = {
+  // randomUUID() mới cho mỗi request
+  "X-Mavis-Session-Id": "<UUID>",
+  // timezone của máy chạy
+  "X-Mavis-Timezone-Offset": "<TZ>",
+  // hostname của máy chạy
+  "X-Msh-Device-Name": "<HOST>",
+  // OS/arch của máy chạy
+  "X-Msh-Device-Model": "<MODEL>",
+  // version của app — đổi mỗi lần release
+  "X-Msh-Version": "<VERSION>",
+};
+
 function sanitize(headers) {
   const out = {};
   for (const [k, v] of Object.entries(headers)) {
-    out[k] = typeof v === "string"
-      ? v.replace(/Bearer .+/, "Bearer <TOK>")
-          .replace(/sk-test-APIKEY|tok-test-ACCESS/g, "<CRED>")
-          .replace(/kimi-\d{10,}/g, "kimi-<TS>")
-      : v;
+    if (typeof v !== "string") {
+      out[k] = v;
+      continue;
+    }
+    out[k] = MACHINE_DEPENDENT_HEADERS[k]
+      ?? v
+        .replace(/Bearer .+/, "Bearer <TOK>")
+        .replace(/sk-test-APIKEY|tok-test-ACCESS/g, "<CRED>")
+        .replace(/kimi-\d{10,}/g, "kimi-<TS>");
   }
   return out;
 }
