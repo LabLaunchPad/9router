@@ -213,8 +213,13 @@ describe("chaos: translator corruption", () => {
     }
 
     expect(threw).toBe(false);
-    // Fail-open contract: stats object on success, null on failure.
-    expect(result === null || typeof result === "object").toBe(true);
+    // Fail-open contract: the stats object is returned and the malformed
+    // message is left alone. (The previous assertion —
+    // `result === null || typeof result === "object"` — was vacuously true,
+    // because `typeof null === "object"`.)
+    expect(result).not.toBeNull();
+    expect(typeof result).toBe("object");
+    expect(result.hits).toEqual([]);
     // The malformed message must not have been rewritten into something else.
     expect(JSON.stringify(body.messages[1])).toBe(JSON.stringify({ role: "tool", tool_call_id: "call_1", content: { unexpected: "object" } }));
     expect(before).toContain("unexpected");
@@ -285,7 +290,7 @@ describe("chaos: provider timeout", () => {
     expect(res.status).toBeGreaterThanOrEqual(500);
   });
 
-  it("does not attempt upstream calls while the circuit is open", () => {
+  it("refuses requests while the circuit is open", () => {
     const cb = getCircuitBreaker("timeout-provider", {
       failureThreshold: 2,
       coolDownWindowMs: 600000,
@@ -294,14 +299,30 @@ describe("chaos: provider timeout", () => {
 
     cb.recordFailure();
     cb.recordFailure();
-    expect(cb.canRequest()).toBe(false);
 
-    // A guarded call path would consult canRequest() and skip the upstream.
-    let upstreamCalled = false;
-    if (cb.canRequest()) {
-      upstreamCalled = true;
-    }
-    expect(upstreamCalled).toBe(false);
+    // The circuit is open, so a guarded call path would skip the upstream.
+    expect(cb.state).toBe("open");
+    expect(cb.canRequest()).toBe(false);
+  });
+
+  it("does not change the circuit state when the state is read", () => {
+    const cb = getCircuitBreaker("timeout-provider", {
+      failureThreshold: 2,
+      coolDownWindowMs: 600000,
+      resetWindowMs: 900000,
+    });
+
+    cb.recordFailure();
+    cb.recordFailure();
+
+    // Reading the state must be inert. A metrics scrape or a health probe
+    // that promoted the circuit to half-open would start admitting traffic
+    // to a provider that is still down.
+    const before = cb.state;
+    const reported = cb.getState();
+    expect(reported.state).toBe(before);
+    expect(cb.state).toBe(before);
+    expect(cb.canRequest()).toBe(false);
   });
 });
 
@@ -398,7 +419,9 @@ describe("chaos: combo model exhaustion", () => {
 
 describe("chaos: fusion judge timeout", () => {
   it("degrades to a surviving panel answer when the judge hangs", async () => {
+    const attempted = [];
     const handleSingleModel = async (body, model) => {
+      attempted.push(model);
       if (model === "judge") {
         // Hang past the hard timeout.
         await new Promise((r) => setTimeout(r, 200));
@@ -429,6 +452,11 @@ describe("chaos: fusion judge timeout", () => {
     // Degraded to a panel answer, not the late judge output.
     expect(text).toContain("answer from");
     expect(text).not.toContain("late judge");
+
+    // The degradation must NOT re-issue the request: no second call to a
+    // panel model, and no second call to the provider at all. The panel
+    // answers are already in hand.
+    expect(attempted.filter((m) => m !== "judge")).toEqual(["panel-a", "panel-b"]);
   });
 
   it("returns the judge answer when the judge responds in time", async () => {

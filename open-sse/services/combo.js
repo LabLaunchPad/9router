@@ -591,6 +591,41 @@ function collectPanel(calls, { minPanel, stragglerGraceMs, panelHardTimeoutMs })
 }
 
 /**
+ * Degrade to a panel answer that is already in hand.
+ *
+ * The panel responses are complete responses in the client's format, so the
+ * degraded answer can be returned as-is. Re-issuing the request to the panel
+ * model instead would:
+ *   - cost a second upstream call for a request the user already paid for,
+ *   - fail with 429/5xx even though a good answer was available, and
+ *   - hang for as long as the upstream allowed, because that call was not
+ *     wrapped in the hard timeout — the exact hang the judge timeout exists
+ *     to prevent.
+ *
+ * Trade-off: the panel responses are collected non-streaming, so a client that
+ * asked for `stream: true` receives the degraded answer as a complete
+ * response body rather than as an SSE stream. A complete answer in the
+ * client's own format beats a stream that may never arrive.
+ *
+ * @param {{ model: string, text: string, response?: Response }} answer
+ * @returns {Response}
+ */
+function degradeToPanelAnswer(answer) {
+  if (!answer) {
+    return new Response(
+      JSON.stringify({ error: { message: "Fusion produced no usable answer" } }),
+      { status: 503, headers: { "Content-Type": "application/json" } }
+    );
+  }
+  if (answer.response) return answer.response;
+  // Fallback for an answer whose response body was already consumed.
+  return new Response(
+    JSON.stringify({ choices: [{ message: { role: "assistant", content: answer.text } }] }),
+    { status: 200, headers: { "Content-Type": "application/json" } }
+  );
+}
+
+/**
  * Handle a fusion combo: fan the prompt out to every panel model in parallel,
  * then a judge model synthesizes one final answer from all panel responses.
  *
@@ -664,7 +699,10 @@ export async function handleFusionChat({ body, models, handleSingleModel, log, c
       const json = await res.clone().json();
       const text = extractPanelText(json);
       if (text) {
-        answers.push({ model, text });
+        // Keep the panel's own Response alongside the extracted text. It is a
+        // complete response in the client's format, so it can be returned as
+        // the degraded answer without issuing a second upstream request.
+        answers.push({ model, text, response: res });
         log.info("FUSION", `Panel ${model} ok (${text.length} chars)`);
       } else {
         log.warn("FUSION", `Panel ${model} returned empty content`);
@@ -684,7 +722,7 @@ export async function handleFusionChat({ body, models, handleSingleModel, log, c
   }
   if (answers.length === 1) {
     log.info("FUSION", `Only ${answers[0].model} succeeded — answering directly (no fusion)`);
-    return handleSingleModel(body, answers[0].model);
+    return degradeToPanelAnswer(answers[0]);
   }
 
   // 4. Judge analyzes + writes one final answer (streams to client if requested).
@@ -698,13 +736,13 @@ export async function handleFusionChat({ body, models, handleSingleModel, log, c
   const judged = await withTimeout(handleSingleModel(judgeBody, judge), cfg.panelHardTimeoutMs);
   if (judged?.__timeout) {
     log.warn("FUSION", `Judge ${judge} timed out — degrading to first panel answer`);
-    return handleSingleModel(body, answers[0].model);
+    return degradeToPanelAnswer(answers[0]);
   }
   if (judged?.__error) {
     log.warn("FUSION", `Judge ${judge} threw — degrading to first panel answer`, {
       error: judged.__error?.message || String(judged.__error),
     });
-    return handleSingleModel(body, answers[0].model);
+    return degradeToPanelAnswer(answers[0]);
   }
   return judged;
 }
