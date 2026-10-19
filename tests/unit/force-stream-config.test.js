@@ -71,6 +71,10 @@ vi.mock("../../open-sse/rtk/index.js", () => ({
 vi.mock("../../open-sse/rtk/headroom.js", () => ({
   compressWithHeadroom: vi.fn(async () => null),
   formatHeadroomLog: vi.fn(() => ""),
+  // chatCore.js imports these two as well; a partial mock makes Vitest throw
+  // "No '...' export is defined on the mock" when the module is loaded.
+  formatHeadroomSizeLog: vi.fn(() => ""),
+  isHeadroomPhantomSavings: vi.fn(() => false),
 }));
 
 vi.mock("../../open-sse/providers/capabilities.js", () => ({
@@ -96,7 +100,7 @@ vi.mock("../../open-sse/utils/error.js", () => ({
   parseUpstreamError: vi.fn(),
 }));
 
-vi.mock("@/lib/usageDb.js", () => ({
+vi.mock("../../../src/lib/usageDb.js", () => ({
   trackPendingRequest: vi.fn(),
   appendRequestLog: vi.fn(() => Promise.resolve()),
   saveRequestDetail: vi.fn(() => Promise.resolve()),
