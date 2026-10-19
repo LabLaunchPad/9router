@@ -607,22 +607,16 @@ function collectPanel(calls, { minPanel, stragglerGraceMs, panelHardTimeoutMs })
  * response body rather than as an SSE stream. A complete answer in the
  * client's own format beats a stream that may never arrive.
  *
- * @param {{ model: string, text: string, response?: Response }} answer
+ * Only the JUDGE degradation uses this. The "only one panel member
+ * succeeded" path keeps re-issuing with the client's original body, because
+ * that path has no hang to prevent and the re-issue preserves the client's
+ * stream flag and tools — both of which the panel response does not carry.
+ *
+ * @param {{ model: string, text: string, response: Response }} answer
  * @returns {Response}
  */
 function degradeToPanelAnswer(answer) {
-  if (!answer) {
-    return new Response(
-      JSON.stringify({ error: { message: "Fusion produced no usable answer" } }),
-      { status: 503, headers: { "Content-Type": "application/json" } }
-    );
-  }
-  if (answer.response) return answer.response;
-  // Fallback for an answer whose response body was already consumed.
-  return new Response(
-    JSON.stringify({ choices: [{ message: { role: "assistant", content: answer.text } }] }),
-    { status: 200, headers: { "Content-Type": "application/json" } }
-  );
+  return answer.response;
 }
 
 /**
@@ -721,8 +715,12 @@ export async function handleFusionChat({ body, models, handleSingleModel, log, c
     );
   }
   if (answers.length === 1) {
+    // Only one panel member succeeded and no judge ran. The client's original
+    // body is re-issued so the answer keeps the client's stream flag and its
+    // tools — the panel response has neither (the panel body is built with
+    // `stream: false` and the tools stripped).
     log.info("FUSION", `Only ${answers[0].model} succeeded — answering directly (no fusion)`);
-    return degradeToPanelAnswer(answers[0]);
+    return handleSingleModel(body, answers[0].model);
   }
 
   // 4. Judge analyzes + writes one final answer (streams to client if requested).
