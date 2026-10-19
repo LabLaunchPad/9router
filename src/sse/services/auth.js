@@ -5,6 +5,24 @@ import { MAX_RATE_LIMIT_COOLDOWN_MS } from "open-sse/config/errorConfig.js";
 import { resolveProviderId, FREE_PROVIDERS } from "@/shared/constants/providers.js";
 import { getAntigravityQuotaCache, getAntigravityModelQuota } from "./antigravityQuota.js";
 import * as log from "../utils/logger.js";
+import { CIRCUIT_BREAKER_CONFIG } from "open-sse/config/runtimeConfig.js";
+import { getCircuitBreaker, getAllCircuitBreakerStates } from "open-sse/services/circuitBreaker.js";
+import REGISTRY from "open-sse/providers/registry/index.js";
+
+// Helper: get per-provider circuit breaker config, merged with defaults
+function getProviderCircuitBreakerConfig(providerId) {
+  // Look up the provider entry in the registry
+  const providerEntry = REGISTRY.find(r => r.id === providerId || r.alias === providerId);
+  if (!providerEntry) return CIRCUIT_BREAKER_CONFIG.default;
+
+  const providerCbConfig = providerEntry.circuitBreaker || {};
+  // Merge: per-provider overrides take precedence over defaults
+  return {
+    failureThreshold: providerCbConfig.failureThreshold ?? CIRCUIT_BREAKER_CONFIG.default.failureThreshold,
+    coolDownWindowMs: providerCbConfig.coolDownWindowMs ?? CIRCUIT_BREAKER_CONFIG.default.coolDownWindowMs,
+    resetWindowMs: providerCbConfig.resetWindowMs ?? CIRCUIT_BREAKER_CONFIG.default.resetWindowMs,
+  };
+}
 
 // Mutex to prevent race conditions during account selection
 let selectionMutex = Promise.resolve();
@@ -43,6 +61,14 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     // Resolve alias to provider ID (e.g., "kc" -> "kilocode")
     const providerId = resolveProviderId(provider);
 
+    // Circuit breaker: fail fast if provider circuit is OPEN
+    const cbConfig = getProviderCircuitBreakerConfig(providerId);
+    const cb = getCircuitBreaker(providerId, cbConfig);
+    if (!cb.canRequest()) {
+      log.warn("AUTH", `${provider} | circuit breaker OPEN — refusing request, state: ${cb.state}`);
+      return null;
+    }
+
     // Inject a virtual connection for no-auth free providers (with optional proxy pool from settings)
     if (FREE_PROVIDERS[providerId]?.noAuth) {
       const settings = await getSettings();
@@ -75,6 +101,11 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     log.debug("AUTH", `${provider} | total connections: ${connections.length}, excludeIds: ${excludeSet.size > 0 ? [...excludeSet].join(",") : "none"}, model: ${model || "any"}`);
 
     if (connections.length === 0) {
+      // Record circuit breaker failure for provider with no available connections
+      const providerId = resolveProviderId(provider);
+      const cbConfig = getProviderCircuitBreakerConfig(providerId);
+      const cb = getCircuitBreaker(providerId, cbConfig);
+      cb.recordFailure();
       log.warn("AUTH", `No credentials for ${provider}`);
       return null;
     }
@@ -113,6 +144,11 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     });
 
     if (availableConnections.length === 0) {
+      // Record circuit breaker failure for provider with all accounts locked/rate-limited
+      const providerId = resolveProviderId(provider);
+      const cbConfig = getProviderCircuitBreakerConfig(providerId);
+      const cb = getCircuitBreaker(providerId, cbConfig);
+      cb.recordFailure();
       // Find earliest persistent lock or lazy Antigravity quota-cache reset for retry timing.
       const lockedConns = connections.filter(c => isModelLockActive(c, model));
       const expiries = lockedConns.map(c => getEarliestModelLockUntil(c)).filter(Boolean);
@@ -154,8 +190,6 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
       }
     }
     if (connection) {
-      // skip strategy
-    } else if (strategy === "round-robin") {
       const stickyLimit = providerOverride.stickyRoundRobinLimit || settings.stickyRoundRobinLimit || 3;
 
       // Sort by lastUsed (most recent first) to find current candidate
@@ -198,6 +232,10 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
       // Default: fill-first (already sorted by priority in getProviderConnections)
       connection = availableConnections[0];
     }
+
+    // A valid credential was selected — reset the provider circuit breaker's
+    // failure counter so a recovered provider closes the circuit promptly.
+    cb.recordSuccess();
 
     const resolvedProxy = await resolveConnectionProxyConfig(connection.providerSpecificData || {});
 

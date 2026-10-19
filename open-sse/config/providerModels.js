@@ -143,3 +143,17 @@ export function getModelsByProviderId(providerId) {
 export function getModelStrip(alias, modelId) {
   return modelStrip(findModel(PROVIDER_MODELS[alias], modelId, alias));
 }
+
+// Example model entry showing circuitBreaker field structure.
+// In practice, per-provider circuitBreaker config is defined in the provider
+// registry entries (providers/registry/{id}.js) and merged with CIRCUIT_BREAKER_CONFIG.default.
+// The field shape per model: { circuitBreaker: { failureThreshold, coolDownWindowMs, resetWindowMs } }
+export const CIRCUIT_BREAKER_EXAMPLE_MODEL = {
+  id: "example-model",
+  name: "Example Model",
+  circuitBreaker: {
+    failureThreshold: 3,     // Per-provider override (default: 5 from runtimeConfig.js)
+    coolDownWindowMs: 120000, // Per-provider override (default: 300000 ms / 5 min)
+    resetWindowMs: 600000,    // Per-provider override (default: 900000 ms / 15 min)
+  },
+};

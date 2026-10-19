@@ -96,3 +96,83 @@ export function resolveRetryEntry(entry) {
 export const SKIP_PATTERNS = [
   "Please write a 5-10 word title for the following conversation:"
 ];
+
+// Circuit breaker config
+export const CIRCUIT_BREAKER_CONFIG = {
+  // Default provider circuit breaker settings
+  default: {
+    failureThreshold: 5,
+    coolDownWindowMs: 300000, // 5 minutes
+    resetWindowMs: 900000,    // 15 minutes
+  },
+  // Per-provider overrides (merged with default)
+  // Format: 'providerId': { failureThreshold, coolDownWindowMs, resetWindowMs }
+  // Each field overrides the corresponding default; omitted fields keep the default
+  providers: {
+    // Example: 'openai': { failureThreshold: 3 }
+  },
+};
+
+// Simple schema validation for circuit breaker config
+// Validates: failureThreshold (positive integer), coolDownWindowMs (positive int ms), resetWindowMs (positive int ms)
+export function validateCircuitBreakerConfig(config) {
+  const errors = [];
+
+  if (config.failureThreshold !== undefined) {
+    if (!Number.isInteger(config.failureThreshold) || config.failureThreshold < 1) {
+      errors.push("failureThreshold must be a positive integer");
+    }
+  }
+
+  if (config.coolDownWindowMs !== undefined) {
+    if (!Number.isInteger(config.coolDownWindowMs) || config.coolDownWindowMs < 1) {
+      errors.push("coolDownWindowMs must be a positive integer (milliseconds)");
+    }
+  }
+
+  if (config.resetWindowMs !== undefined) {
+    if (!Number.isInteger(config.resetWindowMs) || config.resetWindowMs < 1) {
+      errors.push("resetWindowMs must be a positive integer (milliseconds)");
+    }
+  }
+
+  return { valid: errors.length === 0, errors };
+}
+
+// Validate the default config on import
+const defaultValidation = validateCircuitBreakerConfig(CIRCUIT_BREAKER_CONFIG.default);
+if (!defaultValidation.valid) {
+  console.error("CIRCUIT_BREAKER_CONFIG.default is invalid:", defaultValidation.errors);
+}
+
+// Validate per-provider configs
+for (const [providerId, providerConfig] of Object.entries(CIRCUIT_BREAKER_CONFIG.providers)) {
+  const pv = validateCircuitBreakerConfig(providerConfig);
+  if (!pv.valid) {
+    console.warn(`CIRCUIT_BREAKER_CONFIG.providers.${providerId} is invalid:`, pv.errors);
+  }
+}
+
+// Schema validation for circuit breaker config
+export const CIRCUIT_BREAKER_SCHEMA = {
+  // Validates a single circuit breaker config entry
+  // All fields are optional; missing fields fall back to defaults
+  type: "object",
+  properties: {
+    failureThreshold: {
+      type: "integer",
+      minimum: 1,
+    },
+    coolDownWindowMs: {
+      type: "integer",
+      minimum: 1,
+    },
+    resetWindowMs: {
+      type: "integer",
+      minimum: 1,
+    },
+  },
+  // Allow additional properties to false for strict validation
+  additionalProperties: false,
+};
+

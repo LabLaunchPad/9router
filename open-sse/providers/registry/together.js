@@ -27,5 +27,11 @@ export default {
     { id: "togethercomputer/m2-bert-80M-8k-retrieval", name: "M2 BERT 80M 8K", kind: "embedding" },
   ],
   serviceKinds: ["llm", "embedding"],
+  // Circuit breaker config per provider (overrides default)
+  circuitBreaker: {
+    failureThreshold: 5, // Together: use default (stable service)
+    coolDownWindowMs: 300000, // 5 minutes
+    resetWindowMs: 900000,    // 15 minutes
+  },
   embeddingConfig: { baseUrl: "https://api.together.xyz/v1/embeddings" },
 };
