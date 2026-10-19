@@ -135,6 +135,9 @@ Metrics Registry (added by this branch, in-process)
   ├─ sse_request_latency_seconds (fixed buckets)
   ├─ sse_error_budget_consumed (gauge — the signal the SLO gate reads)
   ├─ sse_circuit_breaker_state (gauge) + sse_circuit_breaker_transitions_total
+  ├─ sse_circuit_breaker_rejections_total (refused by an open circuit —
+  │   part of the error count, so a total outage behind an open circuit
+  │   consumes the budget instead of reading as a perfect one)
   └─ sse_metrics_sample_age_seconds (the gate can tell a fresh process from a stale one)
 ```
 
@@ -172,7 +175,9 @@ Metrics Registry (added by this branch, in-process)
   `sse_requests_total`, `sse_error_responses_total`,
   `sse_request_latency_seconds` (a fixed-bucket histogram, so memory is
   bounded regardless of traffic), `sse_error_budget_consumed`,
-  `sse_circuit_breaker_state` and `sse_metrics_sample_age_seconds`.
+  `sse_circuit_breaker_state`, `sse_circuit_breaker_transitions_total`,
+  `sse_circuit_breaker_rejections_total` and
+  `sse_metrics_sample_age_seconds`.
 - **Health endpoint** — `GET /api/health` reports pending request counts,
   active connections, requests dropped by the last restart, the remaining
   error budget, the last error provider, per-provider circuit-breaker state

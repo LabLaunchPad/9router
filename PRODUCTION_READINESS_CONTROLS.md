@@ -78,7 +78,42 @@ is 50x the budget, so the fallback reports 100% consumed (capped) and the gate
 blocks. Every series of a labelled counter is summed — reading only one series
 would divide one provider's error count by another provider's request count.
 
+#### What counts as an error
+
+An error is a request the client did not get an answer to. That is the 5xx
+responses, **and** the requests the circuit breaker refused:
+
+```
+sse_error_responses_total{...}             # 5xx responses
+sse_circuit_breaker_rejections_total{...}  # refused by an open circuit
+```
+
+The second one is not optional. The breaker refuses a request *before* any
+upstream call is made, and the handler answers `404` — because "no
+credentials" and "the provider's circuit is open" share one return value. So
+the refusals are counted as **requests** but not as **errors**, and the
+measured error rate *falls* as the outage gets worse. Measured against the
+real registry:
+
+```
+1000 requests, provider returns 5xx   -> budget consumed 100.00%
+1000 requests, breaker refuses (404)   -> budget consumed   0.00%
+```
+
+A total outage behind an open circuit would read as a **perfect** error
+budget, and the gate would allow the deploy — for exactly the failure the
+breaker exists to contain. The refusals are counted explicitly, and when the
+registry is full they land in the overflow **error** series, so a full
+registry cannot understate the outage either.
+
 ### Configuration
+
+Every variable in this table is forwarded by the workflow from a repository
+variable (the endpoint from a secret). A repository variable is not injected
+into a step's environment on its own — it has to be named in the workflow's
+`env:` block — so a knob that is documented but not forwarded is one an
+operator can set and never see take effect. The two lists are checked
+against each other by `tests/unit/drift-workflow-contract.test.js`.
 
 | Variable | Default | Notes |
 |---|---|---|
@@ -477,11 +512,17 @@ Two things follow, and both are in place:
 - the **snapshot is portable** now: every machine- and release-dependent value
   is normalised to a placeholder, and
   `tests/translator/golden-snapshot-portability.test.js` is the guard. It
-  asserts the *property* — the sanitised headers are identical when
-  `process.platform` and `process.version` change — and it checks the
-  committed snapshot for a platform, a runtime version or the app version. It
-  fails against the old snapshot with `the snapshot records the platform
-  "win32"`.
+  asserts the *property* — the sanitised headers are identical when the
+  machine changes: its platform, its Node version, **and its architecture**.
+  The modules are re-imported under each identity, so a value that is
+  computed when a module is first evaluated is recomputed too; varying
+  `process.arch` alone would not have changed it, and the check would have
+  passed for the wrong reason. The static half checks the committed snapshot
+  for a platform literal, for the app version, for this runner's Node
+  version, and for any concrete value of a header the sanitiser knows to be
+  machine-dependent — the last of those is what covers the runtime version,
+  because `X-PLATFORM-VERSION` is one of those headers. It fails against the
+  old snapshot with `the snapshot records the platform "win32"`.
 - the gate now **reports what it cannot see**. The failures that are on both
   sides are listed, and the ones in files the change touched are called out
   with a warning. It does not fail the build: a failure that was already
@@ -940,6 +981,18 @@ breaker's state (`getState()`, used by `/api/health` and `/api/metrics`) is
 side-effect free: a metrics scrape must never half-open a circuit that is
 supposed to be failing fast.
 
+The no-auth free providers take an early return that hands back a **synthetic
+credential**, and that credential carries its `provider` — like a real one
+does. It has to: the success path resolves the provider from the credential
+to record the success, and a synthetic credential without one meant the
+success was never recorded. The circuit stayed `half-open` with its probe
+slot claimed, and every later request was refused for the whole reset window
+— a provider that had recovered was blackholed, and again in the next window.
+The synthetic credential also *holds* the probe rather than releasing it,
+because that path does make an upstream request: the response resolves it.
+The two early returns that release it explicitly are the ones that make no
+upstream request at all.
+
 ### The breaker's transitions are observable
 
 Every state change emits a structured log line and increments a counter.
@@ -971,8 +1024,8 @@ Prometheus text exposition. Exports `sse_requests_total`,
 `sse_error_responses_total`, `sse_request_latency_seconds` (a fixed-bucket
 histogram, so memory is bounded regardless of traffic),
 `sse_error_budget_consumed`, `sse_circuit_breaker_state`,
-`sse_circuit_breaker_transitions_total`, `sse_metrics_sample_age_seconds`,
-and `sse_metrics_dropped_series_total`.
+`sse_circuit_breaker_transitions_total`, `sse_circuit_breaker_rejections_total`,
+`sse_metrics_sample_age_seconds`, and `sse_metrics_dropped_series_total`.
 
 The `sse_error_budget_consumed` gauge is the signal the SLO gate reads. The
 sample-age gauge is what lets the gate tell whether the sample spans the SLO
