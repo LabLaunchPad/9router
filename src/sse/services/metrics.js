@@ -273,6 +273,37 @@ export function recordRequest({ status, provider, model, endpoint, durationMs } 
 }
 
 /**
+ * Record a request that the circuit breaker refused.
+ *
+ * The refusal is a SERVER-side failure of the provider: the client asked for
+ * something and did not get it. The handler happens to answer 404 — because
+ * "no credentials" and "the provider's circuit is open" share one return
+ * value — but the error budget has to see it.
+ *
+ * Counting only 5xx would make a total outage behind an open circuit read as
+ * a PERFECT error budget, because the refusals are counted as requests and
+ * not as errors: the measured error rate would FALL as the outage got
+ * worse. The SLO gate would then wave the deploy through, for exactly the
+ * failure the breaker exists to contain.
+ *
+ * The series is created only when the registry has room. When it does not,
+ * the refusal is counted in the overflow ERROR series — a full registry must
+ * never understate the outage, which is what the overflow series is for.
+ *
+ * @param {string} provider
+ */
+export function recordBreakerRejection(provider) {
+  const labels = { provider };
+  const key = `sse_circuit_breaker_rejections_total${counterKey(labels)}`;
+  if (!counters.has(key) && counters.size >= MAX_SERIES) {
+    incrementOverflowError();
+    noteDroppedSeries("sse_circuit_breaker_rejections_total", labels);
+    return;
+  }
+  incrementCounter("sse_circuit_breaker_rejections_total", labels);
+}
+
+/**
  * Count one request in the overflow series.
  */
 function incrementOverflowRequest() {
@@ -452,10 +483,16 @@ export function getMetricsSnapshot() {
  * Compute error-budget consumption as a 0..1 fraction.
  *
  * Derives from the recorded request counters:
- *   errorRate = 5xx responses / total responses
+ *   errorRate = (5xx responses + breaker refusals) / total responses
  *   consumed  = errorRate / targetErrorRate
  *
  * With a 99.95% availability target the error budget is 0.05% of requests.
+ *
+ * The breaker refusals are part of the error count because they are
+ * server-side failures: the provider is down and the client got nothing.
+ * Without them, a total outage behind an open circuit would consume no
+ * budget at all — the refusals would be counted as requests but never as
+ * errors, and the measured error rate would fall as the outage got worse.
  *
  * @param {number} [targetErrorRate] default 0.0005
  * @returns {number} fraction of budget consumed (0 when no traffic yet)
@@ -466,6 +503,7 @@ export function computeErrorBudgetConsumed(targetErrorRate = 0.0005) {
   for (const [key, value] of counters.entries()) {
     if (key.startsWith("sse_requests_total")) total += value;
     if (key.startsWith("sse_error_responses_total")) errors += value;
+    if (key.startsWith("sse_circuit_breaker_rejections_total")) errors += value;
   }
   if (total === 0) return 0;
   const errorRate = errors / total;

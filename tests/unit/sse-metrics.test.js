@@ -6,6 +6,7 @@ import {
   addGauge,
   observeLatency,
   recordRequest,
+  recordBreakerRejection,
   renderPrometheus,
   getMetricsSnapshot,
   computeErrorBudgetConsumed,
@@ -330,5 +331,73 @@ describe("the metric registry cannot be grown by the caller", () => {
     const counters = getMetricsSnapshot().counters;
     expect(counters['sse_error_responses_total{endpoint="overflow"}']).toBe(1);
     expect(after).toBeGreaterThan(before);
+  });
+});
+
+// --- breaker refusals -----------------------------------------------------
+
+describe("recordBreakerRejection", () => {
+  it("counts a refused request and moves the error budget", () => {
+    // The refusal is a server-side failure: the client asked for something
+    // and did not get it. The handler answers 404 — "no credentials" and
+    // "the circuit is open" share one return value — so without an
+    // explicit count the budget would not see it at all.
+    for (let i = 0; i < 10; i += 1) {
+      recordRequest({ status: 404, provider: "openai", endpoint: "/api/v1beta/models/x" });
+    }
+
+    // The 404s are requests, not errors: the budget is untouched.
+    expect(computeErrorBudgetConsumed(1)).toBe(0);
+
+    recordBreakerRejection("openai");
+
+    const counters = getMetricsSnapshot().counters;
+    expect(counters['sse_circuit_breaker_rejections_total{provider="openai"}']).toBe(1);
+
+    // ONE error out of TEN requests. Against a target of 100% that is
+    // exactly 0.1 of the budget consumed — the refusal moved it by exactly
+    // what it should have.
+    expect(computeErrorBudgetConsumed(1)).toBeCloseTo(0.1, 10);
+
+    // And against the real 0.05% target it saturates: a provider refusing
+    // a tenth of all traffic has certainly blown the budget.
+    expect(computeErrorBudgetConsumed()).toBe(1);
+  });
+
+  it("makes a total outage visible to the gate", () => {
+    // The case the gate exists for: the provider is entirely down and
+    // every request is refused by the breaker. Before the refusal was
+    // counted, this read as a PERFECT error budget, because the 404s were
+    // counted as requests and never as errors — so the measured error rate
+    // FELL as the outage got worse.
+    for (let i = 0; i < 100; i += 1) {
+      recordRequest({ status: 404, provider: "openai", endpoint: "/api/v1beta/models/x" });
+      recordBreakerRejection("openai");
+    }
+    expect(computeErrorBudgetConsumed()).toBe(1);
+  });
+
+  it("counts a refusal whose own series cannot be created", () => {
+    // A full registry must never understate the outage: the refusal goes
+    // to the overflow ERROR series, which the budget reads.
+    incrementCounter("sse_requests_total", { status: "2xx", endpoint: "/v1/chat/completions" });
+    for (let i = 0; i < 600; i += 1) {
+      incrementCounter("sse_requests_total", { status: "2xx", provider: `p${i}` });
+    }
+
+    const before = computeErrorBudgetConsumed(1);
+    recordBreakerRejection("openai");
+    const after = computeErrorBudgetConsumed(1);
+
+    const counters = getMetricsSnapshot().counters;
+    expect(counters['sse_error_responses_total{endpoint="overflow"}']).toBe(1);
+    expect(after).toBeGreaterThan(before);
+  });
+
+  it("renders the refusal on the metrics endpoint", () => {
+    recordBreakerRejection("openai");
+    const text = renderPrometheus();
+    expect(text).toContain("sse_circuit_breaker_rejections_total");
+    expect(text).toContain('provider="openai"');
   });
 });
