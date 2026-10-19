@@ -28,6 +28,10 @@ class CircuitBreaker {
     this.lastFailureTime = 0;
     this.lastStateChangeTime = Date.now();
     this.nextRetryTime = 0;
+    // HALF_OPEN admits exactly one probe request. The slot is claimed by
+    // canRequest() and released by recordSuccess()/recordFailure().
+    this.probeInFlight = false;
+    this.probeStartedAt = 0;
   }
 
   // Record a failure and check if circuit should open
@@ -47,13 +51,46 @@ class CircuitBreaker {
   recordSuccess() {
     if (this.state === CircuitBreakerState.HALF_OPEN) {
       this.reset();
+    } else if (this.state === CircuitBreakerState.OPEN) {
+      // A request that was already in flight when the circuit opened has come
+      // back with a real response, so the provider is demonstrably healthy
+      // again. Close the circuit rather than keeping it open until the
+      // cool-down elapses.
+      this.reset();
     } else if (this.state === CircuitBreakerState.CLOSED) {
       // Reset failure count on success in closed state
       this.failureCount = 0;
     }
   }
 
-  // Check if circuit allows a request through
+  /**
+   * Pure availability check. Changes no state, so it is safe to call from a
+   * status read (a metrics scrape or a health probe must not half-open a
+   * circuit that is supposed to be failing fast).
+   */
+  isAvailable(now = Date.now()) {
+    if (this.state === CircuitBreakerState.CLOSED) return true;
+
+    if (this.state === CircuitBreakerState.OPEN) {
+      // The cool-down has elapsed, so a probe would be allowed.
+      return now - this.lastStateChangeTime >= this.coolDownWindowMs;
+    }
+
+    if (this.state === CircuitBreakerState.HALF_OPEN) {
+      // Available only when no probe is currently in flight.
+      return !this.probeInFlight;
+    }
+
+    return false;
+  }
+
+  /**
+   * Check if circuit allows a request through.
+   *
+   * This is the request-path entry point and it may change state: it
+   * promotes OPEN -> HALF_OPEN once the cool-down has elapsed and claims the
+   * single probe slot that HALF_OPEN allows.
+   */
   canRequest() {
     const now = Date.now();
 
@@ -65,13 +102,22 @@ class CircuitBreaker {
       // Check if cool-down window has elapsed
       if (now - this.lastStateChangeTime >= this.coolDownWindowMs) {
         this.transitionTo(CircuitBreakerState.HALF_OPEN);
+        this.probeInFlight = true;
+        this.probeStartedAt = now;
         return true;
       }
       return false;
     }
 
     if (this.state === CircuitBreakerState.HALF_OPEN) {
-      // Allow one probe request through
+      // Allow one probe request through. If a probe was claimed but never
+      // resolved (the request crashed or was dropped), release the slot once
+      // the reset window has elapsed so the breaker cannot get stuck open.
+      if (this.probeInFlight && now - this.probeStartedAt < this.resetWindowMs) {
+        return false;
+      }
+      this.probeInFlight = true;
+      this.probeStartedAt = now;
       return true;
     }
 
@@ -81,6 +127,8 @@ class CircuitBreaker {
   transitionTo(newState) {
     this.state = newState;
     this.lastStateChangeTime = Date.now();
+    this.probeInFlight = false;
+    this.probeStartedAt = 0;
     if (newState === CircuitBreakerState.OPEN) {
       this.nextRetryTime = this.lastStateChangeTime + this.coolDownWindowMs;
     } else if (newState === CircuitBreakerState.HALF_OPEN) {
@@ -94,9 +142,12 @@ class CircuitBreaker {
     this.lastFailureTime = 0;
     this.lastStateChangeTime = Date.now();
     this.nextRetryTime = 0;
+    this.probeInFlight = false;
+    this.probeStartedAt = 0;
   }
 
-  // Get current state for metrics
+  // Get current state for metrics. Side-effect free: reading the state must
+  // not change it.
   getState() {
     return {
       provider: this.provider,
@@ -105,7 +156,7 @@ class CircuitBreaker {
       lastFailureTime: this.lastFailureTime,
       lastStateChangeTime: this.lastStateChangeTime,
       nextRetryTime: this.nextRetryTime,
-      canRequest: this.canRequest(),
+      canRequest: this.isAvailable(),
     };
   }
 }

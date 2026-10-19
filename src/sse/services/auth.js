@@ -10,18 +10,82 @@ import { getCircuitBreaker, getAllCircuitBreakerStates } from "open-sse/services
 import REGISTRY from "open-sse/providers/registry/index.js";
 
 // Helper: get per-provider circuit breaker config, merged with defaults
+//
+// Precedence: CIRCUIT_BREAKER_CONFIG.providers (the documented operator knob)
+// > the provider registry entry > CIRCUIT_BREAKER_CONFIG.default.
+//
+// The runtime-config map used to be validated on import but never read, so an
+// operator override there was silently ignored while still logging a startup
+// warning — false confidence.
 function getProviderCircuitBreakerConfig(providerId) {
+  const defaults = CIRCUIT_BREAKER_CONFIG.default;
+  const fromRuntimeConfig = CIRCUIT_BREAKER_CONFIG.providers?.[providerId] || {};
+
   // Look up the provider entry in the registry
   const providerEntry = REGISTRY.find(r => r.id === providerId || r.alias === providerId);
-  if (!providerEntry) return CIRCUIT_BREAKER_CONFIG.default;
+  const fromRegistry = providerEntry?.circuitBreaker || {};
 
-  const providerCbConfig = providerEntry.circuitBreaker || {};
-  // Merge: per-provider overrides take precedence over defaults
+  const pick = (key) => fromRuntimeConfig[key] ?? fromRegistry[key] ?? defaults[key];
   return {
-    failureThreshold: providerCbConfig.failureThreshold ?? CIRCUIT_BREAKER_CONFIG.default.failureThreshold,
-    coolDownWindowMs: providerCbConfig.coolDownWindowMs ?? CIRCUIT_BREAKER_CONFIG.default.coolDownWindowMs,
-    resetWindowMs: providerCbConfig.resetWindowMs ?? CIRCUIT_BREAKER_CONFIG.default.resetWindowMs,
+    failureThreshold: pick("failureThreshold"),
+    coolDownWindowMs: pick("coolDownWindowMs"),
+    resetWindowMs: pick("resetWindowMs"),
   };
+}
+
+/**
+ * Is this failure a signal about the PROVIDER, or about one credential?
+ *
+ * 401/403/402/429 mean "this account is bad, throttled, or out of quota" —
+ * the provider itself is healthy, so they must not trip a provider-level
+ * circuit. 5xx and transport errors (no status at all) mean the provider is
+ * failing and every account will fail the same way.
+ */
+function isProviderLevelFailure(status) {
+  const n = Number(status);
+  // No status at all -> transport error (DNS, TCP, TLS, timeout).
+  if (!Number.isFinite(n) || n <= 0) return true;
+  return n >= 500;
+}
+
+/**
+ * Record a provider-level failure on the circuit breaker.
+ *
+ * Called from the upstream error path, so a provider that is genuinely down
+ * is skipped instead of being retried into the ground.
+ *
+ * @param {string|null} provider
+ * @param {number|string|null} status - upstream HTTP status, if any
+ * @returns {boolean} true when a failure was recorded
+ */
+export function recordProviderFailure(provider, status) {
+  if (!provider) return false;
+  if (!isProviderLevelFailure(status)) return false;
+
+  const providerId = resolveProviderId(provider);
+  const cb = getCircuitBreaker(providerId, getProviderCircuitBreakerConfig(providerId));
+  cb.recordFailure();
+  log.warn(
+    "AUTH",
+    `${provider} | provider failure (${status ?? "transport error"}) — breaker ${cb.state} (${cb.failureCount}/${cb.failureThreshold})`,
+  );
+  return true;
+}
+
+/**
+ * Record a successful upstream response on the circuit breaker, so a provider
+ * that has recovered closes the circuit promptly.
+ *
+ * This must be tied to an actual response, not to credential selection —
+ * selecting a credential says nothing about whether the provider answered.
+ */
+export function recordProviderSuccess(provider) {
+  if (!provider) return false;
+
+  const providerId = resolveProviderId(provider);
+  const cb = getCircuitBreaker(providerId, getProviderCircuitBreakerConfig(providerId));
+  cb.recordSuccess();
+  return true;
 }
 
 // Mutex to prevent race conditions during account selection
@@ -101,11 +165,11 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     log.debug("AUTH", `${provider} | total connections: ${connections.length}, excludeIds: ${excludeSet.size > 0 ? [...excludeSet].join(",") : "none"}, model: ${model || "any"}`);
 
     if (connections.length === 0) {
-      // Record circuit breaker failure for provider with no available connections
-      const providerId = resolveProviderId(provider);
-      const cbConfig = getProviderCircuitBreakerConfig(providerId);
-      const cb = getCircuitBreaker(providerId, cbConfig);
-      cb.recordFailure();
+      // No credentials is an ACCOUNT problem, not a provider problem. The
+      // provider may be perfectly healthy, and no upstream call is made
+      // here, so there is nothing for the provider circuit to protect
+      // against. Tripping it would let one misconfigured account take the
+      // provider out of service for every other account on it.
       log.warn("AUTH", `No credentials for ${provider}`);
       return null;
     }
@@ -144,11 +208,11 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     });
 
     if (availableConnections.length === 0) {
-      // Record circuit breaker failure for provider with all accounts locked/rate-limited
-      const providerId = resolveProviderId(provider);
-      const cbConfig = getProviderCircuitBreakerConfig(providerId);
-      const cb = getCircuitBreaker(providerId, cbConfig);
-      cb.recordFailure();
+      // All accounts locked or rate-limited is again an ACCOUNT problem, not
+      // a provider problem — the provider itself is healthy and no upstream
+      // call is made. The provider circuit must not open for it: doing so
+      // would let one account's exhausted quota blackhole the whole
+      // provider. The per-account locks are handled by accountFallback.
       // Find earliest persistent lock or lazy Antigravity quota-cache reset for retry timing.
       const lockedConns = connections.filter(c => isModelLockActive(c, model));
       const expiries = lockedConns.map(c => getEarliestModelLockUntil(c)).filter(Boolean);
@@ -233,9 +297,11 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
       connection = availableConnections[0];
     }
 
-    // A valid credential was selected — reset the provider circuit breaker's
-    // failure counter so a recovered provider closes the circuit promptly.
-    cb.recordSuccess();
+    // NOTE: the circuit breaker is deliberately NOT reset here. Selecting a
+    // credential says nothing about whether the provider answered — a
+    // provider that is down still hands out credentials happily. The breaker
+    // is closed by a real upstream response (recordProviderSuccess) and
+    // tripped by a real upstream failure (recordProviderFailure).
 
     const resolvedProxy = await resolveConnectionProxyConfig(connection.providerSpecificData || {});
 
@@ -283,6 +349,12 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
  * @returns {{ shouldFallback: boolean, cooldownMs: number }}
  */
 export async function markAccountUnavailable(connectionId, status, errorText, provider = null, model = null, resetsAtMs = null) {
+  // A provider-level failure (5xx, transport error) trips the circuit
+  // breaker. This is the upstream error path, so a provider that is genuinely
+  // down is skipped instead of being retried into the ground. Per-account
+  // problems (401/403/402/429) are ignored here — see isProviderLevelFailure.
+  recordProviderFailure(provider, status);
+
   if (!connectionId || connectionId === "noauth") return { shouldFallback: false, cooldownMs: 0 };
   const connections = await getProviderConnections({ provider });
   const conn = connections.find(c => c.id === connectionId);
@@ -337,13 +409,22 @@ export async function markAccountUnavailable(connectionId, status, errorText, pr
  * - Clears modelLock_${model} (the model that just succeeded)
  * - Lazy-cleans any other expired modelLock_* keys
  * - Resets error state only if no active locks remain
+ * - Closes the provider circuit breaker (the provider answered, so it is up)
  * @param {string} connectionId
  * @param {object} currentConnection - credentials object (has _connection) or raw connection
  * @param {string|null} model - model that succeeded
+ * @param {string|null} provider - provider id; derived from the connection when omitted
  */
-export async function clearAccountError(connectionId, currentConnection, model = null) {
+export async function clearAccountError(connectionId, currentConnection, model = null, provider = null) {
+  // A successful upstream response is the only trustworthy "the provider is
+  // healthy" signal. Recording it on credential selection instead (which is
+  // what this used to do) reset the breaker before the request had even been
+  // sent, so a provider that was down never tripped.
+  const connForProvider = currentConnection?._connection || currentConnection;
+  recordProviderSuccess(provider || connForProvider?.provider || null);
+
   if (!connectionId || connectionId === "noauth") return;
-  const conn = currentConnection._connection || currentConnection;
+  const conn = connForProvider;
   const now = Date.now();
   const allLockKeys = Object.keys(conn).filter(k => k.startsWith("modelLock_"));
 
