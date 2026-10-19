@@ -19,6 +19,12 @@
 // ---------------------------------------------------------------------------
 
 const CONFIG = {
+  // The metrics endpoint to scrape.
+  //
+  // `METRICS_ENDPOINT` is an accepted alias of `SLO_METRICS_ENDPOINT`. It is
+  // documented here and in PRODUCTION_READINESS_CONTROLS.md because a
+  // generically-named variable in the environment silently supplying an
+  // endpoint would otherwise be a surprise.
   metricsEndpoint: process.env.SLO_METRICS_ENDPOINT || process.env.METRICS_ENDPOINT || "",
   serviceName: process.env.SERVICE_NAME || "9router",
   environment: process.env.ENVIRONMENT || "production",
@@ -33,10 +39,37 @@ const CONFIG = {
   // SLO window in seconds (default 30 days)
   windowSeconds: numEnv("SLO_WINDOW_SECONDS", 30 * 24 * 60 * 60),
 
-  // Fail-closed: block when metrics are unavailable or malformed
+  // The error budget allowance, as a fraction of requests. Must match the
+  // app's own target (see computeErrorBudgetConsumed in
+  // src/sse/services/metrics.js): 0.0005 == a 99.95% availability SLO.
+  //
+  // Without this the counter fallback would report the raw error RATE and
+  // compare it against budget-consumption thresholds — off by 1/targetErrorRate.
+  targetErrorRate: numEnv("SLO_TARGET_ERROR_RATE", 0.0005),
+
+  // The counters behind the metric live in the service process, so they only
+  // cover the time since the last restart. A sample that does not span the
+  // SLO window cannot validate the SLO, so the gate fails closed on it.
+  // Set SLO_REQUIRE_FULL_WINDOW=false to downgrade this to a warning.
+  requireFullWindow: (process.env.SLO_REQUIRE_FULL_WINDOW || "true") !== "false",
+
+  // Fail-closed: block when metrics are unavailable or malformed.
+  //
+  // This covers a missing endpoint as well: a gate that has no endpoint to
+  // read cannot say anything about the error budget, so it blocks. The
+  // explicit ways to release a deploy are `SLO_GATE_SKIP` and the audited
+  // `SLO_GATE_OVERRIDE_APPROVED` — never an implicit fail-open.
   failClosed: (process.env.SLO_FAIL_CLOSED || "true") !== "false",
 
-  // Emergency override (audited)
+  // Skip the gate entirely. CI-only: the workflow step is skipped, so the
+  // deploy is not validated against the error budget. Always visible in the
+  // job summary.
+  skip: process.env.SLO_GATE_SKIP === "true",
+
+  // Emergency override (audited).
+  // `SLO_GATE_OVERRIDE` is an accepted alias of `SLO_GATE_OVERRIDE_APPROVED`;
+  // both are documented, and the audit trail records the actor, the reason
+  // and the git SHA either way.
   overrideApproved:
     process.env.SLO_GATE_OVERRIDE_APPROVED === "true" ||
     process.env.SLO_GATE_OVERRIDE === "true",
@@ -80,11 +113,50 @@ export function parseMetric(text, name) {
 }
 
 /**
+ * Sum every series of a metric from Prometheus text exposition.
+ *
+ * The app exports one series per label combination, e.g.
+ *   sse_requests_total{status="2xx",provider="openai"} 990
+ *   sse_requests_total{status="5xx",provider="openai"} 5
+ * Reading a single one of those is meaningless for a total, so counters must
+ * be summed. `parseMetric` is only correct for single-series gauges.
+ *
+ * @returns {number|null} the sum, or null when the metric is absent
+ */
+export function sumMetric(text, name) {
+  if (!text) return null;
+  const lines = text.split("\n");
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const re = new RegExp(`^${escaped}(\\{[^}]*\\})?\\s+(\\S+)$`);
+  let sum = 0;
+  let found = false;
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#")) continue;
+    const m = line.match(re);
+    if (!m) continue;
+    const parsed = Number(m[2]);
+    if (Number.isFinite(parsed)) {
+      sum += parsed;
+      found = true;
+    }
+  }
+  return found ? sum : null;
+}
+
+/**
  * Parse an error-budget-consumption ratio from a Prometheus endpoint.
  * Prefers a directly-exported gauge; otherwise derives it from request/error
  * counters. Returns null when neither signal is present.
+ *
+ * The counter path computes the same quantity as the app's own
+ * `computeErrorBudgetConsumed()`: the error rate divided by the target error
+ * rate, i.e. the fraction of the error budget that has been spent. Returning
+ * the raw error rate here would compare an error rate against
+ * budget-consumption thresholds and be wrong by a factor of
+ * 1 / targetErrorRate (2000x at the default 99.95% SLO).
  */
-export function parseBudgetConsumed(text) {
+export function parseBudgetConsumed(text, cfg = CONFIG) {
   // Preferred: an explicit gauge exported by the metrics endpoint.
   const direct = parseMetric(text, "sse_error_budget_consumed");
   if (direct !== null) {
@@ -92,19 +164,23 @@ export function parseBudgetConsumed(text) {
     return { consumedPercent: round2(direct * 100), source: "gauge" };
   }
 
-  // Fallback: derive from counters.
-  const total = parseMetric(text, "sse_requests_total");
+  // Fallback: derive from counters. Sum every series of each counter.
+  const total = sumMetric(text, "sse_requests_total");
   if (total === null || total === 0) return null;
 
   // Prefer an explicitly-labelled error counter if the endpoint exports one.
   const errorCount =
-    parseMetric(text, "sse_error_responses_total") ??
-    parseMetric(text, "sse_requests_failed_total");
+    sumMetric(text, "sse_error_responses_total") ??
+    sumMetric(text, "sse_requests_failed_total");
 
   if (errorCount === null) return null;
 
+  const targetErrorRate = Number(cfg?.targetErrorRate ?? CONFIG.targetErrorRate);
+  if (!Number.isFinite(targetErrorRate) || targetErrorRate <= 0) return null;
+
   const errorRate = errorCount / total;
-  return { consumedPercent: round2(errorRate * 100), source: "counters" };
+  const consumed = errorRate / targetErrorRate;
+  return { consumedPercent: round2(Math.min(1, consumed) * 100), source: "counters" };
 }
 
 function round2(n) {
@@ -285,7 +361,7 @@ export function evaluate({ metricsText = null, fetchError = null, cfg = CONFIG }
   let parsed = null;
   let parseError = null;
   try {
-    parsed = parseBudgetConsumed(metricsText);
+    parsed = parseBudgetConsumed(metricsText, cfg);
     if (!parsed) parseError = "no error-budget metric found in response";
   } catch (err) {
     parseError = err?.message || "parse failure";
@@ -301,6 +377,28 @@ export function evaluate({ metricsText = null, fetchError = null, cfg = CONFIG }
     };
   }
 
+  // ---- Sample age ----
+  //
+  // The counters behind the metric are held in the service process, so they
+  // only cover the time since the last restart. A sample that does not span
+  // the SLO window cannot say anything about the budget over that window, and
+  // reading it as if it could would silently allow exactly the deployments
+  // the gate exists to catch (a crash-looping service has just reset its
+  // counters). The exporter publishes the sample age so this is checkable.
+  const sampleAge = parseMetric(metricsText, "sse_metrics_sample_age_seconds");
+  if (cfg.requireFullWindow && sampleAge !== null && sampleAge < cfg.windowSeconds) {
+    return {
+      decision: "block",
+      exitCode: cfg.failClosed ? 1 : 0,
+      reason:
+        `SLO sample covers only ${Math.round(sampleAge)}s of the ${cfg.windowSeconds}s window — ` +
+        "the service has not been up long enough for the metric to represent the SLO window",
+      consumedPercent: parsed.consumedPercent,
+      override: false,
+      source: parsed.source,
+    };
+  }
+
   // ---- Decide ----
   const decision = decide(parsed.consumedPercent, cfg);
   return {
@@ -313,6 +411,28 @@ export function evaluate({ metricsText = null, fetchError = null, cfg = CONFIG }
 
 export async function main() {
   const cfg = CONFIG;
+
+  // ---- Explicit skip ----
+  //
+  // SLO_GATE_SKIP is honoured here as well as in the workflow step, so the
+  // documented skip works no matter which path invokes the script. It is
+  // never silent: the decision is logged and printed as a warning.
+  if (cfg.skip) {
+    const decision = {
+      decision: "allow",
+      exitCode: 0,
+      reason: "SLO gate skipped via SLO_GATE_SKIP",
+    };
+    emitStructuredLog(cfg, decision, null, { skipped: true });
+    console.error(
+      buildSummary(cfg, decision, null, {
+        note:
+          "**SLO GATE SKIPPED** (SLO_GATE_SKIP=true). This deploy was NOT validated " +
+          "against the error budget.",
+      }),
+    );
+    process.exit(0);
+  }
 
   // ---- Emergency override (audited) ----
   //
@@ -343,6 +463,10 @@ export async function main() {
   // it would silently report a healthy budget and wave through every deploy.
   // An unset endpoint is a configuration error and fails closed.
   if (!cfg.metricsEndpoint) {
+    // A gate with no endpoint cannot say anything about the error budget, so
+    // it blocks — including when SLO_FAIL_CLOSED=false, because a
+    // misconfigured gate is a configuration error, not a data problem. The
+    // explicit releases are SLO_GATE_SKIP and the audited override above.
     const decision = {
       decision: "block",
       exitCode: 1,

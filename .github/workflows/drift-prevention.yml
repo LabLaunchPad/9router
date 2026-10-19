@@ -1,6 +1,12 @@
 name: 🛡️ Drift Prevention Check
 
-# Run on every PR and push to main/default branch
+# Run on every PR, and on pushes to the default branch.
+#
+# The default branch of this repository (and of upstream) is `master`, not
+# `main`. The SLO gate used to trigger on `push: branches: [main]` and to
+# require `github.ref == 'refs/heads/main'`, so it never ran once. Both
+# names are listed below so the gate works whichever branch is the default;
+# the job condition is kept in sync with the trigger.
 on:
   pull_request:
     paths:
@@ -8,9 +14,19 @@ on:
       - '**.config.*'
       - 'next.config*'
       - 'tailwind*'
+      # The control plane itself must be covered, or a PR that changes only
+      # the gate logic or the metric producer runs no CI at all.
+      - 'scripts/ci/**'
+      - 'src/sse/**'
+      - 'src/app/api/metrics/**'
+      - 'src/app/api/health/**'
+      - 'open-sse/rtk/**'
+      - 'open-sse/services/circuitBreaker.js'
+      - '.github/workflows/drift-prevention.yml'
   push:
     branches:
       - main
+      - master
 
 jobs:
   test-drift:
@@ -28,8 +44,11 @@ jobs:
       - name: 🏁 Record baseline test results
         id: baseline
         run: |
-          npx vitest run --reporter=verbose > baseline-results.txt 2>&1 || true
-          echo "baseline_exit_code=$?" >> $GITHUB_OUTPUT
+          set +e
+          npx vitest run --reporter=verbose > baseline-results.txt 2>&1
+          code=$?
+          set -e
+          echo "baseline_exit_code=$code" >> $GITHUB_OUTPUT
 
       - name: 🔍 Drift detection - import resolution
         run: |
@@ -78,7 +97,7 @@ jobs:
   slo-validation-gate:
     runs-on: ubuntu-latest
     needs: test-drift
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
     timeout-minutes: 30
 
     steps:
@@ -94,10 +113,17 @@ jobs:
       # missing — that is exactly the case it exists to catch. Skipping is
       # still possible, but it has to be an explicit, visible repository
       # variable rather than an accident.
+      #
+      # The approved override is checked here too, not only in the script: a
+      # pre-check that ignores it would fail before the script (the only
+      # place that honours it) ever ran, which would make the audited
+      # override unusable in exactly the misconfigured-endpoint case it
+      # exists for.
       - name: 📋 Check SLO gate configuration
         env:
           SLO_METRICS_ENDPOINT: ${{ secrets.SLO_METRICS_ENDPOINT }}
           SLO_GATE_SKIP: ${{ vars.SLO_GATE_SKIP }}
+          SLO_GATE_OVERRIDE_APPROVED: ${{ vars.SLO_GATE_OVERRIDE_APPROVED }}
         run: |
           if [ -n "$SLO_METRICS_ENDPOINT" ]; then
             echo "SLO metrics endpoint configured"
@@ -107,6 +133,10 @@ jobs:
             echo "::warning::SLO gate SKIPPED (SLO_GATE_SKIP=true). The deploy was NOT validated against the error budget."
             exit 0
           fi
+          if [ "$SLO_GATE_OVERRIDE_APPROVED" = "true" ]; then
+            echo "::warning::SLO gate OVERRIDDEN (SLO_GATE_OVERRIDE_APPROVED=true). The deploy was NOT validated against the error budget."
+            exit 0
+          fi
           echo "::error::SLO_METRICS_ENDPOINT is not configured. The SLO gate fails closed."
           echo "Set the SLO_METRICS_ENDPOINT repository secret to the authoritative metrics URL, "
           echo "or set the SLO_GATE_SKIP repository variable to true to skip the gate explicitly."
@@ -114,8 +144,15 @@ jobs:
 
       - name: 🔍 Run SLO validation gate
         # validate-slo.mjs has zero runtime dependencies (native fetch, Node 18+).
+        #
+        # SLO_GATE_SKIP is passed in here as well, not only to the pre-check.
+        # Otherwise the skip would only change the error message while the
+        # gate still failed closed, and the log would claim a skip that never
+        # happened.
+        if: env.SLO_GATE_SKIP != 'true' && env.SLO_GATE_OVERRIDE_APPROVED != 'true'
         env:
           SLO_METRICS_ENDPOINT: ${{ secrets.SLO_METRICS_ENDPOINT }}
+          SLO_GATE_SKIP: ${{ vars.SLO_GATE_SKIP }}
           SERVICE_NAME: 9router
           ENVIRONMENT: production
           GITHUB_SHA: ${{ github.sha }}
@@ -132,8 +169,16 @@ jobs:
 
       - name: 📢 SLO Gate Decision
         if: always()
+        env:
+          SLO_GATE_SKIP: ${{ vars.SLO_GATE_SKIP }}
+          SLO_GATE_OVERRIDE_APPROVED: ${{ vars.SLO_GATE_OVERRIDE_APPROVED }}
         run: |
           echo "Service: 9router"
           echo "Environment: production"
           echo "Git SHA: ${{ github.sha }}"
           echo "SLO gate exit code: ${{ job.status }}"
+          if [ "$SLO_GATE_SKIP" = "true" ]; then
+            echo "::warning::SLO gate was SKIPPED via SLO_GATE_SKIP. This deploy was NOT validated against the error budget."
+          elif [ "$SLO_GATE_OVERRIDE_APPROVED" = "true" ]; then
+            echo "::warning::SLO gate was OVERRIDDEN via SLO_GATE_OVERRIDE_APPROVED. This deploy was NOT validated against the error budget."
+          fi

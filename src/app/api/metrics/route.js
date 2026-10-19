@@ -20,6 +20,12 @@ export async function GET() {
   // Refresh gauges that are computed on demand.
   setGauge("sse_error_budget_consumed", Number(computeErrorBudgetConsumed().toFixed(6)));
 
+  // The counters behind the metric live in this process, so they only cover
+  // the time since the last restart. Publish the sample age so the CI SLO
+  // gate can tell whether the metric actually spans the SLO window instead of
+  // assuming it does.
+  setGauge("sse_metrics_sample_age_seconds", Math.floor(process.uptime()));
+
   try {
     for (const state of getAllCircuitBreakerStates()) {
       // 0 = closed, 1 = half-open, 2 = open (higher = more severe).

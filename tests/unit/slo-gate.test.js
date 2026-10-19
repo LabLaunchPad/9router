@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 // runtime dependencies, so it can be imported directly.
 import {
   parseMetric,
+  sumMetric,
   parseBudgetConsumed,
   decide,
   evaluate,
@@ -48,6 +49,10 @@ const BASE_CONFIG = {
   exhaustedThreshold: 95,
   windowSeconds: 2592000,
   failClosed: true,
+  // The error budget allowance, matching the app's own target
+  // (computeErrorBudgetConsumed in src/sse/services/metrics.js).
+  targetErrorRate: 0.0005,
+  requireFullWindow: true,
 };
 
 /** Build a Prometheus exposition body with the given gauge value. */
@@ -75,6 +80,18 @@ function metricsWithCounters(total, errors) {
   ].join("\n");
 }
 
+/**
+ * The exposition shape the app actually produces: one series per label
+ * combination, with the 2xx series first and the 5xx series last.
+ */
+function metricsWithLabelledSeries(series) {
+  return [
+    "# TYPE sse_requests_total counter",
+    ...series.map(([labels, value]) => `sse_requests_total${labels} ${value}`),
+    "",
+  ].join("\n");
+}
+
 // --- parseMetric -----------------------------------------------------------
 
 describe("parseMetric", () => {
@@ -96,6 +113,8 @@ describe("parseMetric", () => {
   });
 
   it("takes the last occurrence when a metric has multiple series", () => {
+    // parseMetric is the single-series reader: it is used for gauges, which
+    // the app exports without labels. Counters must be read with sumMetric.
     const body = [
       'sse_requests_total{status="2xx"} 10',
       'sse_requests_total{status="5xx"} 3',
@@ -114,6 +133,37 @@ describe("parseMetric", () => {
 
   it("ignores non-numeric values", () => {
     expect(parseMetric("sse_requests_total NaN", "sse_requests_total")).toBeNull();
+  });
+});
+
+// --- sumMetric --------------------------------------------------------------
+
+describe("sumMetric", () => {
+  it("returns null when the metric is absent", () => {
+    expect(sumMetric("other 5", "sse_requests_total")).toBeNull();
+  });
+
+  it("sums every series of a multi-series counter", () => {
+    // This is the shape the app really emits: one series per label set.
+    const body = [
+      'sse_requests_total{status="2xx",endpoint="/v1/chat/completions"} 100000',
+      'sse_requests_total{status="2xx",endpoint="/v1/messages"} 50000',
+      'sse_requests_total{status="5xx",endpoint="/v1/chat/completions"} 1',
+    ].join("\n");
+    expect(sumMetric(body, "sse_requests_total")).toBe(150001);
+  });
+
+  it("sums an unlabelled counter", () => {
+    expect(sumMetric("sse_requests_total 42", "sse_requests_total")).toBe(42);
+  });
+
+  it("ignores comment lines", () => {
+    const body = "# TYPE sse_requests_total counter\nsse_requests_total 9";
+    expect(sumMetric(body, "sse_requests_total")).toBe(9);
+  });
+
+  it("does not match a metric whose name merely starts with the target", () => {
+    expect(sumMetric("sse_requests_total_bytes 5", "sse_requests_total")).toBeNull();
   });
 });
 
@@ -137,21 +187,70 @@ describe("parseBudgetConsumed", () => {
   });
 
   it("falls back to counters when no gauge is present", () => {
-    const result = parseBudgetConsumed(metricsWithCounters(1000, 25));
+    // 25 errors out of 100 000 requests = a 0.025% error rate. Against a
+    // 0.05% error budget (99.95% availability) that is half the budget, so
+    // the consumed percentage must be 50 — not the raw error rate (0.025).
+    const result = parseBudgetConsumed(metricsWithCounters(100000, 25), BASE_CONFIG);
     expect(result.source).toBe("counters");
-    expect(result.consumedPercent).toBe(2.5);
+    expect(result.consumedPercent).toBe(50);
+  });
+
+  it("caps the consumed percentage at 100 when the budget is overrun", () => {
+    // 25 errors out of 1000 requests is 2.5% — fifty times the budget.
+    const result = parseBudgetConsumed(metricsWithCounters(1000, 25), BASE_CONFIG);
+    expect(result.consumedPercent).toBe(100);
+  });
+
+  it("agrees with the app's own budget-consumption formula", () => {
+    // The registry computes: min(1, errorRate / targetErrorRate).
+    const total = 150001;
+    const errors = 1;
+    const expected = Math.min(1, (errors / total) / BASE_CONFIG.targetErrorRate) * 100;
+    const result = parseBudgetConsumed(
+      [
+        'sse_requests_total{status="2xx",endpoint="/v1/chat/completions"} 100000',
+        'sse_requests_total{status="2xx",endpoint="/v1/messages"} 50000',
+        'sse_requests_total{status="5xx",endpoint="/v1/chat/completions"} 1',
+        'sse_error_responses_total{endpoint="/v1/chat/completions"} 1',
+      ].join("\n"),
+      BASE_CONFIG,
+    );
+    expect(result.source).toBe("counters");
+    expect(result.consumedPercent).toBeCloseTo(expected, 2);
+  });
+
+  it("sums the labelled request series rather than reading the last one", () => {
+    // A healthy service with a single error must NOT read as "100% of the
+    // budget consumed" — which is what dividing the last 5xx series by the
+    // last error series produced.
+    const result = parseBudgetConsumed(
+      [
+        'sse_requests_total{status="2xx",endpoint="/v1/chat/completions"} 100000',
+        'sse_requests_total{status="2xx",endpoint="/v1/messages"} 50000',
+        'sse_requests_total{status="5xx",endpoint="/v1/chat/completions"} 1',
+        'sse_error_responses_total{endpoint="/v1/chat/completions"} 1',
+      ].join("\n"),
+      BASE_CONFIG,
+    );
+    expect(result.consumedPercent).toBeLessThan(5);
+    expect(result.consumedPercent).toBeCloseTo(1.33, 1);
+  });
+
+  it("caps the consumed percentage at 100", () => {
+    const result = parseBudgetConsumed(metricsWithCounters(100, 90), BASE_CONFIG);
+    expect(result.consumedPercent).toBe(100);
   });
 
   it("returns null when neither signal is present", () => {
-    expect(parseBudgetConsumed("# TYPE other gauge\nother 1")).toBeNull();
+    expect(parseBudgetConsumed("# TYPE other gauge\nother 1", BASE_CONFIG)).toBeNull();
   });
 
   it("returns null for an empty body", () => {
-    expect(parseBudgetConsumed("")).toBeNull();
+    expect(parseBudgetConsumed("", BASE_CONFIG)).toBeNull();
   });
 
   it("returns null when the request counter is zero and no gauge exists", () => {
-    expect(parseBudgetConsumed(metricsWithCounters(0, 0))).toBeNull();
+    expect(parseBudgetConsumed(metricsWithCounters(0, 0), BASE_CONFIG)).toBeNull();
   });
 });
 
@@ -295,6 +394,42 @@ describe("SLO gate evaluate()", () => {
     expect(r.decision).toBe("allow");
     expect(r.exitCode).toBe(0);
     expect(r.override).toBe(true);
+  });
+
+  it("blocks when the sample is younger than the SLO window", () => {
+    // The counters live in the service process, so a sample that does not
+    // span the window cannot represent the budget over that window. Reading
+    // it as if it could would allow exactly the deploys the gate exists to
+    // catch — a crash-looping service has just reset its counters.
+    const metrics = [
+      "sse_error_budget_consumed 0",
+      "sse_metrics_sample_age_seconds 120",
+      "",
+    ].join("\n");
+    const r = evaluate({ metricsText: metrics, cfg });
+    expect(r.decision).toBe("block");
+    expect(r.exitCode).toBe(1);
+    expect(r.reason).toMatch(/window/i);
+  });
+
+  it("does not block on a short sample when the full-window requirement is disabled", () => {
+    const metrics = [
+      "sse_error_budget_consumed 0",
+      "sse_metrics_sample_age_seconds 120",
+      "",
+    ].join("\n");
+    const r = evaluate({ metricsText: metrics, cfg: { ...cfg, requireFullWindow: false } });
+    expect(r.decision).toBe("allow");
+  });
+
+  it("does not block when the sample spans the window", () => {
+    const metrics = [
+      "sse_error_budget_consumed 0.1",
+      "sse_metrics_sample_age_seconds 2592000",
+      "",
+    ].join("\n");
+    const r = evaluate({ metricsText: metrics, cfg });
+    expect(r.decision).toBe("allow");
   });
 
   it("the override also wins over unavailable SLO data", () => {
