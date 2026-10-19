@@ -15,9 +15,26 @@ import { structuredWarn } from "../utils/logger.js";
 // Latency buckets in seconds (Prometheus convention).
 const LATENCY_BUCKETS = [0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300];
 
-const counters = new Map();
-const gauges = new Map();
-const histograms = new Map();
+// The registry lives on globalThis under a namespaced key.
+//
+// The producer (the chat routes) and the exporter (/api/metrics) must see the
+// same counters. They do today because the bundler happens to emit one shared
+// module instance, but nothing enforced that: per-route bundling, Turbopack,
+// or moving the exporter into a different runtime would give /api/metrics its
+// own empty registry — and the CI SLO gate would read
+// `sse_error_budget_consumed 0`, i.e. a permanently healthy budget.
+//
+// Keeping the state on globalThis makes the sharing explicit and survives a
+// re-bundle, the same way initializeApp.js keeps its singleton.
+const REGISTRY_KEY = "__9router_sse_metrics_registry__";
+const registry = globalThis[REGISTRY_KEY] || {
+  counters: new Map(),
+  gauges: new Map(),
+  histograms: new Map(),
+};
+globalThis[REGISTRY_KEY] = registry;
+
+const { counters, gauges, histograms } = registry;
 
 function counterKey(labels) {
   return renderLabels(labels);
