@@ -176,3 +176,11 @@ export const CIRCUIT_BREAKER_SCHEMA = {
   additionalProperties: false,
 };
 
+// RTK strict mode: when true, RTK/headroom/caveman/ponytail errors propagate instead of fail-open
+// Default: false (fail-open for backward compatibility)
+// Env var override: RTK_STRICT=true|false
+export const RTK_STRICT_MODE = process.env.RTK_STRICT === "true";
+
+// Alias for consistency with ADR-006 naming
+export const rtkStrict = RTK_STRICT_MODE;
+

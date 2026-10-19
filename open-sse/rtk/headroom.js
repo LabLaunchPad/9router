@@ -4,6 +4,7 @@ import {
   openaiResponsesToOpenAIRequest,
   openaiToOpenAIResponsesRequest,
 } from "../translator/request/openai-responses.js";
+import { rtkStrict } from "../config/runtimeConfig.js";
 
 const DEFAULT_TIMEOUT_MS = 3000;
 
@@ -242,10 +243,12 @@ async function callCompress(url, messages, model, timeoutMs, compressUserMessage
   return data;
 }
 
-// Compress request body via Headroom proxy. Fail-open: returns null on any error.
+// Compress request body via Headroom proxy.
+// Fail-open by default; when rtkStrict=true, errors propagate (throw) instead of returning null.
 // /v1/compress only understands OpenAI shape, so Claude bodies are translated
 // to OpenAI, compressed, then translated back using 9Router's own translators.
-export async function compressWithHeadroom(body, { enabled, url, model, format, compressUserMessages, timeoutMs = DEFAULT_TIMEOUT_MS, diagnostics = null } = {}) {
+export async function compressWithHeadroom(body, { enabled, url, model, format, compressUserMessages, timeoutMs = DEFAULT_TIMEOUT_MS, diagnostics = null, rtkStrict: rtkStrictOverride } = {}) {
+  const strict = rtkStrictOverride !== undefined ? rtkStrictOverride : rtkStrict;
   timeoutMs = normalizeTimeout(timeoutMs);
   if (!enabled) {
     setDiagnostic(diagnostics, "disabled");
@@ -337,6 +340,7 @@ export async function compressWithHeadroom(body, { enabled, url, model, format, 
     return data;
   } catch (error) {
     setDiagnostic(diagnostics, `unexpected error: ${error?.message || String(error)}`);
+    if (strict) throw error;
     return null;
   }
 }
