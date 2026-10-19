@@ -337,14 +337,28 @@ reading it, and all of them fixed here:
   ANSI-stripped ones.
 - **The base commit has no root `vitest.config.js`**, so running it from the
   repository root left every `open-sse/...` import unresolvable: 224 of the
-  base's test files failed for that reason alone, and 284 tests failed
-  against the change's 77. That is not just noise — a file that fails in the
-  baseline for an import error **masks** a real regression in that file.
+  base's test files failed for that reason alone, and the base's failing
+  count was several times the change's. That is not just noise — a file that
+  fails in the baseline for an import error **masks** a real regression in
+  that file.
 - **The failure count was read from reporter-specific marker characters**
   (`×` / `✖`), and the baseline used a different reporter from the new run, so
   the two counts were not comparable. The count now comes from vitest's own
   summary line (`Tests  77 failed | 3695 passed | …`), which every reporter
   emits identically.
+
+> **The exact failure counts in this document are the ones measured on the
+> machine the branch was developed on, and they are not a stable property of
+> the repository.** This repository has flaky tests — at least one 5 s-timeout
+> flake and one SQLite-locking flake — so the same tree fails a different
+> number of tests from run to run, and the counts differ again between a
+> developer machine and a CI runner (the CI baseline is far higher, because
+> under `CI=true` the golden snapshot cases fail when there is no committed
+> snapshot to compare against). **The counts are not the claim; the
+> comparison is.** The authoritative statement is the one the workflow makes:
+> "no newly failing tests", measured test-by-test against the base commit.
+> Any number quoted about this repository should be quoted as "on this run",
+> never as "the repository has N failures".
 
 #### How the baseline is produced
 
@@ -382,8 +396,9 @@ The comparison itself:
   the set of failing files. A change that fixes one test and breaks another
   leaves the count unchanged. A change that breaks a *different test inside a
   file that already fails* leaves the *file* set unchanged too — and that is
-  not a corner case here: the change's suite has 42 failing files, and all 42
-  also fail on the base, so a file-level comparison is blind in the whole of
+  not a corner case here: the change's suite has dozens of failing files, and
+  every one of them also fails on the base, so a file-level comparison is
+  blind in the whole of
   the failing suite. The key is the whole line after the `FAIL` marker, and
   both shapes of it are handled, because a suite that cannot be *collected* is
   a different thing from a test that failed:
@@ -413,6 +428,44 @@ The comparison itself:
   failure-burst map — and `src/lib/localDb.js`, and a pull request touching
   either ran no CI at all. A hand-maintained list cannot stay correct.
 
+#### What the drift check cannot see
+
+The comparison is "failed on the change **and** passed on the base". A test
+that fails on **both** sides is not attributed to the change — correctly, as
+far as it goes, but the consequence is that a change which *alters* a test
+that was already broken leaves the failing set unchanged, and the gate reports
+green.
+
+That is not hypothetical. This branch committed a golden snapshot recorded on
+Windows:
+
+```
+"X-PLATFORM": "win32"             (process.platform)
+"X-PLATFORM-VERSION": "v22.23.2" (process.version)
+"User-Agent": "9Router/0.5.104"   (the app version)
+```
+
+so the suite was **red on every Linux runner**, and the gate said "no newly
+failing tests" — because the base commit has no snapshot at all and fails the
+same 150 cases. Both sides were equally red, so a comparison about
+*differences* saw nothing. A green gate over a red suite is the one
+combination that teaches a reviewer to trust nothing.
+
+Two things follow, and both are in place:
+
+- the **snapshot is portable** now: every machine- and release-dependent value
+  is normalised to a placeholder, and
+  `tests/translator/golden-snapshot-portability.test.js` is the guard. It
+  asserts the *property* — the sanitised headers are identical when
+  `process.platform` and `process.version` change — and it checks the
+  committed snapshot for a platform, a runtime version or the app version. It
+  fails against the old snapshot with `the snapshot records the platform
+  "win32"`.
+- the gate now **reports what it cannot see**. The failures that are on both
+  sides are listed, and the ones in files the change touched are called out
+  with a warning. It does not fail the build: a failure that was already
+  broken is not evidence that the change broke it.
+
 #### The defect the drift check itself found
 
 The first run of the repaired workflow found **three test suites that this
@@ -429,8 +482,9 @@ Error: ENOENT: no such file or directory, open 'C:\src\app\(dashboard)\dashboard
 ```
 
 All three **failed to collect** — a suite-level failure, not a test failure —
-so they were invisible among the 45 failing files the branch already had.
-They were passing on the base commit; the harness change is what broke them.
+so they were invisible among the dozens of failing files the branch already
+had. They were passing on the base commit; the harness change is what broke
+them.
 
 They are now the only files in the suite that did this, and each resolves the
 path from its own location, so it is correct whatever the working directory
@@ -600,6 +654,7 @@ needed for that and actively broke the exit check.
 | `SSE_STATE_DIR` | the app data dir (`DATA_DIR`) | Where the state file lives. |
 | `SSE_STATE_SNAPSHOT_INTERVAL_MS` | `5000` | Debounce / periodic snapshot interval. |
 | `SSE_STATE_PERSIST_RING` | `false` | Set `true` to also persist the sanitised ring buffer. |
+| `SSE_STATE_PERSIST_DISABLED` | `false` | Set `true` to stop writing **and** restoring. Nothing is written, nothing is read, and the decision is logged once. It does **not** delete a state file that already exists. |
 
 State file name: `sse-state.json` inside `SSE_STATE_DIR`.
 
@@ -612,13 +667,31 @@ Every failure path emits a structured JSON log:
 | `sse_state_persistence_registered` | info | Handlers registered. |
 | `sse_state_persisted` | info | Periodic snapshot written. |
 | `sse_state_persisted_on_shutdown` | info | Snapshot written during shutdown. |
+| `sse_state_shutdown_signal` | info | A shutdown signal arrived. |
+| `sse_state_shutdown_forced` | warn | A second signal arrived — the operator's force-kill gesture. |
 | `sse_state_restored` | info | State restored at startup. |
 | `sse_state_no_snapshot` | info | Nothing to restore. |
+| `sse_state_persistence_disabled` | warn | `SSE_STATE_PERSIST_DISABLED` is set. Logged **once**, not once per attempt. |
 | `sse_state_read_failed` | warn | State file unreadable. |
 | `sse_state_parse_failed` | warn | State file is not valid JSON. |
 | `sse_state_version_mismatch` | warn | State file version unknown. |
 | `sse_state_restore_failed` | error | Restore threw. |
 | `sse_state_persist_failed` | error | Write threw. |
+
+### Idempotency
+
+Restoring twice yields the same result, on the ring path as well as on the
+counters. The ring merge is a **union**, not a concatenation: a persisted
+entry that is already in the ring is not added a second time. A plain
+concatenation was not idempotent — restoring the same snapshot twice
+duplicated every entry — and the shipped idempotency test covered only the
+non-ring path, so nothing noticed.
+
+A ring entry has no id of its own, so its identity is its own content
+(timestamp, provider, model, connection, endpoint, cost, status, tokens). The
+trade-off is explicit: two genuinely identical requests — the same
+millisecond, the same model, the same cost — collapse into one. The
+alternative was a ring that grows on every restore.
 
 ### Verification
 
@@ -628,10 +701,12 @@ node -e "import('./src/sse/services/state-persistence.js')"   # module loads
 ls "$DATA_DIR/sse-state.json"                                  # after a restart
 ```
 
-Unit tests: `tests/unit/sse-state-persistence.test.js` (30 cases) covering the
+Unit tests: `tests/unit/sse-state-persistence.test.js` (33 cases) covering the
 atomic write, idempotency, secret redaction, restore round-trip, version
 mismatch, the synchronous shutdown writer, and the single-registration
-guarantee for the signal handlers.
+guarantee for the signal handlers; and
+`tests/unit/sse-state-persistence-disabled.test.js` (3 cases) covering the kill
+switch.
 
 ### Rollback
 
@@ -639,6 +714,14 @@ The feature is safe to disable without a code change:
 
 ```bash
 # Disable entirely (no file written, nothing restored)
+SSE_STATE_PERSIST_DISABLED=true
+```
+
+That switch is read at start-up, so it takes effect on the next deploy. It
+leaves an existing state file on disk — delete it if that is the intent.
+
+```bash
+# Or keep the feature and move the file elsewhere
 SSE_STATE_DIR=/dev/null          # or point it at a throwaway path
 ```
 
@@ -655,7 +738,7 @@ time.
 ### The scenarios
 
 `tests/chaos/provider-failures.test.js` covers six provider/failure scenarios
-(24 cases).
+(25 cases).
 
 | # | Scenario | What is asserted |
 |---|---|---|
@@ -723,7 +806,7 @@ The fix threads the flag down to the mutating helpers and uses the local:
 
 Fail-open remains the default: every `tests/unit/system-inject.test.js`
 assertion still passes unchanged. Strict mode is covered by
-`tests/unit/rtk-strict-mode.test.js` (19 cases).
+`tests/unit/rtk-strict-mode.test.js` (22 cases).
 
 ### Rollback
 
@@ -836,13 +919,39 @@ breaker's state (`getState()`, used by `/api/health` and `/api/metrics`) is
 side-effect free: a metrics scrape must never half-open a circuit that is
 supposed to be failing fast.
 
+### The breaker's transitions are observable
+
+Every state change emits a structured log line and increments a counter.
+
+| Event | Level | When |
+|---|---|---|
+| `sse_circuit_breaker_open` | warn | The circuit opened. |
+| `sse_circuit_breaker_half_open` | info | The cool-down elapsed and a probe was admitted. |
+| `sse_circuit_breaker_closed` | info | The circuit closed again. |
+
+Each line carries the provider, the state it came from, the state it went to,
+the failure count, the threshold and the cool-down — so a reader can tell
+"the provider was briefly flaky" from "the provider is down" without
+correlating against another line. The counter is
+`sse_circuit_breaker_transitions_total{provider,to}`.
+
+The distinction matters: the **state** gauge (`sse_circuit_breaker_state`) is
+the state at scrape time, a snapshot of a moment. It cannot say when the
+circuit opened, how long it stayed open, or whether the provider has been
+flapping. The transition is the event; the gauge is the state.
+
+The log line is emitted on a **transition**, not on every failure: a provider
+that fails once with a threshold of two has not changed state, and a line per
+failure would bury the line that matters.
+
 ### `GET /api/metrics`
 
 Prometheus text exposition. Exports `sse_requests_total`,
 `sse_error_responses_total`, `sse_request_latency_seconds` (a fixed-bucket
 histogram, so memory is bounded regardless of traffic),
 `sse_error_budget_consumed`, `sse_circuit_breaker_state`,
-`sse_metrics_sample_age_seconds`, and `sse_metrics_dropped_series_total`.
+`sse_circuit_breaker_transitions_total`, `sse_metrics_sample_age_seconds`,
+and `sse_metrics_dropped_series_total`.
 
 The `sse_error_budget_consumed` gauge is the signal the SLO gate reads. The
 sample-age gauge is what lets the gate tell whether the sample spans the SLO
@@ -893,7 +1002,7 @@ that precision — the gate prefers the gauge over the counters.
 
 ### Verification
 
-Unit tests: `tests/unit/sse-metrics.test.js` (36 cases) covering the
+Unit tests: `tests/unit/sse-metrics.test.js` (37 cases) covering the
 counters, gauges, the bounded-bucket histogram, the error-budget
 computation, the Prometheus rendering, the handler wrapper, the route
 templates, and the series ceiling.

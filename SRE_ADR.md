@@ -121,6 +121,21 @@ In-Memory State
   ├─ _lastErrorProvider (last error source)
   ├─ _recentRing (50-entry ring buffer)
   └─ _statsEmitTimers (debounced stats events)
+
+Structured JSON Logs (added by this branch)
+  │
+  ├─ one line per event, JSON, on stdout
+  ├─ sse_state_* (persistence lifecycle and every failure path)
+  ├─ sse_circuit_breaker_{open,half_open,closed} (every state transition)
+  └─ sse_metrics_dropped_series_total (the registry at its ceiling)
+
+Metrics Registry (added by this branch, in-process)
+  │
+  ├─ sse_requests_total / sse_error_responses_total
+  ├─ sse_request_latency_seconds (fixed buckets)
+  ├─ sse_error_budget_consumed (gauge — the signal the SLO gate reads)
+  ├─ sse_circuit_breaker_state (gauge) + sse_circuit_breaker_transitions_total
+  └─ sse_metrics_sample_age_seconds (the gate can tell a fresh process from a stale one)
 ```
 
 ### 2.4 Recommended Observability Additions
@@ -130,6 +145,14 @@ In-Memory State
    - `sse_requests_total` (count, by status, by provider, by endpoint)
    - `sse_request_latency_seconds` (histogram: p50, p95, p99)
    - `sse_error_budget_consumed` (gauge 0-1, derived from error rates)
+   - `sse_circuit_breaker_state` (gauge) and
+     `sse_circuit_breaker_transitions_total` (counter, by provider and by the
+     state it moved to) — the gauge is the state at scrape time, the counter
+     is the event; a breaker that opens and closes silently cannot be audited
+   - `sse_metrics_sample_age_seconds` (gauge) and
+     `sse_metrics_dropped_series_total` (counter) — the first tells the SLO
+     gate whether the sample spans the window, the second says the registry
+     hit its ceiling
    - *not implemented:* `sse_pending_requests` (gauge by model/provider) and
      `sse_active_accounts` (gauge by provider) — the pending-request figure is
      reported by `/api/health` instead of as a gauge
@@ -224,6 +247,26 @@ module runs on the request path.
 3. **Process-level metrics persistence** — save `_pendingRequests` et al. to DB on shutdown
 4. **SLO gate in deployment pipeline** — fail deployment if error budget would be exceeded
 5. **Error rule audit** — quarterly review of `ERROR_RULES` against actual error patterns
+
+> Items 1, 2, 3 and 4 are implemented by this branch. The breaker's state
+> changes are announced — a structured log line and
+> `sse_circuit_breaker_transitions_total` — because a breaker that opens and
+> closes silently is a control that cannot be audited; the state gauge is a
+> snapshot of a moment and cannot say when the circuit opened or whether the
+> provider has been flapping.
+>
+> Item 5 is not addressed by this branch.
+>
+> **The drift check's own limit.** The gate compares the *sets* of failing
+> tests between the base commit and the change, so it detects a test that
+> failed on the change and passed on the base. A test that fails on **both**
+> sides is not attributed to the change — and a change that *alters* an
+> already-broken test therefore leaves the failing set unchanged. That is not
+> hypothetical: a golden snapshot committed with machine-dependent values was
+> red on every Linux runner while the gate reported green, because the base
+> had no snapshot and failed the same cases. The snapshot is portable now, a
+> guard test keeps it that way, and the gate **reports** the failures it
+> cannot attribute, calling out the ones in files the change touched.
 
 ---
 
