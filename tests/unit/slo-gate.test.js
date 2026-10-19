@@ -15,6 +15,7 @@ import {
   evaluate,
   isLoopbackEndpoint,
   expandIPv6,
+  refuseEndpoint,
 } from "../../scripts/ci/validate-slo.mjs";
 
 const SCRIPT_PATH = path.join(
@@ -588,6 +589,31 @@ describe("expandIPv6", () => {
   });
 });
 
+describe("refuseEndpoint", () => {
+  it("accepts an ordinary http or https endpoint", () => {
+    expect(refuseEndpoint("http://metrics.internal/metrics")).toBeNull();
+    expect(refuseEndpoint("https://metrics.internal/metrics")).toBeNull();
+    expect(refuseEndpoint("http://192.168.1.20:9090/metrics")).toBeNull();
+  });
+
+  it("refuses a loopback endpoint", () => {
+    expect(refuseEndpoint("http://localhost:3000/metrics")).toMatch(/loopback/i);
+    expect(refuseEndpoint("http://127.0.0.1:3000/metrics")).toMatch(/loopback/i);
+  });
+
+  it("refuses a scheme that is not http or https", () => {
+    // A `data:` URL is read directly by the fetch, with no server involved
+    // at all — so it is a complete, self-supplied "healthy budget".
+    expect(refuseEndpoint("data:text/plain,sse_error_budget_consumed 0")).toMatch(/scheme/i);
+    expect(refuseEndpoint("file:///etc/hostname")).toMatch(/scheme/i);
+    expect(refuseEndpoint("ftp://metrics.internal/metrics")).toMatch(/scheme/i);
+  });
+
+  it("refuses an unparseable endpoint", () => {
+    expect(refuseEndpoint("not a url")).toMatch(/valid URL/i);
+  });
+});
+
 // --- process-level contract (what CI actually depends on) ------------------
 
 describe("SLO gate process exit codes", () => {
@@ -714,5 +740,75 @@ describe("the gate never queries a loopback endpoint", () => {
     } finally {
       await new Promise((resolve) => server.close(resolve));
     }
+  });
+});
+
+describe("the gate cannot be steered to a verdict by a redirect", () => {
+  /**
+   * Start a redirector and a loopback metrics server, and return the
+   * redirector's URL plus the loopback server's request count.
+   *
+   * The redirector has to be reachable at a NON-loopback address, because
+   * the point of the test is the redirect: a redirector on 127.0.0.1 is
+   * refused at the door and would prove nothing.
+   */
+  async function withRedirector(fn) {
+    const addresses = [];
+    for (const list of Object.values(networkInterfaces())) {
+      for (const ni of list || []) {
+        if (ni.family === "IPv4" && !ni.internal) addresses.push(ni.address);
+      }
+    }
+    if (addresses.length === 0) return;
+
+    let loopbackRequests = 0;
+    const loopback = createServer((req, res) => {
+      loopbackRequests += 1;
+      res.writeHead(200, { "content-type": "text/plain" });
+      res.end("sse_error_budget_consumed 0.05\nsse_metrics_sample_age_seconds 3600\n");
+    });
+    await new Promise((resolve) => loopback.listen(0, "127.0.0.1", resolve));
+    const loopbackPort = loopback.address().port;
+
+    const redirector = createServer((req, res) => {
+      res.writeHead(302, { location: `http://127.0.0.1:${loopbackPort}/metrics` });
+      res.end();
+    });
+    await new Promise((resolve) => redirector.listen(0, resolve));
+    const redirectorPort = redirector.address().port;
+
+    try {
+      await fn({
+        url: `http://${addresses[0]}:${redirectorPort}/metrics`,
+        loopbackRequests: () => loopbackRequests,
+      });
+    } finally {
+      await new Promise((resolve) => loopback.close(resolve));
+      await new Promise((resolve) => redirector.close(resolve));
+    }
+  }
+
+  it("exits 1 without following a redirect to a loopback address", async () => {
+    await withRedirector(async ({ url, loopbackRequests }) => {
+      const res = await runGate({
+        SLO_METRICS_ENDPOINT: url,
+        SLO_FETCH_TIMEOUT_MS: "5000",
+      });
+      expect(res.code).toBe(1);
+      expect(res.stderr).toMatch(/redirect/i);
+      // The loopback endpoint was never queried.
+      expect(loopbackRequests()).toBe(0);
+    });
+  });
+
+  it("exits 1 without reading a data: URL", async () => {
+    // A `data:` URL needs no server at all: it is a complete, self-supplied
+    // "healthy budget" that the fetch would read directly.
+    const res = await runGate({
+      SLO_METRICS_ENDPOINT: "data:text/plain,sse_error_budget_consumed%200.05",
+      SLO_FETCH_TIMEOUT_MS: "5000",
+    });
+    expect(res.code).toBe(1);
+    expect(res.stderr).toMatch(/scheme/i);
   });
 });

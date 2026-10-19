@@ -326,16 +326,97 @@ function emitStructuredLog(cfg, decision, consumedPercent, extra = {}) {
 // Main
 // ---------------------------------------------------------------------------
 
+/**
+ * Why the endpoint must not be read, or null when it is acceptable.
+ *
+ * One place, so the check on the configured endpoint and the check on every
+ * redirect hop cannot drift apart.
+ *
+ * @param {string} url
+ * @returns {string|null}
+ */
+export function refuseEndpoint(url) {
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return "the endpoint is not a valid URL";
+  }
+  // A scheme allow-list, not just a host check. `data:` URLs are read
+  // directly by the fetch, with no server involved at all — so
+  // `data:text/plain,sse_error_budget_consumed 0` is a complete, self-
+  // supplied "healthy budget" that never touches the network.
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    return `the endpoint uses the ${parsed.protocol} scheme, which is not http or https`;
+  }
+  if (isLoopbackEndpoint(url)) {
+    return "the endpoint is a loopback address";
+  }
+  return null;
+}
+
+/**
+ * Fetch the metrics, following redirects MANUALLY so that every hop can be
+ * checked.
+ *
+ * The default `redirect: "follow"` would hand the decision to the server
+ * being contacted: it could answer `302 Location: http://127.0.0.1:3000/`
+ * and the gate would happily read the CI runner's own metrics and allow the
+ * deploy. A direct loopback endpoint is refused; a loopback endpoint
+ * reached by redirect has to be refused too, or the refusal is only a
+ * suggestion.
+ *
+ * @param {string} url
+ * @returns {Promise<{ok:boolean, error:string|null, text:string|null}>}
+ */
 async function fetchMetrics(url) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), numEnv("SLO_FETCH_TIMEOUT_MS", 8000));
-  try {
-    const res = await fetch(url, { signal: controller.signal });
-    if (!res.ok) {
-      return { ok: false, error: `HTTP ${res.status}`, text: null };
+  const maxRedirects = numEnv("SLO_MAX_REDIRECTS", 3);
+  const originalScheme = (() => {
+    try {
+      return new URL(url).protocol;
+    } catch {
+      return "";
     }
-    const text = await res.text();
-    return { ok: true, error: null, text };
+  })();
+  try {
+    let current = url;
+    for (let hop = 0; hop <= maxRedirects; hop++) {
+      const res = await fetch(current, { signal: controller.signal, redirect: "manual" });
+
+      if (res.status >= 300 && res.status < 400) {
+        const location = res.headers.get("location");
+        if (!location) {
+          return { ok: false, error: `HTTP ${res.status} with no Location header`, text: null };
+        }
+        let next;
+        try {
+          next = new URL(location, current).href;
+        } catch {
+          return { ok: false, error: `HTTP ${res.status} with an unusable Location header`, text: null };
+        }
+        const refusal = refuseEndpoint(next);
+        if (refusal) {
+          return { ok: false, error: `HTTP ${res.status} redirecting to an unacceptable endpoint: ${refusal}`, text: null };
+        }
+        // A redirect that downgrades the transport is refused too: metrics
+        // fetched over plaintext can be rewritten in transit, and the
+        // budget figure would be the attacker's.
+        if (originalScheme === "https:" && new URL(next).protocol === "http:") {
+          return { ok: false, error: `HTTP ${res.status} redirecting from https to http`, text: null };
+        }
+        current = next;
+        continue;
+      }
+
+      if (!res.ok) {
+        return { ok: false, error: `HTTP ${res.status}`, text: null };
+      }
+      const text = await res.text();
+      return { ok: true, error: null, text };
+    }
+    return { ok: false, error: `more than ${maxRedirects} redirects`, text: null };
   } finally {
     clearTimeout(timeout);
   }
@@ -623,7 +704,7 @@ export async function main() {
 
   const endpoint = cfg.metricsEndpoint;
 
-  // ---- Refuse a loopback endpoint ----
+  // ---- Refuse an unacceptable endpoint ----
   //
   // The requirement is absolute: the gate must NEVER read a loopback
   // endpoint. On a CI runner `http://localhost:3000/metrics` measures the
@@ -632,28 +713,33 @@ export async function main() {
   // is indistinguishable from the summary of a healthy service.
   //
   // The check above refuses an UNSET endpoint. This one refuses a SET but
-  // loopback endpoint. Both are needed, and neither substitutes for the
+  // unacceptable endpoint. Both are needed, and neither substitutes for the
   // other: an unset endpoint is a configuration error, a loopback endpoint is
   // a measurement of the wrong thing.
+  //
+  // The same check is applied to every redirect hop, in `fetchMetrics`, so
+  // an endpoint cannot hand the decision to the server it points at.
   //
   // The refusal is unconditional. There is no flag for it: a gate that has
   // been told to read the runner's own metrics cannot tell a healthy runner
   // from a healthy service, so no setting makes that safe. The release paths
-  // remain SLO_GATE_SKIP and the audited SLO_GATE_OVERRIDE_APPROVED, and
-  // neither of them queries anything — the override exits before this point.
-  if (isLoopbackEndpoint(endpoint)) {
+  // remain SLO_GATE_SKIP and the audited SLO_GATE_OVERRIDE_APPROVED — and
+  // neither of them queries anything, because the override exits before this
+  // point.
+  const refusal = refuseEndpoint(endpoint);
+  if (refusal) {
     const decision = {
       decision: "block",
       exitCode: 1,
-      reason: "SLO_METRICS_ENDPOINT points at a loopback address",
+      reason: `SLO_METRICS_ENDPOINT is not acceptable: ${refusal}`,
     };
-    emitStructuredLog(cfg, decision, null, { loopbackEndpoint: true, endpoint });
+    emitStructuredLog(cfg, decision, null, { unacceptableEndpoint: true, endpoint });
     console.error(
       buildSummary(cfg, decision, null, {
         note:
-          "SLO_METRICS_ENDPOINT points at a loopback address (" +
+          "SLO_METRICS_ENDPOINT is not acceptable (" + refusal + "): " +
           endpoint +
-          "). A loopback endpoint measures the CI runner, not the deployed " +
+          ". A loopback endpoint measures the CI runner, not the deployed " +
           "service, so the gate would report a healthy error budget and " +
           "allow a deploy that was never validated. Point " +
           "SLO_METRICS_ENDPOINT at the deployed service's metrics URL, or at " +
