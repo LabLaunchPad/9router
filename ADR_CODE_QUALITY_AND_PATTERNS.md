@@ -33,7 +33,7 @@
 | `open-sse/handlers/ttsProviders/index.js:15-25` | `SPECIAL_ADAPTERS` has 9 providers hardcoded | HIGH |
 | `open-sse/handlers/ttsCore.js:57-64` | Adapter dispatch hardcoded in `handleTtsCore` | MEDIUM |
 | `open-sse/handlers/ttsProviders/index.js:33` | Dynamic `import()` inside `synthesizeViaConfig()` | MEDIUM |
-| `src/app/layout.js:49` | Hardcoded `setTimeout(f, 1000)` for font loading | MEDIUM |
+| `src/app/layout.js:45` | ~~Hardcoded `setTimeout(f, 1000)` for font loading~~ | **RESOLVED** — reduced to `setTimeout(f, 500)` |
 | `src/app/layout.js:28` | ~~`fontPreconnect` defined but `<link rel="preconnect">` not added to HTML head~~ | **RESOLVED** — removed; `next/font`'s `Inter()` emits the preconnect itself |
 
 ### 1.4 Error Handling Consistency
@@ -151,8 +151,8 @@ register("claude", "openai", (model, body, stream, credentials) => {
 - `SPECIAL_ADAPTERS` in `open-sse/handlers/ttsProviders/index.js` - 9 providers hardcoded
 - `handleTtsCore` adapter dispatch logic - provider list hardcoded
 - `synthesizeViaConfig()` dynamic import inside function body
-- Font preconnect constant defined but not used in HTML head
-- Font loading timeout hardcoded at 1000ms
+- ~~Font preconnect constant defined but not used in HTML head~~ — RESOLVED (removed; `next/font` emits the preconnect itself)
+- ~~Font loading timeout hardcoded at 1000ms~~ — RESOLVED (reduced to 500ms)
 
 ---
 
@@ -188,7 +188,7 @@ register("claude", "openai", (model, body, stream, credentials) => {
 1. **FIX**: Move `SPECIAL_ADAPTERS` to provider registry entries with `ttsAdapter` field (ADR-001)
 2. **FIX**: Update test imports from `@/` to relative paths (ADR-002) 
 3. **FIX**: Add `<link rel="preconnect">` to layout head (ADR-003)
-4. **FIX**: Reduce font loading timeout from 1s to 500ms (ADR-003)
+4. ~~**FIX**: Reduce font loading timeout from 1s to 500ms (ADR-003)~~ — **DONE**
 5. **FIX**: Move adapter registry to provider registry entries (ADR-001 follow-up)
 6. **FIX**: Move `synthesizeViaConfig` import to module level (ADR-001 follow-up)
 7. **FIX**: Refactor `handleTtsCore` to be more config-driven (ADR-001 follow-up)
@@ -196,8 +196,8 @@ register("claude", "openai", (model, body, stream, credentials) => {
 ### 3.4 Migration Path from Current State to Ideal State
 
 **Phase 1: Quick Wins (1-2 days)**
-- Add `<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>` to `src/app/layout.js`
-- Reduce font loading timeout from 1000ms to 500ms
+- ~~Add `<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>` to `src/app/layout.js`~~ — **DONE** (not needed: `next/font`'s `Inter()` emits it)
+- ~~Reduce font loading timeout from 1000ms to 500ms~~ — **DONE**
 - Update vitest config alias to use absolute path: `{find: /^@\\//, replacement: resolve(__dirname, "../../src") + "/"}`
 
 **Phase 2: Medium-term (1-2 weeks)**
@@ -217,8 +217,8 @@ register("claude", "openai", (model, body, stream, credentials) => {
 | Debt Item | Status | Discoverd | Effort | Impact | Risk |
 |-----------|--------|-----------|--------|--------|------|
 | vitest alias resolution - 5 test files need import path updates | pending | 2026-10-19 | 1 hour | HIGH | low |
-| Font preconnect defined but not used in layout | pending | 2026-10-19 | 5 min | HIGH | very-low |
-| FONT LOADING TIMEOUT at 1s | pending | 2026-10-19 | 5 min | MEDIUM | very-low |
+| Font preconnect defined but not used in layout | resolved | 2026-10-19 | 5 min | HIGH | very-low |
+| FONT LOADING TIMEOUT at 1s | resolved | 2026-10-19 | 5 min | MEDIUM | very-low |
 | SPECIAL_ADAPTERS hardcoded in ttsProviders/index.js | pending | 2026-10-19 | 2-3 hours | HIGH | medium |
 | synthesizeViaConfig dynamic import() inside function body | pending | 2026-10-19 | 1 hour | MEDIUM | low |
 | handleTtsCore adapter logic not fully config-driven | pending | 2026-10-19 | 1-2 hours | MEDIUM | low |

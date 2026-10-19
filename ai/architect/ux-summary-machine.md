@@ -8,7 +8,7 @@
 | Inter font import & config | 14-17 | `const inter = Inter({ subsets: ["latin"], variable: "--font-inter" })` |
 | ~~Font preconnect declaration~~ | — | **Removed.** `next/font`'s `Inter()` emits the preconnect to `fonts.gstatic.com` itself; the dead constant, the dead viewport entry and the invalid inline `<script>` that tried to inject the `<link>` are gone. |
 | Theme persistence script | 42-46 | `dangerouslySetInnerHTML` with localStorage theme check |
-| Font loading script | 47-51 | 1s timeout (`setTimeout(f,1000)`) to add `fonts-loaded` class |
+| Font loading script | 45 | 500ms timeout (`setTimeout(f,500)`) to add the `fonts-loaded` class |
 | Google Analytics | 59 | `<GoogleAnalytics gaId={"G-LC959F603F"} />` |
 
 ### src/app/globals.css
@@ -44,7 +44,7 @@
 | Section | Key Finding | Location |
 |---------|-------------|----------|
 | Google Analytics impact | ~100-300ms FCP/LCP added | Line 25-30 |
-| Font loading render-blocking | Material Symbols opacity 0 → 1, 3s→1s timeout | Line 38-43 |
+| Font loading render-blocking | Material Symbols opacity 0 → 1, 3s→500ms timeout | Line 38-43 |
 | Tailwind v4 purging risk | `optimizePackageImports` changed behavior | Line 45-49 |
 | Images unoptimized risk | `unoptimized: true` prevents automatic format/conversion | Line 51-55 |
 | Client component hydration | ~40+ components with `"use client"` | Line 57-64 |
@@ -58,7 +58,7 @@
 ### 1. Font Loading Optimization Strategy
 - **Decision**: Critical font preloading with invisible fallback transition
 - **Current**: Inter via next/font/google + preconnect; Material Symbols with opacity 0→1 transition
-- **1s timeout**: Balances visual completeness vs perceived performance (reduced from 3s)
+- **500ms timeout**: Balances visual completeness vs perceived performance (reduced from 3s, then from 1s)
 - **Preconnect**: Emitted automatically by `next/font`'s `Inter()` — no manual `<link>` needed
 - **Target**: <500ms text rendering, immediate Inter visibility
 

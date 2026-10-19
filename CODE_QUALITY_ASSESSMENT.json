@@ -56,11 +56,12 @@
       "status": "resolved"
     },
     {
-      "location": "src/app/layout.js:49",
-      "pattern": "setTimeout(f, 1000) font loading",
+      "location": "src/app/layout.js:45",
+      "pattern": "setTimeout(f, 500) font loading",
       "severity": "MEDIUM",
-      "description": "Hardcoded 1-second timeout before forcing 'fonts-loaded' class",
-      "conventionViolation": "Performance: Hardcoded timeout without adaptive behavior"
+      "description": "RESOLVED: the timeout before forcing the 'fonts-loaded' class was hardcoded at 1000ms and has been reduced to 500ms.",
+      "conventionViolation": "Performance: Hardcoded timeout without adaptive behavior",
+      "status": "resolved"
     }
   ],
   "providerRegistrationPattern": {
@@ -101,7 +102,7 @@
       "SPECIAL_ADAPTERS: 9 provider→adapter mappings hardcoded",
       "handleTtsCore adapter dispatch: provider list hardcoded",
       "synthesizeViaConfig(): dynamic import inside function",
-      "font loading timeout: hardcoded 1000ms"
+      "font loading timeout: hardcoded 500ms (reduced from 1000ms)"
     ],
     "convention": "open-sse/AGENTS.md line 24: NEVER hardcode values, models, or block/role strings — use config/ + schema/ constants"
   },

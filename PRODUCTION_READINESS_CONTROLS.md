@@ -76,8 +76,8 @@ would divide one provider's error count by another provider's request count.
 | `SLO_EXHAUSTED_THRESHOLD` | `95` | Percent. |
 | `SLO_WINDOW_SECONDS` | `2592000` | 30 days. See the window note below. |
 | `SLO_TARGET_ERROR_RATE` | `0.0005` | The error budget allowance. Must match the app's own target (99.95% availability). |
-| `SLO_REQUIRE_FULL_WINDOW` | `false` | Opt in: block when the sample is younger than the window. |
-| `SLO_MIN_SAMPLE_SECONDS` | `0` | Opt in: block when the sample is thinner than this. `0` disables the check. |
+| `SLO_REQUIRE_FULL_WINDOW` | `false` | Opt in: block when the sample is younger than the window. An unknown age also blocks. |
+| `SLO_MIN_SAMPLE_SECONDS` | `0` | Opt in: block when the sample is thinner than this. `0` disables the check. An unknown age also blocks. |
 | `SLO_FAIL_CLOSED` | `true` | Set `false` to fail open **on data problems**. A missing endpoint still blocks. |
 | `SLO_FETCH_TIMEOUT_MS` | `8000` | Metrics request timeout. |
 | `SLO_GATE_OVERRIDE_APPROVED` | `false` | Emergency override. Audited. |
@@ -118,6 +118,14 @@ When the endpoint does not publish the sample-age gauge at all, the gate says
 so in the reason (`sample age unknown`) rather than pretending the window was
 covered.
 
+**An explicitly-enabled check is not silently bypassed by an unknown age.** If
+the operator turns `SLO_REQUIRE_FULL_WINDOW` or `SLO_MIN_SAMPLE_SECONDS` on and
+the endpoint cannot answer the question — because it does not publish
+`sse_metrics_sample_age_seconds` — the gate blocks (or warns, with
+`SLO_FAIL_CLOSED=false`) rather than passing. An unknown is not a pass: a knob
+that quietly does nothing is the same defect as a knob that does not exist.
+With both checks off, which is the default, an unknown age is only reported.
+
 The script has **zero runtime dependencies** (native `fetch`, Node 18+), so the
 CI job needs no `npm install` for it.
 
@@ -147,7 +155,7 @@ is a self-contained job with no dependencies on the drift steps).
   slo-validation-gate:
     runs-on: ubuntu-latest
     needs: test-drift
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    if: '!cancelled() && github.event_name == ''push'' && (github.ref == ''refs/heads/main'' || github.ref == ''refs/heads/master'')'
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -171,7 +179,7 @@ is a self-contained job with no dependencies on the drift steps).
           echo "::error::SLO_METRICS_ENDPOINT is not configured. The SLO gate fails closed."
           exit 1
       - name: 🔍 Run SLO validation gate
-        if: env.SLO_GATE_SKIP != 'true' && env.SLO_GATE_OVERRIDE_APPROVED != 'true'
+        if: vars.SLO_GATE_SKIP != 'true' && vars.SLO_GATE_OVERRIDE_APPROVED != 'true'
         continue-on-error: false
         env:
           SLO_METRICS_ENDPOINT: ${{ secrets.SLO_METRICS_ENDPOINT }}
@@ -192,6 +200,12 @@ Three things in that wiring are load-bearing and easy to get wrong:
 - **The branch.** This repository's default branch is `master`, not `main`.
   The trigger and the job condition both list `main` and `master`; a workflow
   that names only `main` never runs here.
+- **The step condition reads `vars.`, not `env.`.** A step's own `if` is
+  evaluated before that step's `env:` block is applied to it, so
+  `env.SLO_GATE_SKIP` there resolves to the empty string whatever the
+  repository variable is set to — the documented skip would be a no-op. `vars`
+  is repository-scoped and has no such ordering question. The `env:` block
+  still carries the values to the script.
 - **`SLO_GATE_SKIP` must reach the gate step**, not only the pre-check.
   Otherwise the skip only changes the error message while the gate still
   fails closed — and the log would claim a skip that never happened.
@@ -200,9 +214,62 @@ Three things in that wiring are load-bearing and easy to get wrong:
   would make the override unusable in exactly the misconfigured-endpoint case
   it exists for.
 
+The gate job's condition is `!cancelled() && …`, so it still runs and reports
+its decision when the drift check failed. A bare condition would skip the gate
+whenever its dependency failed, leaving the operator with one red job and no
+SLO verdict.
+
 Disabling the gate is possible, but only through the explicit, visible
 `SLO_GATE_SKIP` repository variable — and a skip is always reported in the job
 summary, never silently treated as a pass.
+
+### The drift check the gate rides on
+
+The gate job lives inside `.github/workflows/drift-prevention.yml`, so that
+workflow has to actually work for the gate to ever run. It had three
+independent reasons not to, all of them fixed here:
+
+- **`npm ci` can never work in this repository.** `package-lock.json` is
+  gitignored (`.gitignore` line 63), so `npm ci` fails with `EUSAGE` on every
+  run and the job died at its first step. The workflow uses `npm install`, like
+  the `Dockerfile` and the `gitbook-pages` workflow already do. The cost is
+  that the installed tree is not pinned; committing a lockfile is a maintainer
+  decision about the repository's dependency policy, not a side effect of this
+  branch.
+- **The baseline was the same commit as the run it was compared against.**
+  Running the suite twice on one tree cannot detect a regression: with
+  identical code on both sides the failure sets are identical, so the
+  comparison only ever detects *flakes* — and it hard-failed the job on them.
+  The baseline is now the **base commit**: the workflow checks it out, runs the
+  suite there, and checks the change back out. "Fails now, passed on the
+  base" then means what it says.
+- **The failure count was read from reporter-specific marker characters**
+  (`×` / `✖`), and the baseline used a different reporter from the new run, so
+  the two counts were not comparable. The count now comes from vitest's own
+  summary line (`Tests  77 failed | 3695 passed | …`), which every reporter
+  emits identically.
+
+The comparison itself:
+
+- The **set** of failing files is compared, not just the count. A change that
+  fixes one test and breaks another leaves the count unchanged; the file set
+  does not.
+- A **newly failing file is re-run on its own** and judged by its exit code.
+  A test that passes on the second run was flaky, and a flaky test must not
+  fail the build. A candidate that cannot be run at all is *not* a pass — it
+  stays a regression, because an unknown is not evidence that the change is
+  innocent.
+- **Unresolvable imports are compared too.** This repository has test files
+  that import packages nobody declared (`lowdb`); those are part of the known
+  pre-existing failures, so an unresolvable import is not a failure on its
+  own. A *new* one is: it means the change added a dependency that does not
+  exist.
+- The `paths:` filter covers the whole source tree (`src/**`, `open-sse/**`,
+  `scripts/**`, `tests/**`) rather than an enumeration of the files the
+  controls happen to touch. An earlier list missed
+  `src/shared/constants/providers.js` — which keys the breaker and the
+  failure-burst map — and `src/lib/localDb.js`, and a pull request touching
+  either ran no CI at all. A hand-maintained list cannot stay correct.
 
 ### Verification
 
@@ -544,16 +611,30 @@ right:
   failure *per account*. Counting those separately would open the circuit
   after a single request and let one client take a whole provider out of
   service for the cool-down window. Failures for the same provider within
-  `PROVIDER_FAILURE_BURST_MS` (2 s) are therefore collapsed into one.
+  `failureBurstMs` (2 s by default, per provider, configurable through
+  `CIRCUIT_BREAKER_CONFIG`) are therefore collapsed into one.
+- **The burst window is anchored at the start of the burst** and is not moved
+  by a failure that was suppressed. If it slid, then during a continuous
+  outage every failure would fall inside the window, only the first would be
+  counted, and the circuit would stay closed for the whole outage — the
+  provider is hammered by every request and every account is locked in the
+  meantime, which is the exact situation the breaker exists for. A failure
+  that is more than `failureBurstMs` after the last *counted* failure starts a
+  new burst and is counted.
 
 The half-open state admits exactly **one** probe request. The probe slot is
 claimed by `canRequest()` and released by the success/failure record — and
 explicitly by `releaseProbe()` on the paths where no upstream request is made
 at all (no credentials, every account locked), because otherwise the
 provider would be blackholed for the whole reset window by a purely local
-problem. Reading the breaker's state (`getState()`, used by `/api/health` and
-`/api/metrics`) is side-effect free: a metrics scrape must never half-open a
-circuit that is supposed to be failing fast.
+problem. A provider that *answers* — even with a `401` or a `429` — also
+resolves the probe: the probe asked "does this provider work now?", the
+provider replied, so the probe succeeded. Without that, a recovered provider
+that answered `429` would be blackholed for the rest of the reset window
+(fifteen minutes by default) even though it was working. Reading the
+breaker's state (`getState()`, used by `/api/health` and `/api/metrics`) is
+side-effect free: a metrics scrape must never half-open a circuit that is
+supposed to be failing fast.
 
 ### `GET /api/metrics`
 

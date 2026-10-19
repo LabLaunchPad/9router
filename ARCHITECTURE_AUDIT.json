@@ -175,10 +175,11 @@
           "id": "ISSUE-005",
           "severity": "medium",
           "category": "Font loading timeout not minimized",
-          "location": "src/app/layout.js line 49: setTimeout(f, 1000) // 1s timeout",
-          "description": "The font loading script has a 1-second timeout before forcing 'fonts-loaded' class. While 1s is better than the typical 3s, it could be further reduced or made configurable based on connection quality.",
+          "location": "src/app/layout.js line 45: setTimeout(f, 500) // 500ms timeout",
+          "description": "RESOLVED. The font loading script has a timeout before forcing the 'fonts-loaded' class. It was 1 second and has been reduced to 500ms, so the class is added twice as early.",
           "conventionViolation": "Performance: Hardcoded timeout without adaptive behavior.",
-          "fix": "Make the timeout configurable via env var or reduce further with critical font preload."
+          "fix": "DONE. The timeout was reduced from 1000ms to 500ms. Making it configurable via an env var is still open.",
+          "status": "resolved"
         },
         {
           "id": "ISSUE-006",

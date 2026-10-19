@@ -400,7 +400,7 @@ User calls /api/tts with {provider: "openai", model: "gpt-4o-mini-tts"}
 | `open-sse/handlers/ttsCore.js:57-64` | Adapter dispatch: `if (getTtsAdapter(provider))` | Check provider registry for `ttsAdapter` field |
 | `open-sse/handlers/ttsProviders/index.js:33` | `import("@/shared/constants/providers")` inside `synthesizeViaConfig()` | Module-level `import { AI_PROVIDERS } from "@/shared/constants/providers"` |
 | `src/app/layout.js:28` | ~~`fontPreconnect = "https://fonts.gstatic.com"`~~ | **RESOLVED** — removed; `next/font`'s `Inter()` emits the preconnect itself |
-| `src/app/layout.js:49` | `setTimeout(f, 1000)` | Configurable via env var or reduced to 500ms |
+| `src/app/layout.js:45` | ~~`setTimeout(f, 1000)`~~ | **RESOLVED** — reduced to 500ms |
 
 ### 4.3 The SPECIAL_ADAPTERS Problem (ISSUE-001)
 
@@ -663,7 +663,7 @@ export async function handleTtsCore({ provider, model, input, credentials, respo
 - [ ] `synthesizeViaConfig` uses module-level import (no dynamic import inside function)
 - [ ] `handleTtsCore` has no hardcoded provider lists
 - [ ] All test imports resolve correctly in vitest
-- [ ] Font preconnect and timeout fixes deployed
+- [x] Font preconnect and timeout fixes deployed
 - [ ] Drift prevention CI checks passing
 
 ---

@@ -12,7 +12,7 @@
 ### Current State
 - **Inter font**: Loaded via `next/font/google` with `subsets: ["latin"]` and `variable: "--font-inter"` (layout.js line 14-17)
 - **Material Symbols Outlined**: Loaded via `import "material-symbols/outlined.css"` (layout.js line 3), with `.material-symbols-outlined { opacity: 0; }` in globals.css (line 7)
-- **Font loading script**: Inline script (layout.js line 47-51) with 1s timeout (reduced from 3s per perf analysis) to add `fonts-loaded` class
+- **Font loading script**: Inline script (layout.js line 45) with a 500ms timeout (reduced from 3s, then from 1s, per the perf analysis) to add the `fonts-loaded` class
 - **Preconnect**: Emitted automatically by `next/font`'s `Inter()` — the dead `fontPreconnect` constant, the dead viewport entry and the invalid inline `<script>` that tried to inject the `<link>` were removed
 
 ### Decision: Font Loading Strategy
@@ -20,10 +20,10 @@
 - **Rationale**: 
   - Inter font is the primary text font; preconnect already in place
   - Material Symbols use opacity transition rather than `font-display: swap` to avoid FOUC
-  - 1s timeout balances visual completeness with perceived performance
+  - 500ms timeout balances visual completeness with perceived performance
 - **Implementation**:
   - Keep preconnect link (already in viewport metadata)
-  - Keep 1s font loading timeout (layout.js line 49)
+  - Keep the 500ms font loading timeout (layout.js line 45)
   - Maintain opacity transition in globals.css (lines 7-8)
   - Consider `font-display: swap` for Inter as secondary optimization
 
