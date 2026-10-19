@@ -355,6 +355,16 @@ jobs:
             echo "::endgroup::"
             if [ -n "$BASE_SHA" ]; then
               git diff --name-only "$BASE_SHA" HEAD > changed-files.txt 2>/dev/null || true
+              # The count is reported, because a `git diff` that fails leaves
+              # an empty file and the refinement below silently stops
+              # working. A refinement that cannot be seen to work is a
+              # refinement that is not there.
+              CHANGED_COUNT=$(grep -c '[^[:space:]]' changed-files.txt 2>/dev/null || true)
+              if [ "${CHANGED_COUNT:-0}" -eq 0 ]; then
+                echo "::warning::Could not list the files this change touched — the masked failures are reported without the 'in a file this change touched' refinement."
+              else
+                echo "Files changed by this branch: $CHANGED_COUNT"
+              fi
               TOUCHED_MASKED=$(while read -r key; do
                 [ -z "$key" ] && continue
                 file=$(printf '%s' "$key" | sed 's/ > .*//; s/ \[ .*//')
@@ -367,6 +377,8 @@ jobs:
                 echo "::group::Masked failures in files this change touched:"
                 printf '%s\n' "$TOUCHED_MASKED"
                 echo "::endgroup::"
+              else
+                echo "No masked failure is in a file this change touched."
               fi
             fi
           fi
