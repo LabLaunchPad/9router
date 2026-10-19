@@ -268,12 +268,7 @@ export function writeSnapshotSync(snapshot) {
   fsSync.mkdirSync(CONFIG.dir, { recursive: true });
 
   const payload = JSON.stringify(snapshot, null, 2);
-  let fd;
-  try {
-    fd = fsSync.openSync(tmp, "w");
-  } catch (err) {
-    throw err;
-  }
+  const fd = fsSync.openSync(tmp, "w");
   try {
     fsSync.writeFileSync(fd, payload, "utf8");
     try {
@@ -376,8 +371,16 @@ export function restoreSnapshot(snapshot, globals = global) {
       if (!globals._recentRing.initialized) {
         // Deliberately NOT setting `initialized` here: usageRepo's
         // ensureRingInitialized() uses that flag to decide whether to
-        // rehydrate the ring from SQLite. Claiming it here would silently
-        // discard the persisted request history.
+        // rehydrate the ring from SQLite, and it REPLACES recentRing.items
+        // wholesale when it does. Setting the flag here would permanently
+        // suppress that rehydration and the ring would only ever hold the
+        // persisted slice.
+        //
+        // The merge below is therefore a best-effort extra, not the source
+        // of truth: SQLite is authoritative, and once ensureRingInitialized()
+        // has run the persisted items are replaced by the rehydrated ones.
+        // That is the intended order — the persisted ring is a fallback for
+        // the case where the SQLite rehydration fails.
         globals._recentRing.items = [
           ...snapshot.recentRing.items,
           ...(globals._recentRing.items || []),
@@ -487,7 +490,15 @@ export function registerStatePersistence(options = {}) {
   let persistedForShutdown = false;
 
   const onSignal = (signal) => {
-    if (persistedForShutdown) return;
+    if (persistedForShutdown) {
+      // A second signal is the operator's force-kill gesture. The first one
+      // already wrote the snapshot, and this handler is still registered
+      // (process.on, not process.once), so Node's default "terminate on
+      // signal" behaviour is suppressed. Without this, a second Ctrl-C
+      // would be swallowed and the process would keep running.
+      structuredWarn("sse_state_shutdown_forced", { signal });
+      process.exit(1);
+    }
     persistedForShutdown = true;
 
     structuredInfo("sse_state_shutdown_signal", { signal, pendingDebounce: pendingSnapshot });
