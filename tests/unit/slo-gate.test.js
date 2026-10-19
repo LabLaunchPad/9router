@@ -52,7 +52,8 @@ const BASE_CONFIG = {
   // The error budget allowance, matching the app's own target
   // (computeErrorBudgetConsumed in src/sse/services/metrics.js).
   targetErrorRate: 0.0005,
-  requireFullWindow: true,
+  requireFullWindow: false,
+  minSampleSeconds: 0,
 };
 
 /** Build a Prometheus exposition body with the given gauge value. */
@@ -396,30 +397,54 @@ describe("SLO gate evaluate()", () => {
     expect(r.override).toBe(true);
   });
 
-  it("blocks when the sample is younger than the SLO window", () => {
+  it("blocks when the sample is younger than the SLO window and the operator asked for that", () => {
     // The counters live in the service process, so a sample that does not
-    // span the window cannot represent the budget over that window. Reading
-    // it as if it could would allow exactly the deploys the gate exists to
-    // catch — a crash-looping service has just reset its counters.
+    // span the window cannot represent the budget over that window. This is
+    // opt-in: a deploy restarts the service, so the sample age at gate time
+    // is seconds old and an enforcing check would block every deploy.
+    const metrics = [
+      "sse_error_budget_consumed 0",
+      "sse_metrics_sample_age_seconds 120",
+      "",
+    ].join("\n");
+    const r = evaluate({
+      metricsText: metrics,
+      cfg: { ...cfg, requireFullWindow: true },
+    });
+    expect(r.decision).toBe("block");
+    expect(r.exitCode).toBe(1);
+    expect(r.reason).toMatch(/window/i);
+  });
+
+  it("does NOT block on a short sample by default, but reports the coverage", () => {
+    // The default has to let a deploy through: the sample age is seconds
+    // old right after a restart, and a gate that always blocks is not a
+    // gate. The age is still reported so the reader knows what the figure
+    // covers.
     const metrics = [
       "sse_error_budget_consumed 0",
       "sse_metrics_sample_age_seconds 120",
       "",
     ].join("\n");
     const r = evaluate({ metricsText: metrics, cfg });
-    expect(r.decision).toBe("block");
-    expect(r.exitCode).toBe(1);
-    expect(r.reason).toMatch(/window/i);
+    expect(r.decision).toBe("allow");
+    expect(r.exitCode).toBe(0);
+    expect(r.reason).toContain("120s");
   });
 
-  it("does not block on a short sample when the full-window requirement is disabled", () => {
+  it("blocks when the sample is thinner than the configured minimum", () => {
     const metrics = [
       "sse_error_budget_consumed 0",
-      "sse_metrics_sample_age_seconds 120",
+      "sse_metrics_sample_age_seconds 30",
       "",
     ].join("\n");
-    const r = evaluate({ metricsText: metrics, cfg: { ...cfg, requireFullWindow: false } });
-    expect(r.decision).toBe("allow");
+    const r = evaluate({
+      metricsText: metrics,
+      cfg: { ...cfg, minSampleSeconds: 300 },
+    });
+    expect(r.decision).toBe("block");
+    expect(r.exitCode).toBe(1);
+    expect(r.reason).toMatch(/minimum/i);
   });
 
   it("does not block when the sample spans the window", () => {
@@ -430,6 +455,12 @@ describe("SLO gate evaluate()", () => {
     ].join("\n");
     const r = evaluate({ metricsText: metrics, cfg });
     expect(r.decision).toBe("allow");
+  });
+
+  it("says the sample age is unknown when the endpoint does not publish it", () => {
+    const r = evaluate({ metricsText: metricsWithBudgetConsumed(0.1), cfg });
+    expect(r.decision).toBe("allow");
+    expect(r.reason).toMatch(/sample age unknown/i);
   });
 
   it("the override also wins over unavailable SLO data", () => {

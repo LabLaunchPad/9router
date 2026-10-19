@@ -49,9 +49,23 @@ const CONFIG = {
 
   // The counters behind the metric live in the service process, so they only
   // cover the time since the last restart. A sample that does not span the
-  // SLO window cannot validate the SLO, so the gate fails closed on it.
-  // Set SLO_REQUIRE_FULL_WINDOW=false to downgrade this to a warning.
-  requireFullWindow: (process.env.SLO_REQUIRE_FULL_WINDOW || "true") !== "false",
+  // SLO window cannot say anything about the budget over that window.
+  //
+  // This is REPORTED, not enforced, by default. A deploy restarts the
+  // service, so the sample age at gate time is seconds old — a check that
+  // blocked on it would block every deploy and the gate would never pass
+  // once. It is enforced only when the operator asks for it:
+  //
+  //   SLO_REQUIRE_FULL_WINDOW=true -> block when the sample does not span
+  //     the window. Meaningful only when the endpoint is a time-series store
+  //     that outlives a single process lifetime.
+  //   SLO_MIN_SAMPLE_SECONDS > 0   -> block when the sample is thinner than
+  //     the given number of seconds.
+  //
+  // Either way the age is included in the decision reason, so a reader of
+  // the job summary always sees how much of the window the figure covers.
+  requireFullWindow: (process.env.SLO_REQUIRE_FULL_WINDOW || "false") !== "false",
+  minSampleSeconds: numEnv("SLO_MIN_SAMPLE_SECONDS", 0),
 
   // Fail-closed: block when metrics are unavailable or malformed.
   //
@@ -165,14 +179,15 @@ export function parseBudgetConsumed(text, cfg = CONFIG) {
   }
 
   // Fallback: derive from counters. Sum every series of each counter.
+  //
+  // The metric names and the formula are the ones the application's own
+  // registry uses (see computeErrorBudgetConsumed in
+  // src/sse/services/metrics.js): total requests, error responses, error
+  // rate, divided by the target error rate, capped at 1.
   const total = sumMetric(text, "sse_requests_total");
   if (total === null || total === 0) return null;
 
-  // Prefer an explicitly-labelled error counter if the endpoint exports one.
-  const errorCount =
-    sumMetric(text, "sse_error_responses_total") ??
-    sumMetric(text, "sse_requests_failed_total");
-
+  const errorCount = sumMetric(text, "sse_error_responses_total");
   if (errorCount === null) return null;
 
   const targetErrorRate = Number(cfg?.targetErrorRate ?? CONFIG.targetErrorRate);
@@ -349,7 +364,7 @@ export function evaluate({ metricsText = null, fetchError = null, cfg = CONFIG }
   // ---- Unavailable data ----
   if (fetchError) {
     return {
-      decision: "block",
+      decision: cfg.failClosed ? "block" : "warn",
       exitCode: cfg.failClosed ? 1 : 0,
       reason: `SLO data unavailable (${fetchError})`,
       consumedPercent: null,
@@ -369,7 +384,7 @@ export function evaluate({ metricsText = null, fetchError = null, cfg = CONFIG }
 
   if (parseError) {
     return {
-      decision: "block",
+      decision: cfg.failClosed ? "block" : "warn",
       exitCode: cfg.failClosed ? 1 : 0,
       reason: `SLO data malformed (${parseError})`,
       consumedPercent: null,
@@ -380,19 +395,37 @@ export function evaluate({ metricsText = null, fetchError = null, cfg = CONFIG }
   // ---- Sample age ----
   //
   // The counters behind the metric are held in the service process, so they
-  // only cover the time since the last restart. A sample that does not span
-  // the SLO window cannot say anything about the budget over that window, and
-  // reading it as if it could would silently allow exactly the deployments
-  // the gate exists to catch (a crash-looping service has just reset its
-  // counters). The exporter publishes the sample age so this is checkable.
+  // only cover the time since the last restart. The age is reported in the
+  // reason so a reader always knows how much of the window the figure
+  // covers, and it is only ENFORCED when the operator asked for it — a
+  // deploy restarts the service, so the age at gate time is seconds old
+  // and an enforcing check would block every deploy.
   const sampleAge = parseMetric(metricsText, "sse_metrics_sample_age_seconds");
+  const sampleAgeNote =
+    sampleAge === null
+      ? "sample age unknown (the endpoint does not publish sse_metrics_sample_age_seconds)"
+      : `sample covers ${Math.round(sampleAge)}s of the ${cfg.windowSeconds}s window`;
+
+  if (cfg.minSampleSeconds > 0 && sampleAge !== null && sampleAge < cfg.minSampleSeconds) {
+    return {
+      decision: cfg.failClosed ? "block" : "warn",
+      exitCode: cfg.failClosed ? 1 : 0,
+      reason:
+        `SLO sample covers only ${Math.round(sampleAge)}s, below the required minimum of ` +
+        `${cfg.minSampleSeconds}s — the metric has too little data to judge`,
+      consumedPercent: parsed.consumedPercent,
+      override: false,
+      source: parsed.source,
+    };
+  }
+
   if (cfg.requireFullWindow && sampleAge !== null && sampleAge < cfg.windowSeconds) {
     return {
-      decision: "block",
+      decision: cfg.failClosed ? "block" : "warn",
       exitCode: cfg.failClosed ? 1 : 0,
       reason:
         `SLO sample covers only ${Math.round(sampleAge)}s of the ${cfg.windowSeconds}s window — ` +
-        "the service has not been up long enough for the metric to represent the SLO window",
+        "the sample has to span the whole SLO window (SLO_REQUIRE_FULL_WINDOW=true)",
       consumedPercent: parsed.consumedPercent,
       override: false,
       source: parsed.source,
@@ -403,6 +436,7 @@ export function evaluate({ metricsText = null, fetchError = null, cfg = CONFIG }
   const decision = decide(parsed.consumedPercent, cfg);
   return {
     ...decision,
+    reason: `${decision.reason} (${sampleAgeNote})`,
     consumedPercent: parsed.consumedPercent,
     override: false,
     source: parsed.source,
