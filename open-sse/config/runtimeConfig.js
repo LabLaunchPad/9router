@@ -126,32 +126,80 @@ export const CIRCUIT_BREAKER_CONFIG = {
   },
 };
 
-// Simple schema validation for circuit breaker config
-// Validates: failureThreshold (positive integer), coolDownWindowMs (positive int ms), resetWindowMs (positive int ms)
+// The schema is the CONTRACT: the validator below is derived from it, so
+// the two cannot drift apart.
+//
+// It used to be a second, hand-written copy of the same rules that nothing
+// read — and the copy was already wrong: it omitted `failureBurstMs` and
+// forbade additional properties, while the validator accepted both. A
+// schema that validates nothing is worse than no schema, because it
+// advertises a guarantee that is not there.
+export const CIRCUIT_BREAKER_SCHEMA = {
+  // Validates a single circuit breaker config entry
+  // All fields are optional; missing fields fall back to defaults
+  type: "object",
+  properties: {
+    failureThreshold: {
+      type: "integer",
+      minimum: 1,
+      message: "failureThreshold must be a positive integer",
+    },
+    coolDownWindowMs: {
+      type: "integer",
+      minimum: 1,
+      message: "coolDownWindowMs must be a positive integer (milliseconds)",
+    },
+    resetWindowMs: {
+      type: "integer",
+      minimum: 1,
+      message: "resetWindowMs must be a positive integer (milliseconds)",
+    },
+    failureBurstMs: {
+      type: "integer",
+      minimum: 0,
+      message: "failureBurstMs must be a non-negative integer (milliseconds)",
+    },
+  },
+  // Strict: an unknown setting is a typo, and a typo in a breaker config is
+  // a breaker that does not behave the way its author read it.
+  additionalProperties: false,
+};
+
+/**
+ * Validate one circuit breaker config entry against CIRCUIT_BREAKER_SCHEMA.
+ *
+ * The rules come from the schema, so there is exactly one description of
+ * what a valid config is. The thresholds it decides are the ones that take
+ * a provider out of service, so a silently-accepted `failureThreshold: 0`
+ * would trip a healthy provider on its first request.
+ *
+ * @param {object} config
+ * @returns {{ valid: boolean, errors: string[] }}
+ */
 export function validateCircuitBreakerConfig(config) {
   const errors = [];
+  if (!config || typeof config !== "object") {
+    return { valid: false, errors: ["config must be an object"] };
+  }
 
-  if (config.failureThreshold !== undefined) {
-    if (!Number.isInteger(config.failureThreshold) || config.failureThreshold < 1) {
-      errors.push("failureThreshold must be a positive integer");
+  for (const [field, rule] of Object.entries(CIRCUIT_BREAKER_SCHEMA.properties)) {
+    const value = config[field];
+    // Every field is optional: a missing one falls back to the default.
+    if (value === undefined) continue;
+    if (rule.type === "integer" && !Number.isInteger(value)) {
+      errors.push(rule.message);
+      continue;
+    }
+    if (typeof rule.minimum === "number" && value < rule.minimum) {
+      errors.push(rule.message);
     }
   }
 
-  if (config.coolDownWindowMs !== undefined) {
-    if (!Number.isInteger(config.coolDownWindowMs) || config.coolDownWindowMs < 1) {
-      errors.push("coolDownWindowMs must be a positive integer (milliseconds)");
-    }
-  }
-
-  if (config.resetWindowMs !== undefined) {
-    if (!Number.isInteger(config.resetWindowMs) || config.resetWindowMs < 1) {
-      errors.push("resetWindowMs must be a positive integer (milliseconds)");
-    }
-  }
-
-  if (config.failureBurstMs !== undefined) {
-    if (!Number.isInteger(config.failureBurstMs) || config.failureBurstMs < 0) {
-      errors.push("failureBurstMs must be a non-negative integer (milliseconds)");
+  if (CIRCUIT_BREAKER_SCHEMA.additionalProperties === false) {
+    for (const field of Object.keys(config)) {
+      if (!(field in CIRCUIT_BREAKER_SCHEMA.properties)) {
+        errors.push(`${field} is not a circuit breaker setting`);
+      }
     }
   }
 
@@ -171,29 +219,6 @@ for (const [providerId, providerConfig] of Object.entries(CIRCUIT_BREAKER_CONFIG
     console.warn(`CIRCUIT_BREAKER_CONFIG.providers.${providerId} is invalid:`, pv.errors);
   }
 }
-
-// Schema validation for circuit breaker config
-export const CIRCUIT_BREAKER_SCHEMA = {
-  // Validates a single circuit breaker config entry
-  // All fields are optional; missing fields fall back to defaults
-  type: "object",
-  properties: {
-    failureThreshold: {
-      type: "integer",
-      minimum: 1,
-    },
-    coolDownWindowMs: {
-      type: "integer",
-      minimum: 1,
-    },
-    resetWindowMs: {
-      type: "integer",
-      minimum: 1,
-    },
-  },
-  // Allow additional properties to false for strict validation
-  additionalProperties: false,
-};
 
 // RTK strict mode: when true, RTK/headroom/caveman/ponytail errors propagate instead of fail-open
 // Default: false (fail-open for backward compatibility)
