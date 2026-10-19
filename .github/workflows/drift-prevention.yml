@@ -267,6 +267,8 @@ jobs:
               if [ ! -f "$candidate" ]; then
                 echo "::warning::$candidate does not exist in the working tree"
                 echo "$candidate" >> still-failing.txt
+                echo "$candidate (could not be run — it does not exist in the working tree)" \
+                  >> confirmed-regressions.txt
                 continue
               fi
               set +e
@@ -292,6 +294,9 @@ jobs:
             if [ -s still-failing.txt ]; then
               echo "::error::⚠️ Regression: these tests fail on the change and passed on the base:"
               cat confirmed-regressions.txt
+              echo ""
+              echo "::error::⚠️ In these files:"
+              cat still-failing.txt
               exit 1
             fi
             echo "No confirmed regressions."
@@ -332,8 +337,8 @@ jobs:
           echo "=== Drift Prevention Check Complete ==="
           if [ "$BASELINE_AVAILABLE" = "true" ]; then
             echo "✅ Baseline: the base commit, run with the same test configuration"
-            echo "✅ Failure diff: the failing-file SET, compared file by file"
-            echo "✅ Flake re-run: each candidate re-run on its own, judged by its exit code"
+            echo "✅ Failure diff: the failing-TEST set, compared test by test"
+            echo "✅ Flake re-run: each candidate re-run on its own, judged by the failing tests it reports"
             echo "✅ Import resolution: unresolvable imports COMPARED between the two runs"
           else
             echo "ℹ️  No base commit for this event — the comparison did not apply"
