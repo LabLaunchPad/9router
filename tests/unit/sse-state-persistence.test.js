@@ -295,6 +295,53 @@ describe("restoreSnapshot", () => {
     expect(g._droppedOnRestart.byModel["m (p)"]).toBe(4);
   });
 
+  it("is idempotent on the ring path too", () => {
+    // The ring merge used to PREPEND the persisted items on every restore,
+    // so restoring the same snapshot twice duplicated every entry — the
+    // module's own contract ("restoring twice yields the same result") was
+    // false, and the shipped idempotency test above covered only the
+    // non-ring path, so nothing noticed.
+    const g = freshGlobals();
+    const snap = buildSnapshot({
+      ...g,
+      _pendingRequests: { byModel: { "m (p)": 4 }, byAccount: {} },
+    });
+    // The ring is only persisted when the ring is enabled; put one entry in
+    // the snapshot by hand so the test does not depend on that setting.
+    snap.recentRing = {
+      items: [
+        { timestamp: "2026-01-01T00:00:00.000Z", provider: "openai", model: "gpt-4o", status: "ok", cost: 0.01 },
+      ],
+    };
+
+    restoreSnapshot(snap, g);
+    const afterFirst = g._recentRing.items.length;
+    expect(afterFirst).toBe(1);
+
+    restoreSnapshot(snap, g);
+    expect(g._recentRing.items.length).toBe(afterFirst);
+    expect(g._recentRing.items[0].model).toBe("gpt-4o");
+  });
+
+  it("keeps a live ring entry that happens to look like a persisted one", () => {
+    // The merge is a union by content, not a replacement: a live entry is
+    // not dropped because the persisted snapshot also holds it.
+    const g = freshGlobals();
+    const entry = {
+      timestamp: "2026-01-01T00:00:00.000Z",
+      provider: "openai",
+      model: "gpt-4o",
+      status: "ok",
+      cost: 0.01,
+    };
+    g._recentRing.items = [{ ...entry }];
+    const snap = buildSnapshot(g);
+    snap.recentRing = { items: [{ ...entry }] };
+
+    restoreSnapshot(snap, g);
+    expect(g._recentRing.items.length).toBe(1);
+  });
+
   it("returns false for a null snapshot", () => {
     expect(restoreSnapshot(null, freshGlobals())).toBe(false);
   });

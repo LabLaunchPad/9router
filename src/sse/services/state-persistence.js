@@ -53,11 +53,41 @@ const CONFIG = {
   // data written to disk. Off by default.
   persistRecentRing: process.env.SSE_STATE_PERSIST_RING === "true",
 
+  // A kill switch. The rollback table in the PR advertises this variable, so
+  // it has to exist: an operator needs a way to stop the state file being
+  // written without a redeploy. It stops the writes AND the restore; it does
+  // NOT remove a state file that already exists.
+  persistEnabled: process.env.SSE_STATE_PERSIST_DISABLED !== "true",
+
   // Max ring entries to persist when enabled.
   maxRingEntries: 50,
 };
 
 const STATE_VERSION = 1;
+
+// Whether the "persistence is disabled" notice has already been logged. A
+// disabled feature that logs on every attempt would be noise; one that never
+// logs would be invisible. Exactly one line, the first time the decision is
+// acted on.
+let disabledNoticeLogged = false;
+
+/**
+ * True when the operator has switched persistence off.
+ *
+ * The decision is logged once, with the reason, so a disabled state file is
+ * a visible choice and not a mystery.
+ */
+function persistenceDisabled() {
+  if (CONFIG.persistEnabled) return false;
+  if (!disabledNoticeLogged) {
+    disabledNoticeLogged = true;
+    structuredWarn("sse_state_persistence_disabled", {
+      env: "SSE_STATE_PERSIST_DISABLED",
+      note: "no snapshot will be written or restored; an existing state file is left in place",
+    });
+  }
+  return true;
+}
 
 // Fields permitted on a ring entry. Everything else is dropped.
 const RING_ENTRY_ALLOWED_FIELDS = [
@@ -110,6 +140,37 @@ function sanitizeRingEntry(entry) {
   }
 
   return Object.keys(safe).length > 0 ? safe : null;
+}
+
+/**
+ * A stable identity for a ring entry, used to merge without duplicating.
+ *
+ * A ring entry carries no id of its own — the allow-list keeps only
+ * timestamp/provider/model/connectionId/endpoint/cost/status/tokens — so the
+ * identity is the entry's own content. The `tokens` bag is an object, so its
+ * keys are sorted before it is serialised: two bags with the same pairs in a
+ * different order are the same entry.
+ *
+ * The trade-off is that two genuinely identical requests — the same
+ * millisecond, the same model, the same cost — collapse into one. The ring
+ * is a 50-entry "recent requests" view, and the alternative was a ring that
+ * grows on every restore.
+ *
+ * @param {object} entry
+ * @returns {string}
+ */
+function ringEntryKey(entry) {
+  if (!entry || typeof entry !== "object") return "";
+  return RING_ENTRY_ALLOWED_FIELDS
+    .map((field) => {
+      const value = entry[field];
+      if (value === null || value === undefined) return "";
+      if (typeof value === "object") {
+        return JSON.stringify(Object.keys(value).sort().map((k) => [k, value[k]]));
+      }
+      return String(value);
+    })
+    .join("\u0000");
 }
 
 /**
@@ -226,6 +287,7 @@ function tempFilePath(tag = "w") {
  * @param {object} snapshot
  */
 export async function writeSnapshot(snapshot) {
+  if (persistenceDisabled()) return null;
   const target = stateFilePath();
   const tmp = tempFilePath();
 
@@ -280,6 +342,7 @@ export async function writeSnapshot(snapshot) {
  * @param {object} snapshot
  */
 export function writeSnapshotSync(snapshot) {
+  if (persistenceDisabled()) return null;
   const target = stateFilePath();
   const tmp = tempFilePath("sync");
 
@@ -400,8 +463,26 @@ export function restoreSnapshot(snapshot, globals = global) {
         // has run the persisted items are replaced by the rehydrated ones.
         // That is the intended order — the persisted ring is a fallback for
         // the case where the SQLite rehydration fails.
+        //
+        // The merge is a UNION, not a concatenation. A plain concatenation
+        // was not idempotent: restoring the same snapshot twice added every
+        // persisted entry a second time, so the ring grew on every restore
+        // and the module's own contract — "restoring twice yields the same
+        // result" — was false. It was false only on the ring path, and the
+        // shipped idempotency test covered the non-ring path, so nothing
+        // noticed.
+        const existing = new Set((globals._recentRing.items || []).map(ringEntryKey));
+        const fresh = [];
+        for (const item of snapshot.recentRing.items) {
+          const key = ringEntryKey(item);
+          // An entry with no content has no identity; keeping it would let
+          // it be added again on every restore.
+          if (!key || existing.has(key)) continue;
+          existing.add(key);
+          fresh.push(item);
+        }
         globals._recentRing.items = [
-          ...snapshot.recentRing.items,
+          ...fresh,
           ...(globals._recentRing.items || []),
         ].slice(-CONFIG.maxRingEntries);
       }
@@ -434,6 +515,7 @@ const attachedHandlers = {};
  * Persist a snapshot now (async, non-blocking).
  */
 export async function persistNow() {
+  if (persistenceDisabled()) return false;
   try {
     const snapshot = buildSnapshot();
     const target = await writeSnapshot(snapshot);
@@ -467,6 +549,7 @@ export function scheduleSnapshot() {
  * Restore any persisted state. Call once during startup.
  */
 export async function restorePersistedState() {
+  if (persistenceDisabled()) return false;
   const snapshot = await readSnapshot();
   if (!snapshot) {
     structuredInfo("sse_state_no_snapshot", {});
@@ -523,12 +606,17 @@ export function registerStatePersistence(options = {}) {
     structuredInfo("sse_state_shutdown_signal", { signal, pendingDebounce: pendingSnapshot });
     pendingSnapshot = false;
     try {
-      const snapshot = buildSnapshot();
-      const target = writeSnapshotSync(snapshot);
-      structuredInfo("sse_state_persisted_on_shutdown", {
-        path: target,
-        pendingModels: Object.keys(snapshot.pendingRequests.byModel).length,
-      });
+      if (persistenceDisabled()) {
+        // The operator has switched persistence off. There is nothing to
+        // write, and the "disabled" notice has already been logged.
+      } else {
+        const snapshot = buildSnapshot();
+        const target = writeSnapshotSync(snapshot);
+        structuredInfo("sse_state_persisted_on_shutdown", {
+          path: target,
+          pendingModels: Object.keys(snapshot.pendingRequests.byModel).length,
+        });
+      }
     } catch (err) {
       structuredError("sse_state_persist_failed", { reason: err?.message });
     }
@@ -558,6 +646,7 @@ export function registerStatePersistence(options = {}) {
     dir: CONFIG.dir,
     intervalMs: CONFIG.snapshotDebounceMs,
     persistRecentRing: CONFIG.persistRecentRing,
+    persistEnabled: CONFIG.persistEnabled,
   });
 
   return true;
@@ -573,6 +662,10 @@ export function registerStatePersistence(options = {}) {
 export function __resetForTests() {
   handlersRegistered = false;
   pendingSnapshot = false;
+  // The "persistence is disabled" notice is logged once per process, which
+  // is the behaviour in production. A test that wants to observe it has to
+  // be able to start from a clean slate.
+  disabledNoticeLogged = false;
   if (snapshotTimer) {
     clearTimeout(snapshotTimer);
     snapshotTimer = null;
