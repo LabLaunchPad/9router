@@ -241,8 +241,13 @@ jobs:
           # pattern that asked for exactly one space never matched anything,
           # so every run reported "Tests 0 passed" and the fallback hid it.
           # The field is taken out of the summary line instead.
-          BASELINE_PASSED=$(grep -E '^[[:space:]]*Tests[[:space:]]+' baseline-results.txt | tail -1 | grep -oE '[0-9]+ passed' | head -1 || true)
-          NEW_PASSED=$(grep -E '^[[:space:]]*Tests[[:space:]]+' new-results.txt | tail -1 | grep -oE '[0-9]+ passed' | head -1 || true)
+          #
+          # The match is "3760 passed", and the echo below adds its own unit,
+          # so the match is reduced to the bare number first. Without that,
+          # the line read "Baseline: Tests 3415 passed passed" — which is
+          # exactly what the first run with this fix printed.
+          BASELINE_PASSED=$(grep -E '^[[:space:]]*Tests[[:space:]]+' baseline-results.txt | tail -1 | grep -oE '[0-9]+ passed' | head -1 | cut -d' ' -f1 || true)
+          NEW_PASSED=$(grep -E '^[[:space:]]*Tests[[:space:]]+' new-results.txt | tail -1 | grep -oE '[0-9]+ passed' | head -1 | cut -d' ' -f1 || true)
           echo "Baseline: Tests ${BASELINE_PASSED:-0} passed"
           echo "New: Tests ${NEW_PASSED:-0} passed"
 

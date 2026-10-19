@@ -214,4 +214,24 @@ describe("the drift workflow: the summary it prints", () => {
   it("does not use the one-space pattern that never matched", () => {
     expect(WORKFLOW).not.toContain("grep -o 'Tests [0-9]* passed'");
   });
+
+  it("does not print the unit twice", () => {
+    // The extraction yields "3760 passed" and the echo adds its own "passed".
+    // Without a reduction in between, CI printed
+    //   Baseline: Tests 3415 passed passed
+    // — which is how the first run with the fixed pattern turned out.
+    const pattern = passedCountPattern("BASELINE_PASSED=");
+    const summary = "      Tests  82 failed | 3760 passed | 14 expected fail | 110 skipped | 1 todo (3967)";
+    const matched = summary.match(new RegExp(pattern))?.[0];
+    expect(matched).toBe("3760 passed");
+
+    // The match is reduced to the bare number...
+    const extract = WORKFLOW.split(/\r?\n/).find((l) => l.includes("BASELINE_PASSED="));
+    expect(extract, "the match must be reduced to the bare number").toMatch(/cut -d' ' -f1/);
+
+    // ...and the echo puts the unit back exactly once.
+    const echo = WORKFLOW.split(/\r?\n/).find((l) => l.includes('echo "Baseline: Tests'));
+    expect(echo).toContain('${BASELINE_PASSED:-0} passed');
+    expect(echo).not.toContain("passed passed");
+  });
 });
