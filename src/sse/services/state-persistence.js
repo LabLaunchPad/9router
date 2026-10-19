@@ -34,6 +34,7 @@
 
 import fs from "node:fs/promises";
 import fsSync from "node:fs";
+import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { DATA_DIR } from "@/lib/dataDir.js";
 import { structuredInfo, structuredWarn, structuredError } from "../utils/logger.js";
@@ -204,7 +205,20 @@ function stateFilePath() {
 let tempCounter = 0;
 function tempFilePath(tag = "w") {
   tempCounter += 1;
-  return `${stateFilePath()}.${process.pid}.${tag}.${tempCounter}.tmp`;
+  // The name carries a random component and the file is opened with O_EXCL.
+  //
+  // The name used to be fully predictable — `<state file>.<pid>.<w|sync>.<n>.tmp`
+  // — and opened with O_CREAT|O_TRUNC and no O_EXCL. In a state directory
+  // that another local user can write to, that user could pre-create the
+  // name as a symlink and the next snapshot write would truncate whatever
+  // it pointed at. O_EXCL makes a name that already exists a failure rather
+  // than something to be written through, and the random component means the
+  // name is not worth pre-creating in the first place.
+  //
+  // It also keeps the async writer and the synchronous shutdown writer from
+  // colliding: they overlap, and a shared path means one writer truncates
+  // the other's file.
+  return `${stateFilePath()}.${process.pid}.${tag}.${tempCounter}.${randomUUID()}.tmp`;
 }
 
 /**
@@ -218,7 +232,11 @@ export async function writeSnapshot(snapshot) {
   await fs.mkdir(CONFIG.dir, { recursive: true });
 
   const payload = JSON.stringify(snapshot, null, 2);
-  const handle = await fs.open(tmp, "w");
+  // "wx" is O_CREAT | O_EXCL | O_WRONLY: the file must not already exist.
+  // 0600: the state file is not world-readable, even though it holds no
+  // secret — it holds operational state that has no business being read by
+  // another user on the machine. The mode is preserved by the rename below.
+  const handle = await fs.open(tmp, "wx", 0o600);
   try {
     await handle.writeFile(payload, "utf8");
     // fsync the file contents before the rename so the rename cannot expose
@@ -268,7 +286,8 @@ export function writeSnapshotSync(snapshot) {
   fsSync.mkdirSync(CONFIG.dir, { recursive: true });
 
   const payload = JSON.stringify(snapshot, null, 2);
-  const fd = fsSync.openSync(tmp, "w");
+  // "wx" is O_CREAT | O_EXCL | O_WRONLY — see the async writer above.
+  const fd = fsSync.openSync(tmp, "wx", 0o600);
   try {
     fsSync.writeFileSync(fd, payload, "utf8");
     try {
