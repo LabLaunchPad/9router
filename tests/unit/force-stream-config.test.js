@@ -1,5 +1,5 @@
 // Guards forceStream moved from chatCore hardcode → PROVIDERS schema (#5).
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 const { executeMock } = vi.hoisted(() => ({
   executeMock: vi.fn(),
@@ -130,6 +130,26 @@ function makeOptions(bodyStream) {
 }
 
 describe("forceStream provider config", () => {
+  // The handler is imported dynamically, and its module graph is large
+  // enough that a cold import can take longer than the default 5s test
+  // timeout on a loaded runner.
+  //
+  // That timeout was not a visible failure: the test was abandoned, the
+  // handler kept running in the background, and it called the mocked
+  // executor again during the NEXT test — which then failed with "expected
+  // 1 times, but got 2 times". The suite passed when it ran alone and
+  // failed when it ran alongside any other file, which is the worst shape
+  // a flake can have.
+  //
+  // The import is paid once, here, outside the test timeout, so the timeout
+  // measures the behaviour under test and not the module graph. The hook
+  // gets an explicit timeout of its own: a hook that times out does not
+  // fail the tests, it SKIPS them, and a test that silently stops running
+  // is worse than one that fails loudly.
+  beforeAll(async () => {
+    await import("../../open-sse/handlers/chatCore.js");
+  }, 60_000);
+
   beforeEach(() => {
     executeMock.mockReset();
     executeMock.mockRejectedValue(new Error("boom"));
@@ -153,5 +173,5 @@ describe("forceStream provider config", () => {
 
     expect(executeMock).toHaveBeenCalledTimes(1);
     expect(executeMock.mock.calls[0][0].stream).toBe(true);
-  });
+  }, 30_000);
 });
