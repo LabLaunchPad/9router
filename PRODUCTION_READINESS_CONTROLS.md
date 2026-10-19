@@ -284,7 +284,7 @@ Each part of that is load-bearing:
 | Inside the repository | Node's module resolution walks up from it and finds the change's `node_modules` |
 | The change's `vitest.config.js`, copied in | The base has no root config, and without the aliases 224 of its test files fail to import. The two runs then differ only in the code under test |
 | `cwd = <base>/tests`, project root = `<base>` | The base's own test files resolve their fixtures with `path.resolve("../src/...")`, which is relative to the **cwd**. The base ran vitest from `tests/`, so `..` was the repository root; running the base from the root would make its tests read the *change's* source files. With the cwd inside the extracted tree they read the base's |
-| Project root one level up | The reported test paths are `tests/...` in both runs, so the two failing-file sets are directly comparable |
+| Project root one level up | The reported test paths are `tests/...` in both runs, so the two failing-test sets are directly comparable |
 
 Two further rules, both about not degrading silently:
 
@@ -298,13 +298,28 @@ Two further rules, both about not degrading silently:
 
 The comparison itself:
 
-- The **set** of failing files is compared, not just the count. A change that
-  fixes one test and breaks another leaves the count unchanged; the file set
-  does not.
-- A **newly failing file is re-run on its own** and judged by its exit code.
-  A test that passes the second run was flaky, and a flaky test must not
-  fail the build. A candidate that cannot be run at all is *not* a pass — it
-  stays a regression, because an unknown is not evidence that the change is
+- The **set of failing tests** is compared, not just the count, and not just
+  the set of failing files. A change that fixes one test and breaks another
+  leaves the count unchanged. A change that breaks a *different test inside a
+  file that already fails* leaves the *file* set unchanged too — and that is
+  not a corner case here: the change's suite has 42 failing files, and all 42
+  also fail on the base, so a file-level comparison is blind in the whole of
+  the failing suite. The key is the whole line after the `FAIL` marker, and
+  both shapes of it are handled, because a suite that cannot be *collected* is
+  a different thing from a test that failed:
+
+  ```
+  FAIL  tests/x.test.js > suite > test name      a test failure
+  FAIL  tests/x.test.js [ tests/x.test.js ]      the suite could not be collected
+  ```
+
+- A **newly failing test is re-run on its own**, and the re-run is judged on
+  the failing *tests* it reports, not on the file's exit code. A file that
+  already had a failing test on the base exits non-zero when it is re-run,
+  whatever the new failure is doing, so the exit code would confirm every
+  candidate. A test that does not reproduce was flaky, and a flaky test must
+  not fail the build. A candidate that cannot be run at all is *not* a pass —
+  it stays a regression, because an unknown is not evidence that the change is
   innocent.
 - **Unresolvable imports are compared too.** This repository has test files
   that import packages nobody declared (`lowdb`); those are part of the known

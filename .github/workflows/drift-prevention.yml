@@ -216,36 +216,52 @@ jobs:
           fi
 
           # The failure COUNT alone is not enough: a change that fixes one
-          # test and breaks another leaves the count unchanged. Compare the
-          # SET of failing files instead — a file that fails now and did not
-          # fail in the baseline is a regression introduced by this change.
+          # test and breaks another leaves the count unchanged.
           #
-          # The FAIL line is emitted by every reporter (" FAIL  tests/x.test.js
-          # > suite > test"), so the two runs are comparable.
-          grep -oE 'FAIL +tests/[^ ]+\.test\.js' baseline-results.txt \
-            | grep -oE 'tests/[^ ]+\.test\.js' | sort -u > baseline-failing-files.txt || true
-          grep -oE 'FAIL +tests/[^ ]+\.test\.js' new-results.txt \
-            | grep -oE 'tests/[^ ]+\.test\.js' | sort -u > new-failing-files.txt || true
-          NEWLY_FAILING=$(comm -13 baseline-failing-files.txt new-failing-files.txt || true)
+          # The comparison is at TEST level, not at file level. A file that
+          # already fails on the base is in the baseline's failing set, so a
+          # change that breaks a DIFFERENT test inside that file does not
+          # appear in the file sets at all. This repository has 45 failing
+          # files on the base, so a file-level comparison is blind in almost
+          # the whole suite.
+          #
+          # Two shapes of FAIL line are handled, and both are needed:
+          #
+          #   FAIL  tests/x.test.js > suite > test name   a test failure
+          #   FAIL  tests/x.test.js [ tests/x.test.js ]   the suite could not
+          #                                                     be collected
+          #
+          # The whole line after the marker is the key, so the two runs are
+          # comparable and a collection failure is not mistaken for a test
+          # failure.
+          grep -oE 'FAIL +tests/[^ ]+\.test\.js.*' baseline-results.txt \
+            | sed -e 's/^FAIL  *//' -e 's/[[:space:]]*$//' | sort -u \
+            > baseline-failing-tests.txt || true
+          grep -oE 'FAIL +tests/[^ ]+\.test\.js.*' new-results.txt \
+            | sed -e 's/^FAIL  *//' -e 's/[[:space:]]*$//' | sort -u \
+            > new-failing-tests.txt || true
+          NEWLY_FAILING=$(comm -13 baseline-failing-tests.txt new-failing-tests.txt || true)
           if [ -n "$NEWLY_FAILING" ]; then
             echo "::group::Candidate regressions (failed on the change, passed on the base):"
             echo "$NEWLY_FAILING"
             echo "::endgroup::"
-            # Re-run just those files. A test that passes on the second run
-            # was flaky, not broken — and a flaky test must not fail the
-            # build. (This repository has at least one 5s-timeout flake.)
+            # Re-run each candidate file and check whether the SPECIFIC test
+            # still fails. A test that passes on the second run was flaky,
+            # not broken — and a flaky test must not fail the build. (This
+            # repository has at least one 5s-timeout flake.)
             #
-            # Each candidate is run on its OWN and judged by its exit code
-            # (0 = every test in that file passed). Parsing the reporter's
-            # output is not usable here: a reporter does not necessarily
-            # print a line for a file whose tests all passed, so "no line"
-            # cannot be told apart from "not run".
+            # The re-run is judged on the failing TESTS it reports, not on
+            # its exit code: a file that already had a failing test on the
+            # base still exits non-zero when it is re-run, so the exit code
+            # would flag every file it was ever able to.
             #
             # A candidate that cannot be run at all is NOT a pass: it stays
             # a regression. An unknown is not evidence that the change is
             # innocent.
-            echo "$NEWLY_FAILING" | grep -v '^[[:space:]]*$' | sort -u > candidate-failing-files.txt
+            echo "$NEWLY_FAILING" | sed 's/ > .*//; s/ \[ .*//' \
+              | grep -v '^[[:space:]]*$' | sort -u > candidate-failing-files.txt
             : > still-failing.txt
+            : > confirmed-regressions.txt
             while read -r candidate; do
               [ -z "$candidate" ] && continue
               if [ ! -f "$candidate" ]; then
@@ -254,23 +270,33 @@ jobs:
                 continue
               fi
               set +e
-              npx vitest run "$candidate" > /dev/null 2>&1
-              code=$?
+              npx vitest run "$candidate" > rerun-raw.txt 2>&1
               set -e
-              if [ "$code" -ne 0 ]; then
-                echo "$candidate" >> still-failing.txt
-              else
-                echo "::warning::$candidate passed on the re-run — flaky, not broken."
-              fi
+              sed -r 's/\x1B\[[0-9;]*[a-zA-Z]//g' rerun-raw.txt > rerun-results.txt
+              grep -oE 'FAIL +tests/[^ ]+\.test\.js.*' rerun-results.txt \
+                | sed -e 's/^FAIL  *//' -e 's/[[:space:]]*$//' | sort -u \
+                > rerun-failing-tests.txt || true
+              # The keys of THIS file that the change newly broke.
+              grep -F "$candidate > " <<< "$NEWLY_FAILING" > candidate-tests.txt || true
+              grep -F "$candidate [ " <<< "$NEWLY_FAILING" >> candidate-tests.txt || true
+              while read -r key; do
+                [ -z "$key" ] && continue
+                if grep -Fxq "$key" rerun-failing-tests.txt; then
+                  echo "$key" >> confirmed-regressions.txt
+                  echo "$candidate" >> still-failing.txt
+                else
+                  echo "::warning::$key passed on the re-run — flaky, not broken."
+                fi
+              done < candidate-tests.txt
             done < candidate-failing-files.txt
             if [ -s still-failing.txt ]; then
-              echo "::error::⚠️ Regression: these files fail on the change and passed on the base:"
-              cat still-failing.txt
+              echo "::error::⚠️ Regression: these tests fail on the change and passed on the base:"
+              cat confirmed-regressions.txt
               exit 1
             fi
             echo "No confirmed regressions."
           else
-            echo "No newly failing test files."
+            echo "No newly failing tests."
           fi
 
           # Unresolvable imports, compared the same way. This repository has
