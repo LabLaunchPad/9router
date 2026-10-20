@@ -986,6 +986,16 @@ breaker's state (`getState()`, used by `/api/health` and `/api/metrics`) is
 side-effect free: a metrics scrape must never half-open a circuit that is
 supposed to be failing fast.
 
+A request the **client** abandoned is not an answer, and is not recorded as
+one. The chat path reports it as `499` and the video path reports the same
+thing as `499`; the breaker releases the probe without recording an outcome,
+because the provider may never have been reached — so the next request is the
+probe again. A provider that *stops answering* is the opposite case and is
+reported as the `502` every other core uses, so it trips the circuit: a
+provider that hangs is the failure the breaker exists for, and `408` would
+have been invisible to both the circuit and the error budget, because the
+budget counts 5xx.
+
 The no-auth free providers take an early return that hands back a **synthetic
 credential**, and that credential carries its `provider` — like a real one
 does. It has to: the success path resolves the provider from the credential
@@ -997,6 +1007,14 @@ The synthetic credential also *holds* the probe rather than releasing it,
 because that path does make an upstream request: the response resolves it.
 The two early returns that release it explicitly are the ones that make no
 upstream request at all.
+
+The no-auth request paths go through the credential lookup as well, and for
+the same reason: that lookup is where the breaker is consulted. `canRequest()`
+has one production call site — inside `getProviderCredentials` — and
+`recordProviderFailure` has one — inside `markAccountUnavailable`, which
+needs an account. A path that skips the lookup is a path the breaker cannot
+see: its provider is never taken out of service, and its failures never trip
+anything. The credential itself is not used on those paths; the *lookup* is.
 
 ### The breaker's transitions are observable
 
