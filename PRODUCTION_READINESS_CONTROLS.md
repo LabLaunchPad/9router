@@ -90,21 +90,21 @@ sse_circuit_breaker_rejections_total{...}  # refused by an open circuit
 
 The second one is not optional. The breaker refuses a request *before* any
 upstream call is made, and the handler answers `404` — because "no
-credentials" and "the provider's circuit is open" share one return value. So
-the refusals are counted as **requests** but not as **errors**, and the
-measured error rate *falls* as the outage gets worse. Measured against the
-real registry:
+credentials" and "the provider's circuit is open" share one return value. The
+refusals are therefore counted explicitly. Without this counter they would be
+counted as **requests** but not as **errors**, and the measured error rate
+would *fall* as the outage got worse. Measured against the real registry:
 
 ```
 1000 requests, provider returns 5xx   -> budget consumed 100.00%
-1000 requests, breaker refuses (404)   -> budget consumed   0.00%
+1000 requests, breaker refuses (404)   -> budget consumed 100.00%
 ```
 
-A total outage behind an open circuit would read as a **perfect** error
-budget, and the gate would allow the deploy — for exactly the failure the
-breaker exists to contain. The refusals are counted explicitly, and when the
-registry is full they land in the overflow **error** series, so a full
-registry cannot understate the outage either.
+Without this counter, a total outage behind an open circuit would read as a
+**perfect** error budget, and the gate would allow the deploy — for exactly
+the failure the breaker exists to contain. When the registry is full the
+refusals land in the overflow **error** series, so a full registry cannot
+understate the outage either.
 
 ### Configuration
 
@@ -382,14 +382,13 @@ reading it, and all of them fixed here:
   summary line (`Tests  77 failed | 3695 passed | …`), which every reporter
   emits identically.
 
-> **The exact failure counts in this document are the ones measured on the
-> machine the branch was developed on, and they are not a stable property of
-> the repository.** This repository has flaky tests — at least one 5 s-timeout
-> flake and one SQLite-locking flake — so the same tree fails a different
-> number of tests from run to run, and the counts differ again between a
-> developer machine and a CI runner (the CI baseline is far higher, because
-> under `CI=true` the golden snapshot cases fail when there is no committed
-> snapshot to compare against). **The counts are not the claim; the
+> **Any failure count quoted in this document is a number a run produced, not a
+> stable property of the repository.** This repository has flaky tests — at
+> least one 5 s-timeout flake and one SQLite-locking flake — so the same tree
+> fails a different number of tests from run to run, and the counts differ
+> again between a developer machine and a CI runner (the CI baseline is far
+> higher, because under `CI=true` the golden snapshot cases fail when there is
+> no committed snapshot to compare against). **The counts are not the claim; the
 > comparison is.** The authoritative statement is the one the workflow makes:
 > "no newly failing tests", measured test-by-test against the base commit.
 > Any number quoted about this repository should be quoted as "on this run",
