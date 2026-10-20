@@ -1,4 +1,4 @@
-import { createErrorResult } from "../utils/error.js";
+import { createErrorResult, createLocalErrorResult } from "../utils/error.js";
 import { HTTP_STATUS } from "../config/runtimeConfig.js";
 import { refreshTokenByProvider } from "../services/tokenRefresh.js";
 import { PROVIDER_MEDIA } from "../providers/index.js";
@@ -89,10 +89,10 @@ export async function handleVideoProxyCore({
 }) {
   const config = getVideoConfig(provider);
   if (!config) {
-    return createErrorResult(HTTP_STATUS.BAD_REQUEST, `Provider '${provider}' does not support video generation`);
+    return createLocalErrorResult(HTTP_STATUS.BAD_REQUEST, `Provider '${provider}' does not support video generation`);
   }
   if (!requestId && !VIDEO_ACTIONS.has(action)) {
-    return createErrorResult(HTTP_STATUS.BAD_REQUEST, `Unknown video action: ${action}`);
+    return createLocalErrorResult(HTTP_STATUS.BAD_REQUEST, `Unknown video action: ${action}`);
   }
 
   const adapter = getVideoAdapter(provider);
@@ -136,7 +136,7 @@ export async function handleVideoProxyCore({
   let upstream;
   try {
     const first = await doFetch();
-    if (first.planError) return createErrorResult(HTTP_STATUS.BAD_REQUEST, `[${provider}] ${first.planError}`);
+    if (first.planError) return createLocalErrorResult(HTTP_STATUS.BAD_REQUEST, `[${provider}] ${first.planError}`);
     upstream = first.response;
   } catch (error) {
     if (error?.name === "TimeoutError") {
@@ -181,7 +181,7 @@ export async function handleVideoProxyCore({
       } catch { /* noop */ }
       try {
         const retry = await doFetch();
-        if (retry.planError) return createErrorResult(HTTP_STATUS.BAD_REQUEST, `[${provider}] ${retry.planError}`);
+        if (retry.planError) return createLocalErrorResult(HTTP_STATUS.BAD_REQUEST, `[${provider}] ${retry.planError}`);
         upstream = retry.response;
       } catch (error) {
         return createErrorResult(HTTP_STATUS.BAD_GATEWAY, sanitizeSecrets(`[${provider}] video retry after refresh failed: ${error.message}`, credentials));

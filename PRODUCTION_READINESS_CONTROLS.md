@@ -947,6 +947,7 @@ The breaker is a **provider-level** control, and the distinction matters:
 | `401`, `402`, `403`, `429` | **No** | About one credential. The provider itself is healthy. |
 | "no credentials configured" | **No** | A local configuration problem, and no upstream call is made. |
 | "every account locked or rate-limited" | **No** | Same: the provider is healthy and no upstream call is made. |
+| A request that never reached the provider | **No** | Same: a purely local problem — the provider was never asked anything, so nothing was learned about it. |
 | A successful upstream response | Closes the circuit | The provider demonstrably answered. |
 
 Two details that are easy to get wrong, and that this implementation gets
@@ -995,6 +996,19 @@ reported as the `502` every other core uses, so it trips the circuit: a
 provider that hangs is the failure the breaker exists for, and `408` would
 have been invisible to both the circuit and the error budget, because the
 budget counts 5xx.
+
+A request that never reached the provider is not an answer either, and it is
+not the same fact as a provider that answered. A `400` raised by a core
+*before* the upstream call — a missing field, an adapter that cannot assemble
+a body, a translation that failed — means the provider was never asked
+anything, so the probe is released and nothing is recorded. The provider's
+own `400` is the opposite case: there the provider did answer, it is alive,
+and the probe was answered, so the circuit closes. The two are the same
+number and different facts, so the core says which one it is
+(`upstreamContacted: false` on a local failure) and the handler passes that
+on. Without the distinction, a single malformed client request could close
+the half-open circuit of a provider that was still down — declaring it
+healthy and sending traffic back to it.
 
 The no-auth free providers take an early return that hands back a **synthetic
 credential**, and that credential carries its `provider` — like a real one

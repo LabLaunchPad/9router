@@ -1,4 +1,4 @@
-import { createErrorResult, parseUpstreamError, formatProviderError } from "../utils/error.js";
+import { createErrorResult, createLocalErrorResult, parseUpstreamError, formatProviderError } from "../utils/error.js";
 import { HTTP_STATUS, FETCH_CONNECT_TIMEOUT_MS } from "../config/runtimeConfig.js";
 import { PROVIDER_MEDIA } from "../providers/index.js";
 import { getModelUpstreamId } from "../config/providerModels.js";
@@ -22,7 +22,7 @@ export async function handleSystemoneCore({
   const cfg = PROVIDER_MEDIA[provider]?.systemoneConfig;
   let targetUrl = credentials?.providerSpecificData?.baseUrl || cfg?.baseUrl;
   if (!targetUrl) {
-    return createErrorResult(
+    return createLocalErrorResult(
       HTTP_STATUS.BAD_REQUEST,
       `Provider '${provider}' does not support System One.`
     );
@@ -31,7 +31,7 @@ export async function handleSystemoneCore({
   if (targetUrl.includes("{accountId}")) {
     const accountId = credentials?.providerSpecificData?.accountId;
     if (!accountId) {
-      return createErrorResult(
+      return createLocalErrorResult(
         HTTP_STATUS.BAD_REQUEST,
         `Provider '${provider}' requires accountId in providerSpecificData.`
       );
@@ -44,10 +44,10 @@ export async function handleSystemoneCore({
 
   // Validate input at the trust boundary; question-level shape is upstream's job.
   if (body.state === undefined || body.state === null) {
-    return createErrorResult(HTTP_STATUS.BAD_REQUEST, "Missing required field: state");
+    return createLocalErrorResult(HTTP_STATUS.BAD_REQUEST, "Missing required field: state");
   }
   if (!body.questions || typeof body.questions !== "object" || Array.isArray(body.questions)) {
-    return createErrorResult(HTTP_STATUS.BAD_REQUEST, "Missing required field: questions");
+    return createLocalErrorResult(HTTP_STATUS.BAD_REQUEST, "Missing required field: questions");
   }
 
   // noAuth free lanes carry accessToken "public" from the credential stub.

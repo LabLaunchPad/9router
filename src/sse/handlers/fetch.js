@@ -223,6 +223,7 @@ async function handleSingleProviderFetch(body, providerInput, request, apiKey, s
       result.error,
       providerId,
       fetchLockKey,
+      result.upstreamContacted ?? true,
     );
 
     if (shouldFallback) {

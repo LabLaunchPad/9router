@@ -7,7 +7,7 @@ import { getAntigravityQuotaCache, getAntigravityModelQuota } from "./antigravit
 import * as log from "../utils/logger.js";
 import { CIRCUIT_BREAKER_CONFIG } from "open-sse/config/runtimeConfig.js";
 import { getCircuitBreaker } from "open-sse/services/circuitBreaker.js";
-import { recordBreakerRejection } from "@/sse/services/metrics.js";
+import { recordBreakerRejection, incrementCounter } from "@/sse/services/metrics.js";
 import REGISTRY from "open-sse/providers/registry/index.js";
 
 // Helper: get per-provider circuit breaker config, merged with defaults
@@ -83,14 +83,38 @@ const lastProviderFailureAt = new Map();
  *
  * @param {string|null} provider
  * @param {number|string|null} status - upstream HTTP status, if any
+ * @param {{ upstreamContacted?: boolean }} [options]
+ *   `upstreamContacted: false` means no upstream call was made at all — the
+ *   request could not be built, or failed validation before it was sent.
  * @returns {boolean} true when a failure was recorded on the breaker
  */
-export function recordProviderFailure(provider, status) {
+export function recordProviderFailure(provider, status, options = {}) {
   if (!provider) return false;
 
+  const { upstreamContacted = true } = options;
   const providerId = resolveProviderId(provider);
   const cbConfig = getProviderCircuitBreakerConfig(providerId);
   const cb = getCircuitBreaker(providerId, cbConfig);
+
+  // A request that never reached the provider is not a signal about it: the
+  // provider was never asked anything, so nothing was learned. It must not
+  // trip the circuit, and it must not be recorded as a success either - the
+  // branch below is for a provider that ANSWERED, and a request that was
+  // never sent is not an answer. The probe is released instead, so the next
+  // request is the probe again.
+  //
+  // This is the same path the "no credentials" and "every account locked"
+  // paths take, and for the same reason: a purely local problem must not
+  // blackhole a provider for the whole reset window.
+  if (!upstreamContacted) {
+    cb.releaseProbe();
+    log.warn(
+      "AUTH",
+      `${provider} | request failed before the upstream call (${status ?? "local error"}) — probe released, breaker ${cb.state}`,
+    );
+    incrementCounter("sse_provider_local_failures_total", { provider: providerId });
+    return false;
+  }
 
   // A request the CLIENT abandoned (499) is not a signal about the provider:
   // the client went away, and the provider may never have been reached. It
@@ -456,14 +480,21 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
  * @param {string} errorText
  * @param {string|null} provider
  * @param {string|null} model - The specific model that triggered the error
+ * @param {boolean} [upstreamContacted] - false when the request never reached
+ *   the provider: the account is not at fault and the provider was never
+ *   asked anything.
+ * @param {number|null} [resetsAtMs] - Optional precise cooldown expiry (ms epoch) for provider-specific quota errors
  * @returns {{ shouldFallback: boolean, cooldownMs: number }}
  */
-export async function markAccountUnavailable(connectionId, status, errorText, provider = null, model = null, resetsAtMs = null) {
+export async function markAccountUnavailable(connectionId, status, errorText, provider = null, model = null, upstreamContacted = true, resetsAtMs = null) {
   // A provider-level failure (5xx, transport error) trips the circuit
   // breaker. This is the upstream error path, so a provider that is genuinely
   // down is skipped instead of being retried into the ground. Per-account
   // problems (401/403/402/429) are ignored here — see isProviderLevelFailure.
-  recordProviderFailure(provider, status);
+  // A request that never reached the provider is ignored too: it says
+  // nothing about the provider, and the half-open probe it claimed has to be
+  // released rather than resolved.
+  recordProviderFailure(provider, status, { upstreamContacted });
 
   if (!connectionId || connectionId === "noauth") return { shouldFallback: false, cooldownMs: 0 };
   const connections = await getProviderConnections({ provider });

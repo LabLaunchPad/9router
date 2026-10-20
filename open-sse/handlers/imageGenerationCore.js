@@ -1,4 +1,4 @@
-import { createErrorResult, parseUpstreamError, formatProviderError } from "../utils/error.js";
+import { createErrorResult, createLocalErrorResult, parseUpstreamError, formatProviderError } from "../utils/error.js";
 import { HTTP_STATUS } from "../config/runtimeConfig.js";
 import { refreshWithRetry } from "../services/tokenRefresh.js";
 import { getExecutor } from "../executors/index.js";
@@ -41,12 +41,12 @@ export async function handleImageGenerationCore({
   const { provider, model } = modelInfo;
 
   if (!body.prompt) {
-    return createErrorResult(HTTP_STATUS.BAD_REQUEST, "Missing required field: prompt");
+    return createLocalErrorResult(HTTP_STATUS.BAD_REQUEST, "Missing required field: prompt");
   }
 
   const adapter = getImageAdapter(provider);
   if (!adapter) {
-    return createErrorResult(
+    return createLocalErrorResult(
       HTTP_STATUS.BAD_REQUEST,
       `Provider '${provider}' does not support image generation`
     );
@@ -102,7 +102,7 @@ export async function handleImageGenerationCore({
     requestBody = await adapter.buildBody(model, body);
     headers = adapter.buildHeaders(credentials, requestBody, model, body);
   } catch (error) {
-    return createErrorResult(HTTP_STATUS.BAD_REQUEST, error.message || `Invalid ${provider} image request`);
+    return createLocalErrorResult(HTTP_STATUS.BAD_REQUEST, error.message || `Invalid ${provider} image request`);
   }
 
   log?.debug?.("IMAGE", `${provider.toUpperCase()} | ${model} | prompt="${body.prompt.slice(0, 50)}..."`);

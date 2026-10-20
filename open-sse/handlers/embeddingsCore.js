@@ -1,4 +1,4 @@
-import { createErrorResult, parseUpstreamError, formatProviderError } from "../utils/error.js";
+import { createErrorResult, createLocalErrorResult, parseUpstreamError, formatProviderError } from "../utils/error.js";
 import { HTTP_STATUS, FETCH_CONNECT_TIMEOUT_MS } from "../config/runtimeConfig.js";
 import { getExecutor } from "../executors/index.js";
 import { refreshWithRetry } from "../services/tokenRefresh.js";
@@ -23,15 +23,15 @@ export async function handleEmbeddingsCore({
   // Validate input
   const input = body.input;
   if (!input) {
-    return createErrorResult(HTTP_STATUS.BAD_REQUEST, "Missing required field: input");
+    return createLocalErrorResult(HTTP_STATUS.BAD_REQUEST, "Missing required field: input");
   }
   if (typeof input !== "string" && !Array.isArray(input)) {
-    return createErrorResult(HTTP_STATUS.BAD_REQUEST, "input must be a string or array of strings");
+    return createLocalErrorResult(HTTP_STATUS.BAD_REQUEST, "input must be a string or array of strings");
   }
 
   const adapter = getEmbeddingAdapter(provider);
   if (!adapter) {
-    return createErrorResult(
+    return createLocalErrorResult(
       HTTP_STATUS.BAD_REQUEST,
       `Provider '${provider}' does not support embeddings.`
     );
@@ -54,7 +54,7 @@ export async function handleEmbeddingsCore({
     });
   } catch (error) {
     log?.debug?.("EMBEDDINGS", `Request build failed: ${error.message}`);
-    return createErrorResult(HTTP_STATUS.BAD_REQUEST, `[${provider}/${model}] ${error.message}`);
+    return createLocalErrorResult(HTTP_STATUS.BAD_REQUEST, `[${provider}/${model}] ${error.message}`);
   }
 
   log?.debug?.("EMBEDDINGS", `${provider.toUpperCase()} | ${model} | input_type=${Array.isArray(input) ? `array[${input.length}]` : "string"}`);

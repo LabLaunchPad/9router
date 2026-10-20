@@ -107,6 +107,31 @@ export function createErrorResult(statusCode, message, resetsAtMs, extraHeaders 
 }
 
 /**
+ * Create an error result for a failure that never reached the provider.
+ *
+ * The status is the one the client sees, but the result also says
+ * `upstreamContacted: false`: no upstream call was made, so nothing was
+ * learned about the provider. The circuit breaker needs to know that
+ * difference — a provider that ANSWERED with the same status is alive, and
+ * a request that was never sent says nothing at all.
+ *
+ * Use this for every failure raised BEFORE the upstream call: a validation
+ * failure, a request that could not be built, a translation that failed.
+ *
+ * @param {number} statusCode - HTTP status code
+ * @param {string} message - Error message
+ * @param {number} [resetsAtMs] - Optional precise cooldown expiry (ms epoch)
+ * @param {ResponseInit|null} [extraHeaders] - Optional extra response headers
+ * @returns {{ success: false, status: number, error: string, response: Response, resetsAtMs?: number, upstreamContacted: false }}
+ */
+export function createLocalErrorResult(statusCode, message, resetsAtMs, extraHeaders = null) {
+  return {
+    ...createErrorResult(statusCode, message, resetsAtMs, extraHeaders),
+    upstreamContacted: false,
+  };
+}
+
+/**
  * Create unavailable response when all accounts are rate limited
  * @param {number} statusCode - Original error status code
  * @param {string} message - Error message (without retry info)

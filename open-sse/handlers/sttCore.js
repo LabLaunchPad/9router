@@ -1,5 +1,5 @@
 import { Buffer } from "node:buffer";
-import { createErrorResult } from "../utils/error.js";
+import { createErrorResult, createLocalErrorResult } from "../utils/error.js";
 import { transcribeGeminiLive } from "./geminiLiveStt.js";
 import { PROVIDER_MODELS, PROVIDER_ID_TO_ALIAS } from "../config/providerModels.js";
 import { HTTP_STATUS } from "../config/runtimeConfig.js";
@@ -272,10 +272,10 @@ function resolveModelTransport(provider, model) {
  */
 export async function handleSttCore({ provider, model, formData, credentials, sttConfig, transport }) {
   const file = formData.get("file");
-  if (!file) return createErrorResult(HTTP_STATUS.BAD_REQUEST, "Missing required field: file");
+  if (!file) return createLocalErrorResult(HTTP_STATUS.BAD_REQUEST, "Missing required field: file");
 
   let cfg = sttConfig;
-  if (!cfg) return createErrorResult(HTTP_STATUS.BAD_REQUEST, `Provider '${provider}' does not support STT`);
+  if (!cfg) return createLocalErrorResult(HTTP_STATUS.BAD_REQUEST, `Provider '${provider}' does not support STT`);
 
   // Per-connection endpoint override. Registry entries carry a fixed baseUrl,
   // which is right for a named cloud service but useless for a self-hosted one
@@ -287,7 +287,7 @@ export async function handleSttCore({ provider, model, formData, credentials, st
 
   const token = cfg.authType === "none" ? null : (credentials?.apiKey || credentials?.accessToken);
   if (cfg.authType !== "none" && !token) {
-    return createErrorResult(HTTP_STATUS.UNAUTHORIZED, `No credentials for STT provider: ${provider}`);
+    return createLocalErrorResult(HTTP_STATUS.UNAUTHORIZED, `No credentials for STT provider: ${provider}`);
   }
 
   // Format-switch extension: an explicit caller marker wins over the registry
