@@ -1024,6 +1024,17 @@ failure back into "the provider ANSWERED". A test asserted one layer below
 the wrapper passes while the path is still broken: the fact is right at the
 producer and gone at the consumer.
 
+The behavioural check asserts **both** directions, and the second one was
+the one that was missing. A local failure has to say the provider was never
+asked; a failure the provider ANSWERED has to say it was asked. A core that
+marked its upstream failures as ones that never left the building would take
+the local branch in the breaker: the probe is released, nothing is recorded
+against the provider, and the circuit never opens for a provider that is
+down. Nothing caught that, so the two directions are asserted here, on the
+three cores that build their results by hand — the fetch core, the
+chat-search core, and the search core, whose result is wrapped on the way
+out.
+
 The fact has three legs: the core marks it, the handler passes it on, the
 breaker reads it. The first leg is guarded by the behavioural core tests and
 the scan below; the third by the breaker's own rules. The middle leg is the
@@ -1054,12 +1065,38 @@ That rule is a property of the *result*, not of the function that made it,
 and that is the whole point. A rule that recognises a shape — a function
 declaration at the top level of a file, with a parameter named after a
 failure — is a rule a refactor can walk out of: a nested helper, an arrow
-function and a one-line object literal all escape it, and the demo in the
-test's own history saw one wrapper in four. The per-site rule sees all of
-them, because it asks what the result carries rather than how the code that
-built it is spelled. The shared constructors state the fact once — the one
-for a failure where the provider was asked, and the one for a failure where
-it was not — and the hand-built results say it at the site.
+function and a one-line object literal all escape it. The per-site rule
+sees all of them, because it asks what the result carries rather than how
+the code that built it is spelled, and
+`tests/unit/fixtures/wrapper-shapes.js` holds one wrapper per shape so that
+the claim is checkable rather than asserted: the scan has to find all four.
+The shared constructors state the fact once — the one for a failure where
+the provider was asked, and the one for a failure where it was not — and the
+hand-built results say it at the site.
+
+The third rule is about the fact's VALUE, and that is the direction that
+matters. A failure that says `upstreamContacted: false` has to BE a local
+failure — a 4xx raised on the core's own account — because a failure that
+says otherwise takes the local branch in the breaker: the probe is released,
+nothing is recorded against the provider, and the circuit never opens for a
+provider that is down. A 5xx is never a local failure: the provider was
+asked, and it answered.
+
+The fact is a statement about the *provider*, not about the request that
+failed. The video core's 401/403 path is the case that makes the
+difference: the first attempt goes out and the provider answers, the token
+is refreshed, and the request is planned again. If the *retry's* plan fails,
+the provider was still asked — it answered a moment earlier — so the failure
+says so. Marking it as a local failure would release the probe as though
+the request had never left the building, and count an upstream answer in
+`sse_provider_local_failures_total`.
+
+The scan reads **statements**, not lines. A call written across four lines
+has its status on the second one, and a scan that matches the call against
+the line the status is on never sees the call at all — the pattern wants
+the `(` and the status together.
+`tests/unit/fixtures/multi-line-failure.js` is that shape, and the scan has
+to find it.
 
 A path that returns to the client without going through the account-failure
 path has to release the probe itself, or the provider is blackholed for the

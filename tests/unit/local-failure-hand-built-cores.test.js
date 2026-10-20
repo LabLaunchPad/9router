@@ -189,3 +189,99 @@ describe("the search core: the fact has to survive the wrapper", () => {
     ).toBe(false);
   });
 });
+
+/**
+ * The other direction.
+ *
+ * Everything above says what a failure that never reached the provider has
+ * to say. This says what a failure the provider ANSWERED has to say, and
+ * that direction is the one that was not asserted anywhere: a core that
+ * marked its upstream failures as ones that never left the building would
+ * pass every other test in this file.
+ *
+ * The consequence is the unsafe one. The breaker reads "the request never
+ * reached the provider" as a local problem: the probe is released, nothing
+ * is recorded against the provider, and the circuit never opens. A provider
+ * that is down keeps taking traffic, and the only trace is a counter that
+ * says the requests never left the building.
+ */
+
+/** A response the upstream "sent": an error, with a body. */
+function upstreamError(status, message) {
+  return {
+    ok: false,
+    status,
+    headers: { get: () => "application/json" },
+    json: async () => ({ error: { message } }),
+    text: async () => message,
+  };
+}
+
+/** Run a body with the global fetch replaced by an upstream that failed. */
+async function withUpstreamFailure(status, message, body) {
+  const original = globalThis.fetch;
+  globalThis.fetch = async () => upstreamError(status, message);
+  try {
+    return await body();
+  } finally {
+    globalThis.fetch = original;
+  }
+}
+
+describe("the cores: a failure the provider ANSWERED has to say so", () => {
+  it("marks the fetch core's upstream failure as one the provider answered", async () => {
+    const result = await withUpstreamFailure(500, "upstream is down", () =>
+      handleFetchCore({
+        url: "https://example.test/article",
+        provider: "tinyfish",
+        providerConfig: { baseUrl: "https://tiny.test/scrape" },
+        credentials: { apiKey: "k" },
+        log,
+      }),
+    );
+
+    expect(result.success).toBe(false);
+    expect(result.status).toBe(500);
+    expect(
+      result.upstreamContacted,
+      "the request was sent and the provider answered with a 500 — the fact has to say so",
+    ).toBe(true);
+  });
+
+  it("marks the chat-search core's upstream failure as one the provider answered", async () => {
+    const result = await withUpstreamFailure(500, "upstream is down", () =>
+      handleChatSearch({
+        provider: "perplexity",
+        query: "hello",
+        credentials: { apiKey: "k" },
+        log,
+      }),
+    );
+
+    expect(result.success).toBe(false);
+    expect(result.status).toBe(500);
+    expect(
+      result.upstreamContacted,
+      "the request was sent and the provider answered with a 500 — the fact has to say so",
+    ).toBe(true);
+  });
+
+  it("marks the search core's upstream failure as one the provider answered", async () => {
+    const result = await withUpstreamFailure(500, "upstream is down", () =>
+      handleSearchCore({
+        body: { query: "hello" },
+        provider: { id: "perplexity", searchViaChat: { defaultModel: "sonar" } },
+        providerConfig: null,
+        credentials: { apiKey: "k" },
+        log,
+      }),
+    );
+
+    expect(result.success).toBe(false);
+    expect(result.status).toBe(500);
+    expect(
+      result.upstreamContacted,
+      "the search core wraps the provider's result — the fact has to survive the wrap",
+    ).toBe(true);
+  });
+});

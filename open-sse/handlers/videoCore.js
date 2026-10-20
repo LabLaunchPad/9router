@@ -181,7 +181,20 @@ export async function handleVideoProxyCore({
       } catch { /* noop */ }
       try {
         const retry = await doFetch();
-        if (retry.planError) return createLocalErrorResult(HTTP_STATUS.BAD_REQUEST, `[${provider}] ${retry.planError}`);
+        if (retry.planError) {
+          // The provider WAS asked. The first attempt went out and it
+          // answered - with a 401 or a 403, which is what brought us here -
+          // and only the RETRY failed locally, when the request could not be
+          // planned with the refreshed token.
+          //
+          // The fact the breaker reads is whether the provider was asked
+          // anything, and it was. Marking this a local failure would release
+          // the probe as though the request had never left the building, and
+          // count an upstream answer as a local failure - the wrong side of
+          // the distinction, in the direction that keeps a dead provider in
+          // service.
+          return createErrorResult(HTTP_STATUS.BAD_REQUEST, `[${provider}] ${retry.planError}`);
+        }
         upstream = retry.response;
       } catch (error) {
         return createErrorResult(HTTP_STATUS.BAD_GATEWAY, sanitizeSecrets(`[${provider}] video retry after refresh failed: ${error.message}`, credentials));
