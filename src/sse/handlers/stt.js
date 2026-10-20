@@ -1,6 +1,6 @@
 import {
   extractApiKey, isValidApiKey,
-  getProviderCredentials, markAccountUnavailable, clearAccountError,
+  getProviderCredentials, markAccountUnavailable, clearAccountError, recordProviderFailure,
 } from "../services/auth.js";
 import { getSettings, getCustomModels } from "@/lib/localDb";
 import { getModelInfo } from "../services/model.js";
@@ -72,8 +72,32 @@ export async function handleStt(request) {
 
   // noAuth providers
   if (!CREDENTIALED_PROVIDERS.has(provider)) {
+    // The circuit breaker is a provider-level control, and this path does
+    // not go through getProviderCredentials - so it never consulted the
+    // breaker, and its failures never tripped it. The credential lookup is
+    // where the breaker is consulted (canRequest), so it is used here as
+    // the gate. The credential itself is not used: this path needs none.
+    const gate = await getProviderCredentials(provider, null, model);
+    if (!gate) {
+      // A no-auth provider has no credentials that could be missing, so the
+      // only reason the lookup returns nothing is an open circuit. The
+      // refusal is a 404, like every other circuit refusal, so it counts
+      // as a request and not as a 5xx error.
+      return errorResponse(HTTP_STATUS.NOT_FOUND, `Provider temporarily unavailable: ${provider}`);
+    }
+
     const result = await handleSttCore({ provider, model, formData, sttConfig: AI_PROVIDERS[provider]?.sttConfig, transport: modelTransport });
-    if (result.success) return result.response;
+
+    if (result.success) {
+      // The lookup claimed the breaker's half-open probe, and only a
+      // SUCCESS resolves it.
+      await clearAccountError(gate.connectionId, gate, model);
+      return result.response;
+    }
+
+    // A no-auth provider has no account to lock, so the failure is
+    // recorded on the breaker directly.
+    recordProviderFailure(provider, result.status);
     return errorResponse(result.status || HTTP_STATUS.BAD_GATEWAY, result.error || "STT failed");
   }
 
