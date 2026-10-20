@@ -193,7 +193,15 @@ export async function handleVideoProxyCore({
           // count an upstream answer as a local failure - the wrong side of
           // the distinction, in the direction that keeps a dead provider in
           // service.
-          return createErrorResult(HTTP_STATUS.BAD_REQUEST, `[${provider}] ${retry.planError}`);
+          //
+          // The status is the provider's own answer rather than a local one.
+          // The provider rejected the credential; the refresh then produced
+          // credentials the request could not be planned with, and that is a
+          // credential problem, not a request the client got wrong. A local
+          // 4xx here would also read as a local failure to the scan that
+          // holds the fact to the status, and it would hide the difference
+          // the fact is there to make.
+          return createErrorResult(upstream.status, `[${provider}] ${retry.planError}`);
         }
         upstream = retry.response;
       } catch (error) {

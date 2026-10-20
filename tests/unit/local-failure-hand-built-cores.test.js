@@ -284,4 +284,51 @@ describe("the cores: a failure the provider ANSWERED has to say so", () => {
       "the search core wraps the provider's result — the fact has to survive the wrap",
     ).toBe(true);
   });
+
+  it("marks the DEDICATED search path's upstream failure as one the provider answered", async () => {
+    // The chat-search path above is one of the two ways into the search
+    // core. The other is a dedicated search API, and it has its own
+    // upstream result — a fact of its own, in a file of its own, that a
+    // test that only drives the chat path never reaches.
+    //
+    // The base URL is a literal address so the SSRF guard has nothing to
+    // resolve: the test asks no network question, and the fetch below never
+    // leaves the process.
+    const result = await withUpstreamFailure(500, "upstream is down", () =>
+      handleSearchCore({
+        body: { query: "hello" },
+        provider: { id: "perplexity" },
+        providerConfig: { authType: "bearer", baseUrl: "https://203.0.113.10/search" },
+        credentials: { apiKey: "k" },
+        log,
+      }),
+    );
+
+    expect(result.success).toBe(false);
+    expect(result.status).toBe(500);
+    expect(
+      result.upstreamContacted,
+      "the dedicated path was asked and the provider answered — the fact has to say so",
+    ).toBe(true);
+  });
+
+  it("marks a dedicated request that cannot be built as one that never reached the provider", async () => {
+    // The dedicated path's own local failure: the request could not be
+    // assembled, so it never left the building. The provider was never
+    // asked, and the fact has to say so.
+    const result = await handleSearchCore({
+      body: { query: "hello" },
+      provider: { id: "google-pse" },
+      providerConfig: { authType: "bearer", baseUrl: "https://203.0.113.10/search" },
+      credentials: { apiKey: "k" },
+      log,
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.status).toBe(400);
+    expect(
+      result.upstreamContacted,
+      "the request was never sent, so the provider was never asked anything",
+    ).toBe(false);
+  });
 });

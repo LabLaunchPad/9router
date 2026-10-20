@@ -10,6 +10,8 @@
  * this is the shape that proves it.
  */
 
+import { HTTP_STATUS } from "../../../open-sse/config/runtimeConfig.js";
+
 /** A core's own wrapper — the shape a core writes for itself. */
 function failureResult(status, message) {
   return { success: false, status, error: message };

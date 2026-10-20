@@ -13,17 +13,20 @@
  * closes, and a provider that is still down is declared healthy.
  *
  * This file is the CHEAP SECOND NET: a scan of the cores for the places
- * where a failure is produced. It has three rules.
+ * where a failure is produced. It has three rules, and all three are about
+ * the VALUE of the fact, not only about whether it is there.
  *
  *   1. A LOCAL failure — one raised on the core's own account, before
- *      anything was sent — has to say the fact.
+ *      anything was sent — has to say `upstreamContacted: false`.
  *   2. EVERY failure result has to carry the fact, whatever its status.
  *   3. A failure that says `upstreamContacted: false` has to BE a local
- *      failure: a 4xx raised on the core's own account. A 5xx is never one
- *      — the provider was asked and it answered — and a failure that says
- *      otherwise takes the local branch in the breaker: the probe is
- *      released, nothing is recorded against the provider, and the circuit
- *      never opens for a provider that is down.
+ *      failure: a 4xx raised on the core's own account, written out.
+ *
+ * Rules 1 and 3 say the same thing from the two ends, and between them they
+ * pin the fact to the status: a failure that says "the provider was never
+ * asked" has to name a local 4xx, and a failure that names a local 4xx has
+ * to say "the provider was never asked". A failure that breaks either half
+ * hands the breaker a value it will read the wrong way.
  *
  * The second rule is the one that closes the shape that round 14 found: a
  * function that is handed a marked result and rebuilds it without the mark.
@@ -35,16 +38,29 @@
  * fixture in `tests/unit/fixtures/wrapper-shapes.js` holds one wrapper per
  * shape, and the test at the end of this file says the scan sees all four.
  *
- * The third rule is the one round 17 found. The first two rules ask
- * whether the fact is THERE; the direction that matters is whether it is
- * RIGHT. A core that marks an upstream failure as one that never reached
- * the provider passes both of the first two rules — the fact is present,
- * and it is on a failure that looks local — and the breaker then reads a
- * provider that is down as a provider that was never asked.
+ * The first and third rules are the ones round 17 and round 18 found. The
+ * first two rules used to ask whether the fact is THERE; the direction that
+ * matters is whether it is RIGHT. A core that marks an upstream failure as
+ * one that never reached the provider passes a presence check — the fact is
+ * present, and it is on a failure that looks local — and the breaker then
+ * reads a provider that is down as a provider that was never asked.
+ *
+ * And the presence check had a hole of its own: it accepted the
+ * constructor that says the provider WAS asked as evidence that a local
+ * failure says it was not. That constructor is the opposite of the
+ * evidence, so a local failure written through it was invisible. The first
+ * rule now asks for the VALUE — `false`, not the presence of the word —
+ * and the constructor that says "false" is the only constructor that
+ * satisfies it.
  *
  * The scan reads STATEMENTS, not lines. A call written across four lines
  * has its status on the second one, and a scan that reads the line the
  * status is on never sees the call at all.
+ *
+ * A bracket inside a string is not a bracket. A message that holds an
+ * unbalanced "(" must not carry the count past the end of the call: the
+ * statement below it would then vouch for a failure that says nothing, and
+ * a later statement's fact would read as the failure's own.
  *
  * It is still not the control, and it does not claim to be. A scan of the
  * source cannot see what a core RETURNS after it has wrapped a result, and
@@ -88,15 +104,16 @@ const LOCAL_STATUS_NAMES = Object.entries(HTTP_STATUS)
   .map(([name]) => name);
 
 /**
- * A status that is a local one, named (`HTTP_STATUS.BAD_REQUEST`) or
- * written out (`400`). The numeric form matters: a failure written as
- * `createErrorResult(400, …)` is the same local failure as one written as
- * `createErrorResult(HTTP_STATUS.BAD_REQUEST, …)`, and a scan that only
- * knows the named form does not see it.
+ * The constructors that build a failure result. A call to one of them is a
+ * failure whatever its arguments say, so the scan has to see them all: the
+ * one that says the provider was asked and the one that says it was not.
  */
-const LOCAL_STATUS = new RegExp(
-  `(?:HTTP_STATUS\\.)?(?:${LOCAL_STATUS_NAMES.join("|")}|${LOCAL_STATUSES.join("|")})\\b`,
-);
+const FAILURE_CONSTRUCTORS = ["createErrorResult", "createLocalErrorResult"];
+
+/**
+ * Words that are followed by a bracket and are not calls.
+ */
+const NOT_A_CALL = ["if", "for", "while", "switch", "catch", "return", "function", "typeof"];
 
 function coreFiles() {
   const found = [];
@@ -115,29 +132,94 @@ function coreFiles() {
 }
 
 /**
- * The statement a call spans: the call's line and the lines after it, up
- * to the one that closes the call.
+ * The text a call spans: its arguments, from the bracket that opens it to
+ * the bracket that closes it.
  *
- * The call is read to its closing parenthesis, not to the next semicolon:
- * a semicolon ends the STATEMENT, and a statement can hold more than one
+ * The call is read to its closing bracket, not to the next semicolon: a
+ * semicolon ends the STATEMENT, and a statement can hold more than one
  * call — reading to it would let a later call vouch for this one, which is
  * the difference between a check and a coincidence.
  */
-function callText(lines, index) {
-  const parts = [lines[index]];
-  let depth = parenDepth(lines[index]);
-  for (let j = index + 1; depth > 0 && j < lines.length && j <= index + 12; j += 1) {
-    parts.push(lines[j]);
-    depth += parenDepth(lines[j]);
+function callText(lines, index, open) {
+  const state = { quote: null };
+  const parts = [];
+  let depth = 1; // the call's own opening bracket
+  for (let j = index; j < lines.length && j <= index + 12; j += 1) {
+    const segment = j === index ? lines[j].slice(open + 1) : lines[j];
+    const scan = scanBrackets(segment, state, depth);
+    if (scan.end >= 0) {
+      parts.push(segment.slice(0, scan.end + 1));
+      return parts.join("\n");
+    }
+    parts.push(segment);
+    depth = scan.depth;
   }
   return parts.join("\n");
 }
 
-/** How many parentheses a line opens, less the ones it closes. */
-function parenDepth(line) {
-  const opens = (line.match(/\(/g) || []).length;
-  const closes = (line.match(/\)/g) || []).length;
-  return opens - closes;
+/**
+ * Walk a piece of text and count the brackets it opens and closes.
+ *
+ * A bracket inside a string or a comment is text, not a bracket: a message
+ * that holds an unbalanced "(" must not carry the count past the end of the
+ * call, or the call's text runs on into the statements below it and a later
+ * statement's fact vouches for a failure that has none.
+ *
+ * The string state is carried from one line to the next, because a string
+ * can run past the end of a line.
+ *
+ * The index of the bracket that closes the outermost one is returned with
+ * it, so the caller can cut the text at the call's own closing bracket.
+ */
+function scanBrackets(text, state, depth = 0) {
+  let end = -1;
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i];
+    if (state.quote) {
+      if (ch === "\\") {
+        i += 1;
+      } else if (ch === state.quote) {
+        state.quote = null;
+      }
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === "`") {
+      state.quote = ch;
+      continue;
+    }
+    if (ch === "/" && text[i + 1] === "/") break; // a comment
+    if (ch === "(") depth += 1;
+    else if (ch === ")") {
+      depth -= 1;
+      if (depth === 0) {
+        end = i;
+        break;
+      }
+    }
+  }
+  return { depth, end };
+}
+
+/**
+ * Every call a line makes, with the text each call spans.
+ *
+ * A line can hold more than one call — a condition and the failure it
+ * guards — and they are separate statements of fact. The status is read
+ * from the call's OWN first argument: the bracket of the condition is not
+ * the bracket of the failure.
+ */
+function callsOn(lines, index) {
+  const line = lines[index];
+  const found = [];
+  const pattern = /[A-Za-z_$][\w$]*\s*\(/g;
+  let match;
+  while ((match = pattern.exec(line)) !== null) {
+    const name = match[0].slice(0, -1).trim();
+    if (NOT_A_CALL.includes(name)) continue;
+    const open = match.index + match[0].length - 1;
+    found.push({ name, text: callText(lines, index, open) });
+  }
+  return found;
 }
 
 /**
@@ -197,7 +279,7 @@ function statusOf(token) {
  * that tests a status — produces no status at all.
  */
 function callStatus(text) {
-  const argument = text.match(/\(\s*((?:HTTP_STATUS\.)?[A-Za-z_][\w.]*|\d{3})/);
+  const argument = text.match(/^\s*((?:HTTP_STATUS\.)?[A-Za-z_][\w.]*|\d{3})/);
   return argument ? statusOf(argument[1]) : null;
 }
 
@@ -210,6 +292,31 @@ function callStatus(text) {
 function objectStatus(text) {
   const property = text.match(/\bstatus:\s*((?:HTTP_STATUS\.)?[A-Za-z_][\w.]*|\d{3})/);
   return property ? statusOf(property[1]) : null;
+}
+
+/**
+ * The fact a failure states: "false", "true", or null when it states none.
+ *
+ * A value written out beats a constructor: `upstreamContacted: false` is
+ * what the failure says, whatever else the statement holds. The shared
+ * constructors state the fact by construction — one says the provider was
+ * asked, the other says it was not — and the one that says "false" is the
+ * one a local failure has to go through. A constructor's name is the
+ * constructor's own statement, so it is read from the call rather than from
+ * the arguments.
+ *
+ * A fact the scan cannot read — the shorthand `upstreamContacted`, whose
+ * value is a variable — is null, not a guess.
+ */
+function factOf(text, name) {
+  if (/upstreamContacted\s*:\s*false/.test(text)) return "false";
+  if (/upstreamContacted\s*:\s*true/.test(text)) return "true";
+  if (name && FAILURE_CONSTRUCTORS.includes(name)) {
+    return name === "createLocalErrorResult" ? "false" : "true";
+  }
+  if (/createLocalErrorResult\s*\(/.test(text)) return "false";
+  if (/createErrorResult\s*\(/.test(text)) return "true";
+  return null;
 }
 
 /**
@@ -231,27 +338,30 @@ function failuresIn(files) {
       // A call that produces a failure. The call is the anchor: the status
       // may sit on the NEXT line, and a scan that reads the line the status
       // is on never sees the call at all.
-      if (/\w\s*\(/.test(line)) {
-        const text = callText(lines, i);
-        const status = callStatus(text);
-        if (status && LOCAL_STATUSES.includes(status)) {
-          found.push({
-            kind: "call",
-            file: relative,
-            line: i + 1,
-            text: line.trim(),
-            status,
-            saysNotContacted:
-              /upstreamContacted\s*:\s*false/.test(text) ||
-              /createLocalErrorResult\s*\(/.test(text),
-            // The shared constructors state the fact by construction: one
-            // says the provider was asked, the other says it was not.
-            marked:
-              /upstreamContacted\b/.test(text) ||
-              /createLocalErrorResult\s*\(/.test(text) ||
-              /createErrorResult\s*\(/.test(text),
-          });
-        }
+      //
+      // A call is recorded when it names a local status, and also when it
+      // is one of the shared constructors: a failure that says the provider
+      // was never asked and states its status as a variable is the defect
+      // the third rule exists to catch, and a scan that only recorded the
+      // calls with a local status would never see it.
+      for (const call of callsOn(lines, i)) {
+        const status = callStatus(call.text);
+        const isFailure =
+          FAILURE_CONSTRUCTORS.includes(call.name) ||
+          (status && LOCAL_STATUSES.includes(status));
+        if (!isFailure) continue;
+        const says = factOf(call.text, call.name);
+        found.push({
+          kind: "call",
+          file: relative,
+          line: i + 1,
+          text: line.trim(),
+          status,
+          says,
+          // The shared constructors state the fact by construction: one
+          // says the provider was asked, the other says it was not.
+          marked: /upstreamContacted\b/.test(call.text) || says !== null,
+        });
       }
 
       // A result object written out by hand. One record per object: the
@@ -268,7 +378,14 @@ function failuresIn(files) {
           text: line.trim(),
           status,
           isFailure: object.text.includes("success: false"),
-          saysNotContacted: /upstreamContacted\s*:\s*false/.test(object.text),
+          // A hand-built result states the fact in the literal, so only the
+          // literal counts here: a constructor call inside the object is a
+          // different failure.
+          says: /upstreamContacted\s*:\s*false/.test(object.text)
+            ? "false"
+            : /upstreamContacted\s*:\s*true/.test(object.text)
+              ? "true"
+              : null,
           marked: /upstreamContacted\b/.test(object.text),
         });
       }
@@ -278,8 +395,8 @@ function failuresIn(files) {
 }
 
 /**
- * The failures that are raised on the core's own account, and whether
- * they say so.
+ * The failures that are raised on the core's own account, and what they
+ * say about the fact.
  */
 function localFailures() {
   return failuresIn(coreFiles()).filter((f) => f.status && LOCAL_STATUSES.includes(f.status));
@@ -305,20 +422,22 @@ describe("the cores: a local failure has to say it is one", () => {
     // A scan that matches nothing would pass the check below for the wrong
     // reason, so the scan is pinned.
     expect(failures.length).toBeGreaterThan(0);
-    expect(failures.some((f) => f.marked)).toBe(true);
+    expect(failures.some((f) => f.says === "false")).toBe(true);
   });
 
-  it("has no local failure that reaches the breaker unmarked", () => {
-    const unmarked = localFailures()
-      .filter((f) => !f.marked)
+  it("has no local failure that says the provider was asked", () => {
+    const wrong = localFailures()
+      .filter((f) => f.says !== "false")
       .map((f) => `${f.file}:${f.line}  ${f.text}`);
 
-    // An unmarked local failure is read by the breaker as "the provider
-    // ANSWERED": it closes the half-open circuit, so one malformed client
-    // request can declare a provider that is still down healthy.
+    // A local failure that says the provider WAS asked is read by the
+    // breaker as "the provider ANSWERED": it closes the half-open circuit,
+    // so one malformed client request can declare a provider that is still
+    // down healthy. The constructor that says the provider was asked is
+    // not evidence that a local failure says it was not.
     expect(
-      unmarked,
-      `these local failures do not say that the provider was never contacted: ${unmarked.join(" | ")}`,
+      wrong,
+      `these local failures do not say that the provider was never contacted: ${wrong.join(" | ")}`,
     ).toEqual([]);
   });
 
@@ -337,7 +456,7 @@ describe("the cores: a local failure has to say it is one", () => {
     );
 
     expect(handBuilt.length).toBeGreaterThan(0);
-    expect(handBuilt.every((f) => f.marked)).toBe(true);
+    expect(handBuilt.every((f) => f.says === "false")).toBe(true);
   });
 });
 
@@ -368,7 +487,7 @@ describe("the cores: every failure result carries the fact", () => {
 describe("the cores: the fact has to be RIGHT", () => {
   it("has no failure that claims the provider was never asked and is not one", () => {
     const wrong = failuresIn(coreFiles())
-      .filter((f) => f.saysNotContacted && f.status && !LOCAL_STATUSES.includes(f.status))
+      .filter((f) => f.says === "false" && !(f.status && LOCAL_STATUSES.includes(f.status)))
       .map((f) => `${f.file}:${f.line}  ${f.text}`);
 
     // A failure that says "the request never reached the provider" takes
@@ -376,9 +495,14 @@ describe("the cores: the fact has to be RIGHT", () => {
     // recorded against the provider, and the circuit never opens. A 5xx is
     // never a local failure — the provider was asked and it answered — so a
     // failure that says otherwise keeps a provider that is down in service.
+    //
+    // The status has to be WRITTEN OUT, too. A failure that says the
+    // provider was never asked and states its status as a variable is the
+    // same defect wearing a different hat: the scan cannot read the value,
+    // and the breaker reads it as the provider's answer.
     expect(
       wrong,
-      `these failures say the provider was never contacted, but they are not local failures: ${wrong.join(" | ")}`,
+      `these failures say the provider was never contacted, but they do not name a local status: ${wrong.join(" | ")}`,
     ).toEqual([]);
   });
 
@@ -397,9 +521,53 @@ describe("the cores: the fact has to be RIGHT", () => {
       "the scan did not see the call at all — the status is on the next line",
     ).toBe(1);
     expect(
-      local[0].marked,
-      "the scan saw the call, but not the fact: the failure is unmarked",
-    ).toBe(false);
+      local[0].says,
+      "the scan saw the call, but not the fact: the failure says nothing",
+    ).toBe(null);
+  });
+});
+
+describe("the scan: the defects it has to catch", () => {
+  const fixture = path.join(process.cwd(), "tests", "unit", "fixtures", "local-failure-defects.js");
+
+  it("catches a local failure raised through the constructor that says the provider was asked", () => {
+    const failures = failuresIn([fixture]);
+    const wrong = failures.filter((f) => f.says === "true" && LOCAL_STATUSES.includes(f.status));
+
+    // The constructor that says "the provider WAS asked" is not evidence
+    // that a local failure says it was not. A scan that accepts it sees
+    // nothing here, and the breaker reads the failure as an answer.
+    expect(
+      wrong.length,
+      "the scan did not see the local failure that claims the provider was asked",
+    ).toBe(2);
+  });
+
+  it("catches a failure that claims the provider was never asked without naming a local status", () => {
+    const failures = failuresIn([fixture]);
+    const wrong = failures.filter((f) => f.says === "false" && !f.status);
+
+    // The status has to be written out for the scan to check the value of
+    // the fact. A status the scan cannot read is a status the breaker
+    // cannot read either.
+    expect(
+      wrong.length,
+      "the scan did not see the failure that says the provider was never asked and names no status",
+    ).toBe(1);
+  });
+
+  it("does not let a bracket in a message carry the call's text past the call", () => {
+    const failures = failuresIn([fixture]);
+    const read = failures.filter((f) => f.says === "false" && LOCAL_STATUSES.includes(f.status));
+
+    // A message that holds an unbalanced "(" must not carry the bracket
+    // count past the end of the call: the statement below it says the
+    // provider was never asked, and that must not vouch for a failure that
+    // says nothing.
+    expect(
+      read.length,
+      "the scan read the fact off a statement that is not part of the call",
+    ).toBe(0);
   });
 });
 

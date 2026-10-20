@@ -1035,6 +1035,13 @@ three cores that build their results by hand — the fetch core, the
 chat-search core, and the search core, whose result is wrapped on the way
 out.
 
+The search core has two ways in, and they are two different files. A test
+that drives the chat-search path never reaches the dedicated search API's
+own result — a fact of its own, in a file of its own — so the dedicated
+path is driven as well, in both directions: the request that could not be
+built says the provider was never asked, and the provider's own answer says
+it was.
+
 The fact has three legs: the core marks it, the handler passes it on, the
 breaker reads it. The first leg is guarded by the behavioural core tests and
 the scan below; the third by the breaker's own rules. The middle leg is the
@@ -1056,7 +1063,10 @@ wrapped a result — but it sees the constructor-based cores, which are
 awkward to drive, and it sees a local failure the moment it is written,
 wherever it is written.
 
-The scan has a second rule for the shape that round 14 found: **every
+The scan has three rules, and all three are about the fact's VALUE, not
+only about whether it is there.
+
+The second rule is the one that closes the shape that round 14 found: **every
 failure result a core builds carries the fact**, whatever its status. The
 call-site rule sees the arguments; it cannot see the return value of the
 function they were passed to, and that is where the fact was lost.
@@ -1074,13 +1084,40 @@ The shared constructors state the fact once — the one for a failure where
 the provider was asked, and the one for a failure where it was not — and the
 hand-built results say it at the site.
 
-The third rule is about the fact's VALUE, and that is the direction that
-matters. A failure that says `upstreamContacted: false` has to BE a local
-failure — a 4xx raised on the core's own account — because a failure that
-says otherwise takes the local branch in the breaker: the probe is released,
-nothing is recorded against the provider, and the circuit never opens for a
-provider that is down. A 5xx is never a local failure: the provider was
-asked, and it answered.
+The first rule is the local direction of the same question: **a local
+failure — one raised on the core's own account, before anything was sent —
+has to say `upstreamContacted: false`**. A local failure that says the
+provider WAS asked is read by the breaker as "the provider ANSWERED": it
+closes the half-open circuit, so one malformed client request can declare a
+provider that is still down healthy.
+
+Asking for the VALUE rather than for the presence of the word is what makes
+that rule work, and the difference is not academic. A scan that asks whether
+the fact is THERE accepts the constructor that says the provider was asked as
+evidence that a local failure says it was not — and that constructor is the
+opposite of the evidence. A local failure written through it was invisible,
+and the tree had exactly one: the video core's retry. So the rule is a
+statement about the whole tree and not about a constructor: **a literal 4xx
+in a core is a failure the core raised on its own account**, and the status
+of a provider's answer is never a literal — it is a variable. A failure that
+names a local 4xx has to say the provider was never asked; the video core's
+retry failure names the provider's own status instead, and says the provider
+was asked.
+
+The third rule is the other end of the same question: **a failure that says
+`upstreamContacted: false` has to BE a local failure — a 4xx raised on the
+core's own account, written out**. A failure that says otherwise takes the
+local branch in the breaker: the probe is released, nothing is recorded
+against the provider, and the circuit never opens for a provider that is
+down. A 5xx is never a local failure: the provider was asked, and it
+answered. The status has to be *written out* for the same reason: a failure
+that says the provider was never asked and states its status as a variable
+is the same defect wearing a different hat, and a scan that cannot read the
+value cannot check it.
+
+Between them the two rules pin the fact to the status: a failure that says
+"the provider was never asked" has to name a local 4xx, and a failure that
+names a local 4xx has to say "the provider was never asked".
 
 The fact is a statement about the *provider*, not about the request that
 failed. The video core's 401/403 path is the case that makes the
@@ -1089,7 +1126,13 @@ is refreshed, and the request is planned again. If the *retry's* plan fails,
 the provider was still asked — it answered a moment earlier — so the failure
 says so. Marking it as a local failure would release the probe as though
 the request had never left the building, and count an upstream answer in
-`sse_provider_local_failures_total`.
+`sse_provider_local_failures_total`. Its status is the provider's own answer
+for the same reason: the provider rejected the credential, and the refresh
+then produced credentials the request could not be planned with. That is a
+credential problem, not a request the client got wrong, and a literal 4xx
+there would claim the latter — and would read as a local failure to the scan
+that holds the fact to the status.
+`tests/unit/video-core-retry-fact.test.js` pins both halves of it.
 
 The scan reads **statements**, not lines. A call written across four lines
 has its status on the second one, and a scan that matches the call against
@@ -1097,6 +1140,16 @@ the line the status is on never sees the call at all — the pattern wants
 the `(` and the status together.
 `tests/unit/fixtures/multi-line-failure.js` is that shape, and the scan has
 to find it.
+
+A bracket inside a string is not a bracket. A message that holds an
+unbalanced "(" must not carry the count past the end of the call: the
+statement below it would then vouch for a failure that says nothing, and a
+later statement's fact would read as the failure's own.
+`tests/unit/fixtures/local-failure-defects.js` holds the shapes the scan has
+to catch — a local failure through the wrong constructor, a hand-built one
+that claims the provider was asked, a failure that says the provider was
+never asked and names no status, and a message with an unbalanced bracket in
+it — and the scan has to see every one of them.
 
 A path that returns to the client without going through the account-failure
 path has to release the probe itself, or the provider is blackholed for the
