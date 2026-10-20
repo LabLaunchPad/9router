@@ -1,6 +1,6 @@
 import {
   extractApiKey, isValidApiKey,
-  getProviderCredentials, markAccountUnavailable,
+  getProviderCredentials, markAccountUnavailable, clearAccountError,
 } from "../services/auth.js";
 import { getSettings, getCustomModels } from "@/lib/localDb";
 import { getModelInfo } from "../services/model.js";
@@ -99,7 +99,16 @@ export async function handleStt(request) {
 
     const result = await handleSttCore({ provider, model, formData, credentials, sttConfig: AI_PROVIDERS[provider]?.sttConfig, transport: modelTransport });
 
-    if (result.success) return result.response;
+    if (result.success) {
+      // The credential lookup claimed the circuit breaker's half-open probe
+      // (auth.js, canRequest()), and only a SUCCESS resolves it: the probe
+      // asked "does this provider work now?", the provider answered, so the
+      // probe succeeded. Without this, a provider that had recovered was
+      // blackholed for the whole reset window - fifteen minutes by default -
+      // for EVERY handler, not only this one.
+      await clearAccountError(credentials.connectionId, credentials, model);
+      return result.response;
+    }
 
     const { shouldFallback } = await markAccountUnavailable(credentials.connectionId, result.status, result.error, provider, model);
     if (shouldFallback) {
