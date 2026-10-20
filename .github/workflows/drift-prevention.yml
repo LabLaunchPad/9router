@@ -283,9 +283,15 @@ jobs:
           # The comparison is at TEST level, not at file level. A file that
           # already fails on the base is in the baseline's failing set, so a
           # change that breaks a DIFFERENT test inside that file does not
-          # appear in the file sets at all. This repository has 45 failing
-          # files on the base, so a file-level comparison is blind in almost
-          # the whole suite.
+          # appear in the file sets at all. The base fails in a large part of
+          # the suite, so a file-level comparison is blind in almost all of
+          # it.
+          #
+          # No count is quoted here on purpose: the base's failing-file count
+          # is a property of the runner, the dependency tree and the base
+          # commit - not of the repository - so a number would be a claim
+          # about one run. "Almost all of it" carries the argument and
+          # cannot go stale.
           #
           # Two shapes of FAIL line are handled, and both are needed:
           #
@@ -378,8 +384,12 @@ jobs:
           # recorded on Windows ("X-PLATFORM": "win32"), so the suite was red
           # on every Linux runner — and the gate said "no newly failing
           # tests", because the base commit has no snapshot at all and fails
-          # the same 150 cases. Both sides were equally red, so the
+          # the same cases. Both sides were equally red, so the
           # comparison, which is about DIFFERENCES, saw nothing.
+          #
+          # The number of masked cases is not quoted here for the same reason
+          # as above: it is a count from one comparison, and the argument
+          # needs only the equality.
           #
           # The masked failures are therefore reported, and the ones in files
           # this change touched are called out: those are the ones a reviewer

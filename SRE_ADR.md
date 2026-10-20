@@ -416,7 +416,7 @@ export function errorBudgetConsumed(errorRate, windowDays = 30) {
 > specification and rollback guidance.
 
 All six experiments above are now automated in
-`tests/chaos/provider-failures.test.js` (24 cases). Failures are injected
+`tests/chaos/provider-failures.test.js`. Failures are injected
 through the existing dependency-injection seams (`handleSingleModel`,
 `getCircuitBreaker`, the RTK entry points) rather than by contacting a live
 upstream, so the suite is deterministic, needs no credentials, and makes no

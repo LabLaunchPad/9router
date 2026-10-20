@@ -371,9 +371,9 @@ reading it, and all of them fixed here:
   "No newly failing test files." The results that are parsed are now the
   ANSI-stripped ones.
 - **The base commit has no root `vitest.config.js`**, so running it from the
-  repository root left every `open-sse/...` import unresolvable: 224 of the
-  base's test files failed for that reason alone, and the base's failing
-  count was several times the change's. That is not just noise — a file that
+  repository root left every `open-sse/...` import unresolvable: many of the
+  base's test files fail for that reason alone, and the base then fails far
+  more tests than the change does. That is not just noise — a file that
   fails in the baseline for an import error **masks** a real regression in
   that file.
 - **The failure count was read from reporter-specific marker characters**
@@ -394,6 +394,13 @@ reading it, and all of them fixed here:
 > "no newly failing tests", measured test-by-test against the base commit.
 > Any number quoted about this repository should be quoted as "on this run",
 > never as "the repository has N failures".
+>
+> The same rule applies to the number of **test cases** in a file, and that is
+> why none is quoted here. A case count changes the moment anyone adds a
+> test, and two documents in the same pull request quoted different counts
+> for the same file. The file's name is the durable fact; what it covers is
+> the useful part; the count is a measurement of one commit and is one
+> `vitest run` away.
 
 #### How the baseline is produced
 
@@ -411,7 +418,7 @@ Each part of that is load-bearing:
 |---|---|
 | `git archive` into a directory, rather than checking the base out over the working tree | The change's dependencies stay installed; the base is never made the working tree |
 | Inside the repository | Node's module resolution walks up from it and finds the change's `node_modules` |
-| The change's `vitest.config.js`, copied in | The base has no root config, and without the aliases 224 of its test files fail to import. The two runs then differ only in the code under test |
+| The change's `vitest.config.js`, copied in | The base has no root config, and without the aliases many of its test files fail to import. The two runs then differ only in the code under test |
 | `cwd = <base>/tests`, project root = `<base>` | The base's own test files resolve their fixtures with `path.resolve("../src/...")`, which is relative to the **cwd**. The base ran vitest from `tests/`, so `..` was the repository root; running the base from the root would make its tests read the *change's* source files. With the cwd inside the extracted tree they read the base's |
 | Project root one level up | The reported test paths are `tests/...` in both runs, so the two failing-test sets are directly comparable |
 
@@ -503,7 +510,7 @@ Windows:
 
 so the suite was **red on every Linux runner**, and the gate said "no newly
 failing tests" — because the base commit has no snapshot at all and fails the
-same 150 cases. Both sides were equally red, so a comparison about
+same cases. Both sides were equally red, so a comparison about
 *differences* saw nothing. A green gate over a red suite is the one
 combination that teaches a reviewer to trust nothing.
 
@@ -571,7 +578,7 @@ SLO_GATE_OVERRIDE_APPROVED=true SLO_GATE_OVERRIDE_REASON="INC-4711" \
   node scripts/ci/validate-slo.mjs; echo $?
 ```
 
-Unit tests: `tests/unit/slo-gate.test.js` (75 cases) covering the healthy /
+Unit tests: `tests/unit/slo-gate.test.js` covering the healthy /
 warning / blocked / exhausted decision matrix, a missing metric, invalid
 Prometheus text, an HTTP failure, a timeout, the fail-open opt-out, the
 override (including that it wins over a misconfigured endpoint), and the
@@ -763,11 +770,11 @@ node -e "import('./src/sse/services/state-persistence.js')"   # module loads
 ls "$DATA_DIR/sse-state.json"                                  # after a restart
 ```
 
-Unit tests: `tests/unit/sse-state-persistence.test.js` (33 cases) covering the
+Unit tests: `tests/unit/sse-state-persistence.test.js` covering the
 atomic write, idempotency, secret redaction, restore round-trip, version
 mismatch, the synchronous shutdown writer, and the single-registration
 guarantee for the signal handlers; and
-`tests/unit/sse-state-persistence-disabled.test.js` (3 cases) covering the kill
+`tests/unit/sse-state-persistence-disabled.test.js` covering the kill
 switch.
 
 ### Rollback
@@ -799,8 +806,7 @@ time.
 
 ### The scenarios
 
-`tests/chaos/provider-failures.test.js` covers six provider/failure scenarios
-(25 cases).
+`tests/chaos/provider-failures.test.js` covers six provider/failure scenarios.
 
 | # | Scenario | What is asserted |
 |---|---|---|
@@ -868,7 +874,7 @@ The fix threads the flag down to the mutating helpers and uses the local:
 
 Fail-open remains the default: every `tests/unit/system-inject.test.js`
 assertion still passes unchanged. Strict mode is covered by
-`tests/unit/rtk-strict-mode.test.js` (22 cases).
+`tests/unit/rtk-strict-mode.test.js`.
 
 ### Rollback
 
@@ -1076,7 +1082,7 @@ that precision — the gate prefers the gauge over the counters.
 
 ### Verification
 
-Unit tests: `tests/unit/sse-metrics.test.js` (37 cases) covering the
+Unit tests: `tests/unit/sse-metrics.test.js` covering the
 counters, gauges, the bounded-bucket histogram, the error-budget
 computation, the Prometheus rendering, the handler wrapper, the route
 templates, and the series ceiling.
