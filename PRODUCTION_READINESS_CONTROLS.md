@@ -1032,16 +1032,34 @@ wrapped a result — but it sees the constructor-based cores, which are
 awkward to drive, and it sees a local failure the moment it is written,
 wherever it is written.
 
+The scan has a second rule for the shape that round 14 found: a function
+that *forwards* a failure — one that is handed a status, an error, or a
+whole result and hands it on — has to forward the fact with it. The
+call-site rule sees the arguments; it cannot see the return value of the
+function they were passed to, and that is where the fact was lost.
+
 A path that returns to the client without going through the account-failure
 path has to release the probe itself, or the provider is blackholed for the
 whole reset window and every refusal is counted as an error against the
 error budget. The gemini native path is the one that returns directly, and
 it has three such exits: a client that walked away before the request was
 sent, a client that walked away during it, and a credential with no API key
-(so nothing was sent at all). `releaseProviderProbe()` is the narrow
-version of `markAccountUnavailable` for those: it touches the breaker only
-and leaves the account alone, because the account is demonstrably not at
-fault.
+(so nothing was sent at all).
+
+The two client-abort exits use `releaseProviderProbe()`: it touches the
+breaker only and leaves the account alone, because a client that walked away
+is nobody's fault but the client's.
+
+The missing-key exit is a different question, and it has the same answer as
+the equivalent failure on the STT path (a credential with no token): a
+credential that can never work is put aside for a cooldown rather than
+re-selected on every request. So that one goes through
+`markAccountUnavailable(..., { upstreamContacted: false })` — the local
+failure releases the probe and records nothing against the provider, and the
+credential is locked. The two decisions are independent: the breaker asks
+"was the provider asked anything?" and the account asks "can this
+credential work?", and a failure can fail the first while passing the
+second.
 
 The reach of that rule is not "the handlers directory". It is every file in
 the tree that claims a probe — `tests/unit/breaker-probe-resolution.test.js`
@@ -1051,6 +1069,14 @@ release it on the paths that produce no answer. The gemini native route is
 the file that leaked for twelve rounds precisely because it was outside the
 scope of the old scan: a control that depends on where the file that claims
 the probe happens to live is not a control.
+
+The "no answer" check is scoped to the function that claims the probe — a
+path that returns an error after the credential lookup, in a function that
+performs one, has to release the probe on the way out. It reads an error
+response whether it is built at the return site or handed back by a helper,
+and it looks at the whole chain of enclosing blocks, so a release made once
+above the branch counts. The branch where the lookup found *nothing* is
+excluded: the probe was never claimed there, so nothing is owed.
 
 The no-auth free providers take an early return that hands back a **synthetic
 credential**, and that credential carries its `provider` — like a real one
@@ -1117,9 +1143,13 @@ counts requests that **never reached the provider** — a request that could not
 be built, a missing field, a credential with no key. They are not provider
 failures, and they must not be read as such: a rising count is a problem in
 the request path, not an outage. `sse_provider_aborted_requests_total` counts
-requests the **client walked away** from. Neither series appears in the
-error budget — neither is a provider failure — but both explain a provider
-sitting in `half-open`: a probe that was claimed and never resolved.
+requests the **client walked away** from. Neither series is counted by the
+error budget — neither is a provider failure — but both are the *early*
+signal for a condition whose *late* signal is a budget being burned: a
+provider left half-open with its probe claimed refuses every later request,
+and each refusal is a `sse_circuit_breaker_rejections_total`, which the
+budget does count as an error. A rising local-failure count is what an
+operator sees first; a rising rejection count is what it becomes.
 
 Both routes are in the dashboard guard's `PUBLIC_API_PATHS`: the SLO gate
 fetches `/api/metrics` unauthenticated (no cookies, no bearer token), so it

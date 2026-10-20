@@ -268,11 +268,26 @@ async function forwardGeminiNativeRequest(request, body, model, action) {
     const authHeaders = buildGeminiNativeAuthHeaders(credentials);
     if (!authHeaders) {
       // The credential was obtained, so the half-open probe it claimed has to
-      // be released: no upstream call is made, and the account is not at
+      // be released: no upstream call is made, and the provider is not at
       // fault — it is the key that is missing. Leaving the probe claimed
       // would refuse this provider for the whole reset window, and every
       // refusal is counted as an error against the error budget.
-      releaseProviderProbe("gemini", 404);
+      //
+      // The account side is a different question, and it has the same answer
+      // as the equivalent failure on the STT path (a credential with no
+      // token): a credential that can never work is put aside for a cooldown
+      // rather than re-selected on every request. `upstreamContacted: false`
+      // is what keeps that from being read as a provider failure — the
+      // breaker releases the probe and records nothing, and only the
+      // credential is put aside.
+      await markAccountUnavailable(
+        credentials.connectionId,
+        404,
+        "No Gemini API key configured",
+        "gemini",
+        modelId,
+        { upstreamContacted: false }
+      );
       return Response.json(
         { error: { message: "No Gemini API key configured" } },
         { status: 404 }

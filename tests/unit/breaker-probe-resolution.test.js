@@ -251,38 +251,48 @@ describe("circuit breaker: every file that claims the probe resolves it", () => 
     ).toEqual([]);
   });
 
+
   /**
-   * The body of the block a line sits in, as text.
+   * The blocks a line sits in: their header and their body, innermost first.
    *
-   * The block is the innermost one whose header is above the line, and its
-   * body is the run of lines below that header which are indented deeper
-   * than it. Brace counting is not used: the source is full of template
-   * literals whose braces are not blocks.
+   * A block is the innermost one whose header is above the line, and its
+   * body is the run of lines below the header that are indented deeper than
+   * it. Brace counting is not used: the source is full of template literals
+   * whose braces are not blocks.
    */
-  function blockBodyAbove(lines, index) {
-    let header = -1;
+  function blocksAbove(lines, index) {
+    const blocks = [];
+    let level = lines[index].search(/\S/);
+    for (let j = index - 1; j >= 0; j -= 1) {
+      const indent = lines[j].search(/\S/);
+      if (indent < 0) continue; // blank line
+      if (indent >= level) continue; // still inside the current block
+      if (lines[j].trim().endsWith("{")) {
+        const body = [];
+        for (let k = j + 1; k <= index; k += 1) {
+          const inner = lines[k].search(/\S/);
+          if (inner < 0) continue; // blank
+          if (inner <= indent) break; // the block ended
+          body.push(lines[k]);
+        }
+        blocks.push({ header: lines[j].trim(), body: body.join("\n") });
+      }
+      level = indent;
+    }
+    return blocks;
+  }
+
+  /** The header line of the function a line sits in, or -1. */
+  function enclosingFunction(lines, index) {
     let level = lines[index].search(/\S/);
     for (let j = index - 1; j >= 0; j -= 1) {
       const indent = lines[j].search(/\S/);
       if (indent < 0) continue;
       if (indent >= level) continue;
-      if (lines[j].trim().endsWith("{")) {
-        header = j;
-        break;
-      }
+      if (/^(export\s+)?(async\s+)?function\s+\w+/.test(lines[j].trim())) return j;
       level = indent;
     }
-    if (header < 0) return "";
-
-    const body = [];
-    const headerLevel = lines[header].search(/\S/);
-    for (let j = header + 1; j <= index; j += 1) {
-      const indent = lines[j].search(/\S/);
-      if (indent < 0) continue; // blank
-      if (indent <= headerLevel) break; // the block ended
-      body.push(lines[j]);
-    }
-    return body.join("\n");
+    return -1;
   }
 
   it("has no error response after the credential lookup that leaves the probe claimed", () => {
@@ -297,32 +307,55 @@ describe("circuit breaker: every file that claims the probe resolves it", () => 
     // away before the request was sent, a client that walked away during
     // it, and a credential with no API key — and none of them touched the
     // breaker.
+    const ERROR_RESPONSE_AT_RETURN = /return\s+(new\s+)?Response(\.json)?\s*\(/;
+    const ERROR_RESPONSE_BY_HELPER =
+      /return\s+\w*(error|Error|unavailable|Unavailable|jsonResponse|JsonResponse)\w*\s*\(/;
+    const LOCAL_4XX =
+      /\b(?:status:\s*|HTTP_STATUS\.)(400|401|403|404|406|409|422|499|BAD_REQUEST|UNAUTHORIZED|FORBIDDEN|NOT_FOUND|NOT_ACCEPTABLE|UNPROCESSABLE_ENTITY)\b/;
+
     const offenders = [];
 
     for (const file of filesThatObtainCredentials()) {
       const source = fs.readFileSync(path.join(process.cwd(), file), "utf8");
       const lines = source.split(/\r?\n/);
 
-      // The line the credential lookup is on: a response before it cannot
-      // have claimed a probe, so it is not this check's business.
-      const lookup = lines.findIndex((line) => /getProviderCredentials\s*\(/.test(line));
-      if (lookup < 0) continue;
-
       lines.forEach((line, i) => {
-        if (i <= lookup) return;
-        // An error response with a literal 4xx status. The status is often
-        // on a line of its own — a multi-line `Response.json(...)` call —
-        // so the whole statement is read, not just the `return` line.
-        if (!/return\s+(new\s+)?Response(\.json)?\s*\(/.test(line)) return;
+        if (!/return\s+/.test(line)) return;
+        // An error response: a response built at the return site, or a call
+        // to a helper that builds one. The status is often on a line of its
+        // own — a multi-line `Response.json(...)` call — so the whole
+        // statement is read, not just the `return` line.
+        if (!ERROR_RESPONSE_AT_RETURN.test(line) && !ERROR_RESPONSE_BY_HELPER.test(line)) return;
         const statement = [line];
         for (let j = i + 1; j < lines.length && j <= i + 6; j += 1) {
           statement.push(lines[j]);
           if (lines[j].includes(";")) break;
         }
-        if (!/\bstatus:\s*(400|401|403|404|406|409|422|499)\b/.test(statement.join("\n"))) return;
+        if (!LOCAL_4XX.test(statement.join("\n"))) return;
 
-        const body = blockBodyAbove(lines, i);
-        if (RESOLVERS.test(body)) return;
+        // The probe is claimed by the credential lookup, so only a function
+        // that performs one can leak it — and only a path that comes after
+        // that lookup.
+        const fn = enclosingFunction(lines, i);
+        if (fn < 0) return;
+        const lookup = lines.findIndex(
+          (l, k) => k > fn && k < i && /getProviderCredentials\s*\(/.test(l),
+        );
+        if (lookup < 0) return;
+
+        const chain = blocksAbove(lines, i);
+
+        // The branch where the lookup found nothing: the probe was never
+        // claimed there, so nothing is owed.
+        const target = lines[lookup].match(/(?:const|let|var)\s+(\w+)\s*=/);
+        const foundNothing = target
+          ? new RegExp(`(!\\s*${target[1]}\\b|${target[1]}\\.allRateLimited\\b)`)
+          : /(\!\s*credentials\b|credentials\.allRateLimited\b)/;
+        if (chain.some((b) => foundNothing.test(b.header))) return;
+
+        // A resolver anywhere in the chain of enclosing blocks counts: the
+        // release may be made once above the branch rather than inside it.
+        if (chain.some((b) => RESOLVERS.test(b.body))) return;
 
         offenders.push(`${file}:${i + 1}  ${line.trim()}`);
       });

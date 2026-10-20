@@ -150,3 +150,88 @@ describe("the cores: a local failure has to say it is one", () => {
     expect(handBuilt.every((f) => f.marked)).toBe(true);
   });
 });
+
+/**
+ * The functions in the cores that BUILD a failure result.
+ *
+ * A function that takes a failure and hands it on — a status, an error, a
+ * whole result — has to carry the fact with it. This is the shape that
+ * round 14's defect had: the search core's `errorResult` was given a marked
+ * result, rebuilt it without the mark, and the fact was gone by the time
+ * the handler read it. The call-site scan above sees the arguments; it
+ * cannot see the return value of the function they were passed to.
+ *
+ * The scope is the functions that FORWARD a failure. A function that builds
+ * a fresh failure out of an upstream response has no fact to forward — the
+ * provider demonstrably answered — so it is not in scope here.
+ */
+function failureBuilders() {
+  const found = [];
+  const FUNCTION = /^(export\s+)?(async\s+)?function\s+(\w+)\s*\(([^)]*)\)/;
+  // A parameter that carries a failure: a status, an error, a whole result.
+  const FORWARDS_A_FAILURE = /\b(status|error|result|err|failure|outcome)\b/i;
+
+  for (const file of coreFiles()) {
+    const lines = fs.readFileSync(file, "utf8").split(/\r?\n/);
+    lines.forEach((line, i) => {
+      const m = line.match(FUNCTION);
+      if (!m) return;
+      const [, , , name, params] = m;
+
+      // The body: to the end of the function, by indentation.
+      const level = line.search(/\S/);
+      const body = [];
+      for (let j = i + 1; j < lines.length; j += 1) {
+        const indent = lines[j].search(/\S/);
+        if (indent < 0) continue;
+        if (indent <= level && lines[j].trim().startsWith("}")) break;
+        body.push(lines[j]);
+      }
+      const text = body.join("\n");
+
+      // Does it build a failure result at all?
+      const builds = text.includes("success: false") || /create(Local)?ErrorResult\s*\(/.test(text);
+      if (!builds) return;
+
+      // Does it forward a failure it was given?
+      if (!FORWARDS_A_FAILURE.test(params)) return;
+
+      found.push({
+        file: path.relative(process.cwd(), file).replace(/\\/g, "/"),
+        line: i + 1,
+        name,
+        text: line.trim(),
+        carries: text.includes("upstreamContacted"),
+      });
+    });
+  }
+  return found;
+}
+
+describe("the cores: a function that forwards a failure forwards the fact", () => {
+  it("finds the failure builders, so the check below is not vacuous", () => {
+    const builders = failureBuilders();
+    expect(builders.length).toBeGreaterThan(0);
+    // The function that dropped the fact in round 14 is pinned here: it is
+    // in scope, and it carries the fact now.
+    const errorResult = builders.find((b) => b.name === "errorResult");
+    expect(errorResult, "the search core's errorResult is in scope").toBeTruthy();
+    expect(errorResult.file).toBe("open-sse/handlers/search/index.js");
+  });
+
+  it("has no failure builder that forwards a failure without the fact", () => {
+    const offenders = failureBuilders()
+      .filter((b) => !b.carries)
+      .map((b) => `${b.file}:${b.line}  ${b.text}`);
+
+    // A builder that drops the fact turns every local failure it handles
+    // back into "the provider ANSWERED" — the half-open circuit closes, and
+    // a provider that is still down is declared healthy. The mark is
+    // correct at the call site and gone at the consumer, which is the
+    // hardest kind of defect to see.
+    expect(
+      offenders,
+      `these functions forward a failure without forwarding the fact: ${offenders.join(" | ")}`,
+    ).toEqual([]);
+  });
+});

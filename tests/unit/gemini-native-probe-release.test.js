@@ -62,6 +62,7 @@ const params = { params: Promise.resolve({ path: ["gemini-2.5-flash:generateCont
 
 beforeEach(() => {
   authMocks.releaseProviderProbe.mockClear();
+  authMocks.markAccountUnavailable.mockClear();
   authMocks.getProviderCredentials.mockClear();
 });
 
@@ -92,8 +93,15 @@ describe("the gemini native path releases the probe it claimed", () => {
 
     expect(response.status).toBe(404);
     expect(
-      authMocks.releaseProviderProbe,
+      authMocks.markAccountUnavailable,
       "a request that was never sent says nothing about the provider, and the probe has to be released",
-    ).toHaveBeenCalledWith("gemini", 404);
+    ).toHaveBeenCalledWith(
+      "gemini-conn",
+      404,
+      "No Gemini API key configured",
+      "gemini",
+      "gemini-2.5-flash",
+      { upstreamContacted: false },
+    );
   });
 });
