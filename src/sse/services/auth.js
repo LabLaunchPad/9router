@@ -92,6 +92,17 @@ export function recordProviderFailure(provider, status) {
   const cbConfig = getProviderCircuitBreakerConfig(providerId);
   const cb = getCircuitBreaker(providerId, cbConfig);
 
+  // A request the CLIENT abandoned (499) is not a signal about the provider:
+  // the client went away, and the provider may never have been reached. It
+  // must not trip the circuit, and it must not be recorded as a success
+  // either - the branch below is for a provider that ANSWERED, and an
+  // abandoned request is not an answer. The probe is released instead, so
+  // the next request is the probe again.
+  if (Number(status) === 499) {
+    cb.releaseProbe();
+    return false;
+  }
+
   if (!isProviderLevelFailure(status)) {
     // The provider ANSWERED (401/402/403/429) — it is alive. That is
     // exactly what isProviderLevelFailure means, and it resolves an
