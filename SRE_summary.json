@@ -1,0 +1,170 @@
+{
+  "adVersion": "1.0",
+  "generated": "2026-10-19",
+  "architectureOverview": {
+    "requestLifecycle": "handler/chatCore.js -> translator/index.js -> executors/index.js -> SSE out",
+    "modalityHandlers": ["TTS (tts.js)", "Chat (chat.js)", "STT (stt.js)", "Embeddings", "Images"],
+    "comboStrategies": ["fallback", "round-robin", "fusion"],
+    "errorTypesHandled": [400, 401, 402, 403, 404, 429, 502, 503, 504],
+    "providersSupported": "Free, freeTier, oauth, apikey, webCookie categories (see providers.js)",
+    "coreServices": ["auth.js (credential management)", "model.js (routing)", "combo.js (fallback/fusion)", "accountFallback.js (cooldowns)"]
+  },
+  "errorHandlingPatterns": {
+    "strategy": "fail-closed with controlled fallbacks",
+    "patterns": {
+      "ttsCore": {
+        "noAuthProviders": "direct handleTtsCore call, error response on failure",
+        "credentialedProviders": "fallback loop with markAccountUnavailable tracking",
+        "errorResult": "createErrorResult(status, message) from open-sse/utils/error.js"
+      },
+      "providerCredentials": "getProviderCredentials filters excluded/locked accounts; returns null/allRateLimited; fallback loop in chat/stT handlers",
+      "modelRouting": "parseModel -> getModelInfo -> combo detection -> handleComboChat or handleSingleModel",
+      "sseStreaming": "handleChatCore try/catch around executor.execute(); token refresh on 401/403; parseUpstreamError for provider errors; streaming vs non-streaming branches"
+    },
+    "failOpenComponents": ["rtk/headroom.js", "rtk/pxpipe.js", "rtk/caveman.js", "rtk/ponytail.js"],
+    "errorBudgetPhilosophy": "implicit through SLO targets; automation over heroics; manual intervention only on sustained budget consumption"
+  },
+  "observability": {
+    "metricsAvailable": {
+      "pendingRequests": "global._pendingRequests.byModel, byAccount (in-memory)",
+      "usageStats": "getUsageStats() — total requests, per-provider/model/account breakdowns, cost, tokens from SQLite",
+      "errorProviderTracking": "global._lastErrorProvider — last provider with error, 10s window timestamp",
+      "recentRing": "50 most recent usage entries via getRecentLogs()",
+      "activeRequests": "getActiveRequests() — currently running per model/provider/account"
+    },
+    "logsAvailable": {
+      "consoleCapture": "initConsoleLogCapture() patches console methods",
+      "sessionTags": "colored tags 🟢🔵🟣🟡🟠🔴⚪🟤 rotating per session",
+      "requestLines": "[timestamp] 📥 POST /path (logger.js:97)",
+      "responseLines": "[timestamp] 📤 200 (1234ms) or 💥 500 (567ms) (logger.js:102-106)",
+      "streamLines": "[timestamp] 🌊 [STREAM] event (logger.js:108-111)",
+      "taggedLogs": "[timestamp] tag symbol message — e.g., [ℹ️] [CHAT] ... (logger.js:76-81)",
+      "errorAlwaysVisible": "errorLine() bypasses log level filter (logger.js:42-44)"
+    },
+    "tracesAvailable": "Limited: request ID correlation via sessionSeed→reqTag; unified '▶' log line; '⚙' token saver summary; pending request tracking",
+    "goldenSignals": {
+      "latency": "partial — console log lines only, no aggregated metrics",
+      "traffic": "good — getUsageStats().totalRequests, per-endpoint counts, recent ring buffer",
+      "errors": "good — lastErrorProvider, usage DB status fields, error log lines",
+      "saturation": "limited — pending request counts, active account tracking"
+    },
+    "recommendedAdditions": [
+      "structured JSON logs with request ID, model, provider, status, latency",
+      "Prometheus metrics endpoint /metrics",
+      "distributed tracing (OpenTelemetry)",
+      "SLO dashboard with error budget tracking",
+      "alert on error rate spikes (>5% or >2x baseline)"
+    ]
+  },
+  "driftPrevention": {
+    "currentMechanisms": {
+      "modelLock_DB_keys": "markAccountUnavailable locks failed accounts/models; clearAccountError clears on success — high effectiveness",
+      "stickyRoundRobin": "consecutiveUseCount per account, reset on success or after limit — high effectiveness",
+      "antigravityQuotaCache": "lazy-loaded per-model quota; skip exhausted accounts until resetAt — high effectiveness",
+      "errorRules": "text/status-based cooldown assignment in errorConfig.js — medium effectiveness",
+      "comboAutoSwitch": "detectRequiredCapabilities → reorderByCapabilities — medium effectiveness",
+      "fusionQuorum": "collectPanel with minPanel + stragglerGraceMs + hardTimeout — medium effectiveness"
+    },
+    "gaps": [
+      "no circuit breaker for consistently failing providers",
+      "no request-level latency SLO tracked in metrics",
+      "no health check endpoint",
+      "in-memory state volatility on process restart",
+      "no deployment-time SLO validation"
+    ],
+    "recommended": [
+      "circuit breaker pattern per provider with closure threshold",
+      "health check endpoint /health returning SSE status, pending count, error budget, active accounts",
+      "persist in-memory state to DB on shutdown",
+      "SLO gate in deployment pipeline",
+      "quarterly error rule audit"
+    ]
+  },
+  "alertThresholds": {
+    "critical": "error rate > 5% in 5min OR error budget < 10% — page on-call, block deploys — immediate",
+    "warning": "error rate > 2% in 30min OR error budget < 25% — notify on-call — 5min delay",
+    "info": "pending requests > 100 OR active accounts < 2 for any provider — dashboard alert — 15min delay",
+    "info": "stream stall > 60s — investigate executor/upstream — 1min delay"
+  },
+  "sloSlis": {
+    "proposedSLOs": [
+      {
+        "name": "Availability",
+        "sli": "count(status < 500) / count(total)",
+        "target": "99.95%",
+        "window": "30d",
+        "burnRateAlerts": ["critical: short 5m factor 14.4, long 1h factor 14.4", "warning: short 30m factor 6, long 6h factor 6"]
+      },
+      {
+        "name": "Latency p99",
+        "sli": "count(duration < 300ms) / count(total)",
+        "target": "99%",
+        "window": "30d",
+        "burnRateAlerts": same pattern as availability
+      },
+      {
+        "name": "Successful TTS",
+        "sli": "count(TTS success) / count(TTS requests)",
+        "target": "99.9%",
+        "window": "30d"
+      },
+      {
+        "name": "Chat success",
+        "sli": "count(chat completion ok) / count(chat requests)",
+        "target": "99.8%",
+        "window": "30d"
+      },
+      {
+        "name": "Stream continuity",
+        "sli": "count(stream completes ok) / count(stream requests)",
+        "target": "99.5%",
+        "window": "30d"
+      }
+    ],
+    "currentSLIGaps": {
+      "requestCountTotal": "getUsageStats().totalRequests ✅ — no gap",
+      "errorCountAggregated": "5xx rate not aggregated — needs implementation",
+      "latencyDistribution": "console logs only, no histogram — needs implementation",
+      "ttsSuccessRate": "not explicitly tracked — needs implementation",
+      "chatCompletionSuccess": "not explicitly tracked — needs implementation",
+      "streamCompletion": "not explicitly tracked — needs implementation"
+    }
+  },
+  "chaosEngineering": {
+    "currentFailureInjectionPoints": [
+      "provider account exhaustion via markAccountUnavailable",
+      "transient 503/502 errors via DEFAULT_RETRY_CONFIG",
+      "concurrent request surge (no explicit limit, pending gauge available)",
+      "model routing failure via combo fallback loop",
+      "translator pipeline break with corrupt request body (RTK fail-open)",
+      "executor timeout via STREAM_STALL_TIMEOUT_MS: 360s",
+      "API key revocation via isValidApiKey check"
+    ],
+    "recommendedExperiments": [
+      "account kill switch: mark all accounts unavailable, verify fallback to 503",
+      "latency spike: inject 5s delay in executor, verify stall timeout handling",
+      "translator corruption: malformed request bodies, verify RTK fail-open (null, body untouched)",
+      "provider timeout: block upstream 30s, verify circuit breaker / fallback",
+      "combo model exhaustion: deplete all models, verify 503 with retryAfter",
+      "fusion judge timeout: hang judge model, verify stragglerGraceMs + hardTimeout"
+    ],
+    "toolingRecommendations": "scripted failure injection via API calls for this Node.js deployment; measure MTTR, fallback success rate, error budget impact"
+  },
+  "incidentResponse": {
+    "severityMapping": {
+      "S1": "error budget < 10% in < 1h — 15min response",
+      "S2": "error budget < 25% in < 6h — 30min response",
+      "S3": "error budget < 50% in < 24h — 2hr response",
+      "S4": "cosmetic/edge cases — next deploy"
+    },
+    "workflow": "detection → triage (check lastErrorProvider, getUsageStats, getActiveRequests) → assessment (provider/broad/translator/deployment) → action (exclude accounts, rollback, escalate) → post-incident (post-mortem, error rule update, toil automation)",
+    "runbookTemplates": "provider-wide-failure and SSE-streaming-degradation templates provided in ADR"
+  },
+  "recommendations": {
+    "sloSLIPriority": "HIGH — implement Prometheus metrics, define 3-5 core SLOs, set error budget alerts, deploy SLO dashboard",
+    "chaosEngineeringPriority": "MEDIUM — create failure injection scripts, test stream stall, validate RTK fail-open, design combo exhaustion experiments",
+    "incidentResponsePriority": "HIGH — create health check endpoint, write runbook templates, establish severity mapping, set up post-mortem process",
+    "observabilityGapsPriority": "HIGH — structured JSON logs, Prometheus metrics, distributed tracing, persist in-memory state, health check endpoint, circuit breakers",
+    "errorHandlingImprovementsPriority": "MEDIUM — circuit breaker per provider, configurable token refresh attempts, max retry per model, deployment SLO validation gate, quarterly error rule audit"
+  }
+}

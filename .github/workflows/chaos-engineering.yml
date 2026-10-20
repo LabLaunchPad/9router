@@ -1,0 +1,49 @@
+name: 🧪 Chaos Engineering Check
+
+# Chaos scenarios validate failure behaviour: circuit-breaker state machine,
+# combo fallback, fusion quorum, RTK fail-open semantics.
+#
+# The suite is deterministic and network-free — failures are injected through
+# dependency-injection seams (handleSingleModel, getCircuitBreaker, the RTK
+# entry points) rather than by contacting a live upstream. It needs no
+# credentials and no accounts.
+#
+# It is excluded from the default test run so a failure-mode scenario can
+# never gate an ordinary pull request. It runs on demand or on a schedule.
+on:
+  workflow_dispatch:
+  schedule:
+    # Weekly, Sunday 03:17 UTC — off the hour to avoid the CI stampede.
+    - cron: "17 3 * * 0"
+
+jobs:
+  chaos:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: 📦 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 🔧 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # `npm install`, not `npm ci`: this repository gitignores
+      # package-lock.json (.gitignore line 63), so `npm ci` fails with EUSAGE
+      # on every run. The drift-prevention workflow has the same fix.
+      - name: ✅ Install dependencies
+        run: npm install --legacy-peer-deps --no-audit --no-fund
+
+      - name: 🧪 Run chaos suite
+        run: npx vitest run --config tests/chaos/vitest.config.js --reporter=verbose
+
+      - name: 📋 Chaos summary
+        if: always()
+        run: |
+          echo "=== Chaos Engineering Check Complete ==="
+          echo "Scenarios: account kill switch, latency spike, translator corruption,"
+          echo "           provider timeout, combo exhaustion, fusion judge timeout"
+          echo "Network required: no (failures injected via dependency-injection seams)"
+          echo "================================================="

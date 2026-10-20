@@ -26,13 +26,14 @@ import { updateProviderCredentials, checkAndRefreshToken } from "../services/tok
 import { getProjectIdForConnection } from "open-sse/services/projectId.js";
 import { stripModelContextMarker } from "open-sse/utils/modelMarkers.js";
 import { getKeyAccessContext, enforceKeyAccess, filterAdapterModels } from "../services/keyAccess.js";
+import { instrumentHandler } from "../services/metrics.js";
 
 /**
  * Handle chat completion request
  * Supports: OpenAI, Claude, Gemini, OpenAI Responses API formats
  * Format detection and translation handled by translator
  */
-export async function handleChat(request, clientRawRequest = null) {
+async function handleChatImpl(request, clientRawRequest = null) {
   let body;
   try {
     body = await request.json();
@@ -353,3 +354,14 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
     return result.response;
   }
 }
+
+/**
+ * Instrumented entry point for chat-shaped requests.
+ *
+ * `/v1/chat/completions`, `/v1/messages` and `/v1/responses` all land here.
+ * The wrapper records the outcome (status class + latency) in the metrics
+ * registry that `GET /api/metrics` exposes and that the CI SLO gate reads.
+ * The response is returned untouched and a thrown error is re-thrown after
+ * being counted.
+ */
+export const handleChat = instrumentHandler(handleChatImpl);

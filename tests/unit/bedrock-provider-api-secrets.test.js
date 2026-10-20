@@ -53,9 +53,9 @@ describe("Bedrock connection API secrets", () => {
       },
     }));
 
-    ({ GET: listConnections, POST: createConnection } = await import("@/app/api/providers/route.js"));
-    ({ GET: getConnection, PUT: updateConnection } = await import("@/app/api/providers/[id]/route.js"));
-    ({ getProviderConnectionById: getStoredConnection } = await import("@/models/index.js"));
+    ({ GET: listConnections, POST: createConnection } = await import("../../../src/app/api/providers/route.js"));
+    ({ GET: getConnection, PUT: updateConnection } = await import("../../../src/app/api/providers/[id]/route.js"));
+    ({ getProviderConnectionById: getStoredConnection } = await import("../../../src/models/index.js"));
   });
 
   afterEach(() => {

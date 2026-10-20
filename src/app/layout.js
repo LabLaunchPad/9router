@@ -42,14 +42,34 @@ export default function RootLayout({ children }) {
         />
         <script
           dangerouslySetInnerHTML={{
-            __html: `var d=document,r=d.documentElement,f=function(){r.classList.add('fonts-loaded')};if(d.fonts&&d.fonts.load){d.fonts.load('24px "Material Symbols Outlined"').then(f).catch(f);setTimeout(f,3000)}else{f()}`,
+            __html: `var d=document,r=d.documentElement,f=function(){r.classList.add('fonts-loaded')};if(d.fonts&&d.fonts.load){d.fonts.load('24px "Material Symbols Outlined"').then(f).catch(f);setTimeout(f,500)}else{f()}`,
           }}
         />
       </head>
       <body className={`${inter.variable} font-sans antialiased`}>
+        {/*
+          Skip link. It must be focusable and visible once focused, so it
+          carries only the `skip-link` class — combining it with
+          `visually-hidden` left the element 1x1px and clipped, because
+          `.visually-hidden` sets width/height/clip unconditionally and
+          `.skip-link:focus` only changed `top`. The link points at
+          `#main`, the content wrapper rendered below.
+
+          The wrapper is a `<div>`, not a `<main>`: three components in the
+          tree already render their own `<main>` landmark (DashboardLayout,
+          AuthLayout, the landing page), and a `<main>` in the root layout
+          would nest a second one inside every one of them. A document may
+          have only one non-hidden `<main>`, and two of them defeat the
+          purpose of the skip link that this same change is fixing.
+        */}
+        <a href="#main" className="skip-link">
+          Skip to main content
+        </a>
         <ThemeProvider>
           <RuntimeI18nProvider>
-            {children}
+            <div id="main" tabIndex={-1}>
+              {children}
+            </div>
           </RuntimeI18nProvider>
         </ThemeProvider>
         <GoogleAnalytics gaId={"G-LC959F603F"} />

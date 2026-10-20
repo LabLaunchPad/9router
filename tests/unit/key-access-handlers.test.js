@@ -32,6 +32,9 @@ vi.mock("@/sse/services/auth.js", () => ({
   getProviderCredentials: mocks.getProviderCredentials,
   markAccountUnavailable: vi.fn(async () => ({ shouldFallback: false })),
   clearAccountError: vi.fn(),
+  // The no-auth STT/TTS paths record their failure on the breaker
+  // directly, so the module has to provide it.
+  recordProviderFailure: vi.fn(() => true),
   extractApiKey: (request) => {
     const a = request.headers.get("Authorization");
     return a?.startsWith("Bearer ") ? a.slice(7) : request.headers.get("x-api-key");

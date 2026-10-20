@@ -1,0 +1,627 @@
+name: 🛡️ Drift Prevention Check
+
+# Run on every PR, and on pushes to the default branch.
+#
+# The default branch of this repository (and of upstream) is `master`, not
+# `main`. The SLO gate used to trigger on `push: branches: [main]` and to
+# require `github.ref == 'refs/heads/main'`, so it never ran once. Both
+# names are listed below so the gate works whichever branch is the default;
+# the job condition is kept in sync with the trigger.
+on:
+  pull_request:
+    paths:
+      - '**.test.js'
+      - '**.config.*'
+      - 'next.config*'
+      - 'tailwind*'
+      # The control plane itself must be covered, or a pull request that
+      # changes only the gate logic, the metric producer, the request path
+      # or the breaker wiring runs no CI at all.
+      #
+      # This is deliberately the whole source tree rather than an
+      # enumeration of the files the controls happen to touch today. An
+      # earlier version of this list missed `src/shared/constants/providers.js`
+      # — which keys the breaker and the failure-burst map — and
+      # `src/lib/localDb.js`, and a pull request touching either ran no CI.
+      # The list cannot stay correct if it is maintained by hand.
+      - 'scripts/**'
+      - 'src/**'
+      - 'open-sse/**'
+      - 'tests/**'
+      # The control plane's own configuration and documentation. A change to
+      # any of these can change what the controls DO, or what they are
+      # CONTRACTED to do, without a single test failing.
+      #
+      #   .github/workflows/**  another workflow can change this one — or be
+      #                        changed to disable it
+      #   package.json          the test script and the vitest dependency set
+      #   .gitattributes        pins `scripts/ci/validate-slo.mjs text eol=lf`;
+      #                        without it a Windows checkout gives the gate
+      #                        script CRLF and its own test cannot import it
+      #   the two ADRs           the documented contract of every control
+      #   docs/**               the repository's documentation directory
+      #
+      # A pull request that touches ONLY one of these used to run no CI at
+      # all: this is the only workflow in the repository with a
+      # `pull_request:` trigger.
+      - '.github/workflows/**'
+      - 'package.json'
+      - '.gitattributes'
+      - 'PRODUCTION_READINESS_CONTROLS.md'
+      - 'SRE_ADR.md'
+      - 'docs/**'
+  push:
+    branches:
+      - main
+      - master
+  # The SLO gate runs on a push to the default branch — and that is the ONLY
+  # event that runs it, which means the gate could not be executed on demand
+  # at all: on every pull request the job is skipped, and the only way to
+  # reach it was a push to the default branch. A control that can only be
+  # reached by the thing it is meant to gate, and that nobody has run, is a
+  # control whose behaviour is a matter of opinion.
+  #
+  # This trigger is how the gate is verified: an operator can run it, with
+  # their own SLO_METRICS_ENDPOINT configured, BEFORE merging to the default
+  # branch — and can see it fail closed, with the reason, when it is not.
+  #
+  # The drift comparison does not apply to this event (there is no base
+  # commit to compare against), so the drift job reports that and skips.
+  workflow_dispatch:
+    inputs:
+      slo_gate:
+        description: "Run the SLO validation gate"
+        type: boolean
+        default: true
+      reason:
+        description: "Why this manual run is happening (recorded in the job summary)"
+        type: string
+        required: true
+
+jobs:
+  test-drift:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      # --- Setup ---
+      - name: 📦 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 🔧 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # `npm install`, not `npm ci`.
+      #
+      # `npm ci` requires a committed package-lock.json, and this repository
+      # gitignores it (.gitignore line 63). The job therefore failed at this
+      # step with EUSAGE on every run — the whole drift check, and every
+      # control downstream of it, had never executed. The upstream workflow
+      # for the gitbook pages already uses `npm install` for the same reason.
+      #
+      # The cost is that the installed tree is not pinned. That is the
+      # repository's existing policy, and changing it (committing a 400 KB
+      # lockfile) is a maintainer decision, not a side effect of this branch.
+      - name: ✅ Install dependencies
+        run: npm install --legacy-peer-deps --no-audit --no-fund
+
+      - name: 🏁 Record baseline test results
+        id: baseline
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set +e
+          # The baseline is the BASE COMMIT, not this commit.
+          #
+          # Running the suite twice on the same tree cannot detect a
+          # regression: with identical code on both sides the failure sets
+          # are identical, so the comparison only ever detects FLAKES — and
+          # it hard-fails the job on them. The comparison is against the
+          # base commit instead, so "fails now, passed on the base" means
+          # what it says.
+          #
+          # The base is EXTRACTED with `git archive` into a directory inside
+          # the repository, rather than checked out over the working tree.
+          # Two reasons, both found by running this:
+          #
+          #   * The base's own test configuration is not used. This branch
+          #     adds a root `vitest.config.js` carrying the path aliases;
+          #     the base commit has no root config (its aliases live in
+          #     `tests/vitest.config.js`, which vitest does not pick up
+          #     when it runs from the repository root). Running the base
+          #     from the root therefore leaves every `open-sse/...` and
+          #     `@/...` import unresolvable: many of the base's test files
+          #     fail for that reason alone, and the base then fails far more
+          #     tests than the change does. A file that fails in the
+          #     baseline for an import error would then MASK a real
+          #     regression.
+          #
+          #     The exact counts are a property of this run, not of the
+          #     repository: they depend on the runner, the dependency tree
+          #     and the base commit. The document says the same, and quotes
+          #     the comparison rather than the numbers.
+          #   * The head's `node_modules` are reused. The base's
+          #     package.json does not declare `vitest` — this branch adds
+          #     it — so a separate install for the base would have to
+          #     install a test runner the base never declared.
+          #
+          # The directory lives inside the repository so that Node's module
+          # resolution walks up from it and finds the head's node_modules.
+          if [ -n "$BASE_SHA" ] && [ "$BASE_SHA" != "$HEAD_SHA" ]; then
+            echo "::group::Baseline: the base commit $BASE_SHA"
+            rm -rf .drift-base
+            mkdir -p .drift-base
+            if git fetch --no-tags --depth=1 origin "+$BASE_SHA:refs/remotes/origin/pr-base" \
+               && git archive "$BASE_SHA" > /tmp/drift-base.tar 2>/dev/null \
+               && tar -xf /tmp/drift-base.tar -C .drift-base \
+               && cp vitest.config.js .drift-base/vitest.config.js; then
+              # The run happens from inside the extracted tree, with the
+              # project root one level above it:
+              #
+              #   process.cwd()  = <base>/tests  -> the base's own test files
+              #     resolve their fixtures with path.resolve("../src/..."),
+              #     which is relative to the cwd. The base ran vitest from
+              #     `tests/`, so `..` was the repository root; running the
+              #     base from the root instead would make its tests read
+              #     the CHANGE's source files.
+              #   project root   = <base>        -> the reported test paths
+              #     are `tests/...`, the same format as the change's run, so
+              #     the two failing-file sets are directly comparable.
+              ( cd .drift-base/tests && npx vitest run --root .. --reporter=verbose ) \
+                > baseline-raw.txt 2>&1
+              code=$?
+            else
+              # Falling back to "the baseline is this commit" would compare
+              # the commit against itself, which detects only flakes — and
+              # after the flake re-run below, nothing at all. A gate that
+              # silently stops gating is worse than a red job.
+              echo "::error::Could not obtain the base commit $BASE_SHA — the drift comparison is meaningless without it"
+              rm -rf .drift-base
+              exit 1
+            fi
+            rm -rf .drift-base
+            echo "::endgroup::"
+          else
+            # Not a pull request (a push to the default branch): there is no
+            # base to compare against, so the comparison does not apply to
+            # this event. Say so, rather than comparing the commit against
+            # itself.
+            echo "::warning::No base commit for this event — the drift comparison does not apply."
+            echo "baseline_available=false" >> $GITHUB_OUTPUT
+            echo "baseline_exit_code=0" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          # The vitest output carries ANSI escape sequences in CI, and they
+          # break every pattern in the comparison below. Vitest colours the
+          # summary numbers separately from the words, so the file contains
+          #
+          #   "Tests <ESC>[22m <ESC>[1m<ESC>[31m42 failed<ESC>[39m"
+          #
+          # and not "Tests  42 failed" — and the same for the " FAIL " lines.
+          # The result files that are parsed are therefore the ANSI-stripped
+          # ones.
+          sed -r 's/\x1B\[[0-9;]*[a-zA-Z]//g' baseline-raw.txt > baseline-results.txt
+          set -e
+          echo "baseline_available=true" >> $GITHUB_OUTPUT
+          echo "baseline_exit_code=$code" >> $GITHUB_OUTPUT
+          # A suite that could not be COLLECTED produces no summary line at
+          # all — a config that will not load, or a missing test runner.
+          # Every number below is derived from that summary, so there is
+          # nothing to compare against and the job stops here rather than
+          # reporting a meaningless comparison.
+          #
+          # An unresolvable import is a different thing: this repository has
+          # test files that import packages nobody declared (`lowdb`), and
+          # they are part of the known pre-existing failures. Those are
+          # COMPARED between the two runs below, not failed on absolutely —
+          # a new one is a regression, an old one is not.
+          if ! grep -qE 'Tests +[0-9]+ (failed|passed)' baseline-results.txt; then
+            echo "::error::The baseline test run produced no results — the suite could not be collected"
+            tail -40 baseline-results.txt || true
+            exit 1
+          fi
+
+      - name: 🧪 Drift detection - full test suite
+        # No `pipefail` here on purpose: the repository has a known set of
+        # pre-existing failures, and the drift gate below is what decides
+        # whether the CHANGE introduced any. Failing this step on the
+        # pre-existing failures would make the job permanently red and hide
+        # the signal that matters.
+        run: |
+          npx vitest run 2>&1 | tee new-raw.txt
+          # Strip the ANSI escape sequences before anything parses the output
+          # (see the baseline step for why).
+          sed -r 's/\x1B\[[0-9;]*[a-zA-Z]//g' new-raw.txt > new-results.txt
+          # The summary line is "Tests  42 failed | 3695 passed | ...". vitest
+          # prints TWO spaces, and the passed count is not always next to the
+          # word "Tests" — in a failing run it is the second field. The
+          # pattern that asked for exactly one space never matched anything,
+          # so every run reported "Tests 0 passed" and the fallback hid it.
+          # The field is taken out of the summary line instead.
+          #
+          # The match is "3695 passed", and the echo below adds its own unit,
+          # so the match is reduced to the bare number first. Without that,
+          # the line read "Baseline: Tests 3695 passed passed" — which is
+          # exactly what the first run with this fix printed.
+          BASELINE_PASSED=$(grep -E '^[[:space:]]*Tests[[:space:]]+' baseline-results.txt | tail -1 | grep -oE '[0-9]+ passed' | head -1 | cut -d' ' -f1 || true)
+          NEW_PASSED=$(grep -E '^[[:space:]]*Tests[[:space:]]+' new-results.txt | tail -1 | grep -oE '[0-9]+ passed' | head -1 | cut -d' ' -f1 || true)
+          echo "Baseline: Tests ${BASELINE_PASSED:-0} passed"
+          echo "New: Tests ${NEW_PASSED:-0} passed"
+
+      - name: 📊 Drift detection - failure diff
+        env:
+          BASELINE_EXIT_CODE: ${{ steps.baseline.outputs.baseline_exit_code }}
+          BASELINE_AVAILABLE: ${{ steps.baseline.outputs.baseline_available }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [ "$BASELINE_AVAILABLE" != "true" ]; then
+            echo "::warning::No base commit for this event — the drift comparison does not apply."
+            exit 0
+          fi
+          # The failure count is taken from vitest's own summary line
+          # ("Tests  42 failed | 3695 passed | ..."), not from the reporter's
+          # per-test marker characters. The markers differ between the
+          # verbose baseline and the default new run, so a count taken from
+          # them is not comparable between the two runs.
+          BASELINE_FAILURES=$(grep -oE 'Tests +[0-9]+ failed' baseline-results.txt | tail -1 | grep -oE '[0-9]+' || echo 0)
+          NEW_FAILURES=$(grep -oE 'Tests +[0-9]+ failed' new-results.txt | tail -1 | grep -oE '[0-9]+' || echo 0)
+          CHANGE=$((NEW_FAILURES - BASELINE_FAILURES))
+          echo "Baseline failures: $BASELINE_FAILURES (baseline run exit code: $BASELINE_EXIT_CODE)"
+          echo "New failures: $NEW_FAILURES"
+          echo "Change: $CHANGE"
+          if [ "$CHANGE" -gt 20 ]; then
+            echo "::error::⚠️ Significant test drift detected: $CHANGE more failures"
+            exit 1
+          fi
+
+          # The failure COUNT alone is not enough: a change that fixes one
+          # test and breaks another leaves the count unchanged.
+          #
+          # The comparison is at TEST level, not at file level. A file that
+          # already fails on the base is in the baseline's failing set, so a
+          # change that breaks a DIFFERENT test inside that file does not
+          # appear in the file sets at all. The base fails in a large part of
+          # the suite, so a file-level comparison is blind in almost all of
+          # it.
+          #
+          # No count is quoted here on purpose: the base's failing-file count
+          # is a property of the runner, the dependency tree and the base
+          # commit - not of the repository - so a number would be a claim
+          # about one run. "Almost all of it" carries the argument and
+          # cannot go stale.
+          #
+          # Two shapes of FAIL line are handled, and both are needed:
+          #
+          #   FAIL  tests/x.test.js > suite > test name   a test failure
+          #   FAIL  tests/x.test.js [ tests/x.test.js ]   the suite could not
+          #                                                     be collected
+          #
+          # The whole line after the marker is the key, so the two runs are
+          # comparable and a collection failure is not mistaken for a test
+          # failure.
+          grep -oE 'FAIL +tests/[^ ]+\.test\.js.*' baseline-results.txt \
+            | sed -e 's/^FAIL  *//' -e 's/[[:space:]]*$//' | sort -u \
+            > baseline-failing-tests.txt || true
+          grep -oE 'FAIL +tests/[^ ]+\.test\.js.*' new-results.txt \
+            | sed -e 's/^FAIL  *//' -e 's/[[:space:]]*$//' | sort -u \
+            > new-failing-tests.txt || true
+          NEWLY_FAILING=$(comm -13 baseline-failing-tests.txt new-failing-tests.txt || true)
+          if [ -n "$NEWLY_FAILING" ]; then
+            echo "::group::Candidate regressions (failed on the change, passed on the base):"
+            echo "$NEWLY_FAILING"
+            echo "::endgroup::"
+            # Re-run each candidate file and check whether the SPECIFIC test
+            # still fails. A test that passes on the second run was flaky,
+            # not broken — and a flaky test must not fail the build. (This
+            # repository has at least one 5s-timeout flake.)
+            #
+            # The re-run is judged on the failing TESTS it reports, not on
+            # its exit code: a file that already had a failing test on the
+            # base still exits non-zero when it is re-run, so the exit code
+            # would flag every file it was ever able to.
+            #
+            # A candidate that cannot be run at all is NOT a pass: it stays
+            # a regression. An unknown is not evidence that the change is
+            # innocent.
+            echo "$NEWLY_FAILING" | sed 's/ > .*//; s/ \[ .*//' \
+              | grep -v '^[[:space:]]*$' | sort -u > candidate-failing-files.txt
+            : > still-failing.txt
+            : > confirmed-regressions.txt
+            while read -r candidate; do
+              [ -z "$candidate" ] && continue
+              if [ ! -f "$candidate" ]; then
+                echo "::warning::$candidate does not exist in the working tree"
+                echo "$candidate" >> still-failing.txt
+                echo "$candidate (could not be run — it does not exist in the working tree)" \
+                  >> confirmed-regressions.txt
+                continue
+              fi
+              set +e
+              npx vitest run "$candidate" > rerun-raw.txt 2>&1
+              set -e
+              sed -r 's/\x1B\[[0-9;]*[a-zA-Z]//g' rerun-raw.txt > rerun-results.txt
+              grep -oE 'FAIL +tests/[^ ]+\.test\.js.*' rerun-results.txt \
+                | sed -e 's/^FAIL  *//' -e 's/[[:space:]]*$//' | sort -u \
+                > rerun-failing-tests.txt || true
+              # The keys of THIS file that the change newly broke.
+              grep -F "$candidate > " <<< "$NEWLY_FAILING" > candidate-tests.txt || true
+              grep -F "$candidate [ " <<< "$NEWLY_FAILING" >> candidate-tests.txt || true
+              while read -r key; do
+                [ -z "$key" ] && continue
+                if grep -Fxq "$key" rerun-failing-tests.txt; then
+                  echo "$key" >> confirmed-regressions.txt
+                  echo "$candidate" >> still-failing.txt
+                else
+                  echo "::warning::$key passed on the re-run — flaky, not broken."
+                fi
+              done < candidate-tests.txt
+            done < candidate-failing-files.txt
+            if [ -s still-failing.txt ]; then
+              echo "::error::⚠️ Regression: these tests fail on the change and passed on the base:"
+              cat confirmed-regressions.txt
+              echo ""
+              echo "::error::⚠️ In these files:"
+              cat still-failing.txt
+              exit 1
+            fi
+            echo "No confirmed regressions."
+          else
+            echo "No newly failing tests."
+          fi
+
+          # What the comparison above CANNOT see.
+          #
+          # The comparison is "failed on the change AND passed on the base".
+          # A test that fails on BOTH sides is not attributed to the change —
+          # correctly, as far as it goes, but the consequence is that a change
+          # which ALTERS a test that was already broken leaves the failing
+          # set unchanged, and the gate reports green.
+          #
+          # That is not hypothetical. This branch committed a golden snapshot
+          # recorded on Windows ("X-PLATFORM": "win32"), so the suite was red
+          # on every Linux runner — and the gate said "no newly failing
+          # tests", because the base commit has no snapshot at all and fails
+          # the same cases. Both sides were equally red, so the
+          # comparison, which is about DIFFERENCES, saw nothing.
+          #
+          # The number of masked cases is not quoted here for the same reason
+          # as above: it is a count from one comparison, and the argument
+          # needs only the equality.
+          #
+          # The masked failures are therefore reported, and the ones in files
+          # this change touched are called out: those are the ones a reviewer
+          # has to look at. This is a warning, not a gate — a failure that was
+          # already broken is not evidence that the change broke it.
+          MASKED=$(comm -12 baseline-failing-tests.txt new-failing-tests.txt || true)
+          MASKED_COUNT=$(printf '%s\n' "$MASKED" | grep -c '[^[:space:]]' || true)
+          if [ "$MASKED_COUNT" -gt 0 ]; then
+            echo "::group::Failures on BOTH sides ($MASKED_COUNT) — not attributable to the change:"
+            echo "$MASKED"
+            echo "::endgroup::"
+            if [ -n "$BASE_SHA" ]; then
+              git diff --name-only "$BASE_SHA" HEAD > changed-files.txt 2>/dev/null || true
+              # The count is reported, because a `git diff` that fails leaves
+              # an empty file and the refinement below silently stops
+              # working. A refinement that cannot be seen to work is a
+              # refinement that is not there.
+              CHANGED_COUNT=$(grep -c '[^[:space:]]' changed-files.txt 2>/dev/null || true)
+              if [ "${CHANGED_COUNT:-0}" -eq 0 ]; then
+                # An empty list means either that nothing changed or that
+                # `git diff` failed. Those are different facts, and only one
+                # of them supports a conclusion about the masked failures —
+                # so no conclusion is drawn here. The masked failures are
+                # still listed above, just without the refinement.
+                echo "::warning::Could not list the files this change touched — the masked failures are reported without the 'in a file this change touched' refinement."
+              else
+                echo "Files changed by this branch: $CHANGED_COUNT"
+                TOUCHED_MASKED=$(while read -r key; do
+                  [ -z "$key" ] && continue
+                  file=$(printf '%s' "$key" | sed 's/ > .*//; s/ \[ .*//')
+                  if grep -Fxq "$file" changed-files.txt 2>/dev/null; then
+                    printf '%s\n' "$key"
+                  fi
+                done <<< "$MASKED")
+                TOUCHED_COUNT=$(printf '%s\n' "$TOUCHED_MASKED" | grep -c '[^[:space:]]' || true)
+                if [ "${TOUCHED_COUNT:-0}" -gt 0 ]; then
+                  # Both numbers are quoted: the total, and the size of the
+                  # list that follows. One number and a shorter list read as
+                  # a list that was truncated.
+                  echo "::warning::$MASKED_COUNT tests fail on both the base and the change. The comparison sees differences, so a change that ALTERS an already-broken test is invisible to it. Files this change touched account for $TOUCHED_COUNT of them:"
+                  echo "::group::Masked failures in files this change touched:"
+                  printf '%s\n' "$TOUCHED_MASKED"
+                  echo "::endgroup::"
+                else
+                  echo "::warning::$MASKED_COUNT tests fail on both the base and the change. The comparison sees differences, so a change that ALTERS an already-broken test is invisible to it. None of them is in a file this change touched."
+                fi
+              fi
+            fi
+          fi
+
+          # Unresolvable imports, compared the same way. This repository has
+          # test files that import packages nobody declared, and they are
+          # part of the known pre-existing failures — so an unresolvable
+          # import is not a failure on its own. A NEW one is: it means this
+          # change added a dependency that does not exist, and the file it
+          # breaks is a file the drift check would otherwise call clean.
+          grep -oE "Cannot find package '[^']+'" baseline-results.txt \
+            | sort -u > baseline-import-errors.txt || true
+          grep -oE "Cannot find package '[^']+'" new-results.txt \
+            | sort -u > new-import-errors.txt || true
+          NEW_IMPORT_ERRORS=$(comm -13 baseline-import-errors.txt new-import-errors.txt || true)
+          if [ -n "$NEW_IMPORT_ERRORS" ]; then
+            echo "::error::⚠️ New unresolvable imports — the change added a dependency that does not exist:"
+            echo "$NEW_IMPORT_ERRORS"
+            exit 1
+          fi
+          echo "No new unresolvable imports."
+
+          # A green baseline means the suite is expected to be green. A red
+          # new run on a green baseline is a regression regardless of the
+          # failure-count threshold above.
+          if [ "$BASELINE_EXIT_CODE" = "0" ] && [ "$NEW_FAILURES" -gt 0 ]; then
+            echo "::error::⚠️ The baseline suite was green and this run is not — the change introduced test failures"
+            exit 1
+          fi
+
+      - name: 📋 Drift prevention summary
+        env:
+          BASELINE_AVAILABLE: ${{ steps.baseline.outputs.baseline_available }}
+        run: |
+          echo "=== Drift Prevention Check Complete ==="
+          if [ "$BASELINE_AVAILABLE" = "true" ]; then
+            echo "✅ Baseline: the base commit, run with the same test configuration"
+            echo "✅ Failure diff: the failing-TEST set, compared test by test"
+            echo "✅ Flake re-run: each candidate re-run on its own, judged by the failing tests it reports"
+            echo "✅ Import resolution: unresolvable imports COMPARED between the two runs"
+          else
+            echo "ℹ️  No base commit for this event — the comparison did not apply"
+          fi
+          echo "========================================"
+
+      - name: 📊 Performance summary
+        run: echo "Performance optimizations documented in web-performance-analysis.md"
+        shell: bash
+
+      - name: 📝 Update drift prevention docs
+        run: echo "Drift prevention framework documented in STATUS_UPDATE.md and FINAL_SUMMARY.md"
+
+  slo-validation-gate:
+    runs-on: ubuntu-latest
+    needs: test-drift
+    # `!cancelled()` rather than a bare condition: the gate still has to run
+    # and report its decision when the drift check failed, otherwise the
+    # operator sees one red job and no SLO verdict. The workflow still fails
+    # overall, because the failed dependency fails it.
+    #
+    # The `workflow_dispatch` branch is how the gate is run on demand. It is
+    # deliberately NOT limited to the default branch: the point of a manual
+    # run is to check the gate (and the operator's endpoint) before the
+    # deploy that would trigger it.
+    if: '!cancelled() && ((github.event_name == ''push'' && (github.ref == ''refs/heads/main'' || github.ref == ''refs/heads/master'')) || (github.event_name == ''workflow_dispatch'' && inputs.slo_gate))'
+    timeout-minutes: 30
+
+    steps:
+      - name: 📦 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 🔧 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # Fail closed. The gate must not silently disappear because a secret is
+      # missing — that is exactly the case it exists to catch. Skipping is
+      # still possible, but it has to be an explicit, visible repository
+      # variable rather than an accident.
+      #
+      # The approved override is checked here too, not only in the script: a
+      # pre-check that ignores it would fail before the script (the only
+      # place that honours it) ever ran, which would make the audited
+      # override unusable in exactly the misconfigured-endpoint case it
+      # exists for.
+      - name: 📋 Check SLO gate configuration
+        env:
+          SLO_METRICS_ENDPOINT: ${{ secrets.SLO_METRICS_ENDPOINT }}
+          # The documented alias of the endpoint. The script prefers the
+          # canonical name and falls back to this one, so an operator who set
+          # the alias as a secret gets the gate they asked for.
+          METRICS_ENDPOINT: ${{ secrets.METRICS_ENDPOINT }}
+          SLO_GATE_SKIP: ${{ vars.SLO_GATE_SKIP }}
+          SLO_GATE_OVERRIDE_APPROVED: ${{ vars.SLO_GATE_OVERRIDE_APPROVED }}
+        run: |
+          if [ -n "$SLO_METRICS_ENDPOINT" ] || [ -n "$METRICS_ENDPOINT" ]; then
+            echo "SLO metrics endpoint configured"
+            exit 0
+          fi
+          if [ "$SLO_GATE_SKIP" = "true" ]; then
+            echo "::warning::SLO gate SKIPPED (SLO_GATE_SKIP=true). The deploy was NOT validated against the error budget."
+            exit 0
+          fi
+          if [ "$SLO_GATE_OVERRIDE_APPROVED" = "true" ]; then
+            echo "::warning::SLO gate OVERRIDDEN (SLO_GATE_OVERRIDE_APPROVED=true). The deploy was NOT validated against the error budget."
+            exit 0
+          fi
+          echo "::error::SLO_METRICS_ENDPOINT is not configured. The SLO gate fails closed."
+          echo "Set the SLO_METRICS_ENDPOINT repository secret to the authoritative metrics URL, "
+          echo "or set the SLO_GATE_SKIP repository variable to true to skip the gate explicitly."
+          exit 1
+
+      - name: 🔍 Run SLO validation gate
+        # validate-slo.mjs has zero runtime dependencies (native fetch, Node 18+).
+        #
+        # SLO_GATE_SKIP is passed in here as well, not only to the pre-check.
+        # Otherwise the skip would only change the error message while the
+        # gate still failed closed, and the log would claim a skip that never
+        # happened.
+        #
+        # The condition reads `vars.`, not `env.`. The `env` context does
+        # contain step-level variables, but a step's own `if` is evaluated
+        # before that step's `env` block is applied to it, so `env.SLO_GATE_SKIP`
+        # here would resolve to the empty string regardless of what the
+        # repository variable is set to — and the documented skip would be a
+        # no-op again. `vars` is repository-scoped and has no such ordering
+        # question. The `env:` block below still carries the values to the
+        # script.
+        if: vars.SLO_GATE_SKIP != 'true' && vars.SLO_GATE_OVERRIDE_APPROVED != 'true'
+        env:
+          SLO_METRICS_ENDPOINT: ${{ secrets.SLO_METRICS_ENDPOINT }}
+          # The documented alias of the endpoint, forwarded for the same
+          # reason: the script prefers the canonical name and falls back to
+          # this one.
+          METRICS_ENDPOINT: ${{ secrets.METRICS_ENDPOINT }}
+          SLO_GATE_SKIP: ${{ vars.SLO_GATE_SKIP }}
+          SERVICE_NAME: 9router
+          ENVIRONMENT: production
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_ACTOR: ${{ github.actor }}
+          # Every knob the documented operator table lists is forwarded here.
+          #
+          # A repository variable is NOT injected into a step's environment:
+          # it has to be named explicitly. A knob the gate script reads but
+          # the workflow does not forward is a knob an operator can turn on
+          # and never see take effect — the script's own default takes its
+          # place, silently.
+          #
+          # An unset variable arrives as an empty string, and the script
+          # falls back to its documented default for an empty value, so
+          # forwarding an unset knob changes nothing. The defaults here are
+          # the same as the ones the table documents.
+          SLO_WARNING_THRESHOLD: ${{ vars.SLO_WARNING_THRESHOLD }}
+          SLO_BLOCKED_THRESHOLD: ${{ vars.SLO_BLOCKED_THRESHOLD }}
+          SLO_EXHAUSTED_THRESHOLD: ${{ vars.SLO_EXHAUSTED_THRESHOLD }}
+          SLO_WINDOW_SECONDS: ${{ vars.SLO_WINDOW_SECONDS }}
+          SLO_TARGET_ERROR_RATE: ${{ vars.SLO_TARGET_ERROR_RATE }}
+          SLO_REQUIRE_FULL_WINDOW: ${{ vars.SLO_REQUIRE_FULL_WINDOW }}
+          SLO_MIN_SAMPLE_SECONDS: ${{ vars.SLO_MIN_SAMPLE_SECONDS }}
+          SLO_FAIL_CLOSED: ${{ vars.SLO_FAIL_CLOSED }}
+          SLO_FETCH_TIMEOUT_MS: ${{ vars.SLO_FETCH_TIMEOUT_MS }}
+          SLO_MAX_REDIRECTS: ${{ vars.SLO_MAX_REDIRECTS }}
+          SLO_GATE_OVERRIDE: ${{ vars.SLO_GATE_OVERRIDE }}
+          SLO_GATE_OVERRIDE_APPROVED: ${{ vars.SLO_GATE_OVERRIDE_APPROVED }}
+          SLO_GATE_OVERRIDE_REASON: ${{ vars.SLO_GATE_OVERRIDE_REASON }}
+        run: node scripts/ci/validate-slo.mjs
+        continue-on-error: false
+
+      - name: 📢 SLO Gate Decision
+        if: always()
+        env:
+          SLO_GATE_SKIP: ${{ vars.SLO_GATE_SKIP }}
+          SLO_GATE_OVERRIDE_APPROVED: ${{ vars.SLO_GATE_OVERRIDE_APPROVED }}
+          MANUAL_RUN_REASON: ${{ inputs.reason }}
+        run: |
+          echo "Service: 9router"
+          echo "Environment: production"
+          echo "Git SHA: ${{ github.sha }}"
+          echo "SLO gate exit code: ${{ job.status }}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "Event: manual run"
+            echo "Reason: ${{ inputs.reason }}"
+          fi
+          if [ "$SLO_GATE_SKIP" = "true" ]; then
+            echo "::warning::SLO gate was SKIPPED via SLO_GATE_SKIP. This deploy was NOT validated against the error budget."
+          elif [ "$SLO_GATE_OVERRIDE_APPROVED" = "true" ]; then
+            echo "::warning::SLO gate was OVERRIDDEN via SLO_GATE_OVERRIDE_APPROVED. This deploy was NOT validated against the error budget."
+          fi

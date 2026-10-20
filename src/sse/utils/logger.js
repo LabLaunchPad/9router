@@ -115,3 +115,56 @@ export function maskKey(key) {
   if (!key || key.length < 8) return "***";
   return `${key.slice(0, 4)}...${key.slice(-4)}`;
 }
+
+// ---------------------------------------------------------------------------
+// Structured (JSON) logging — additive helpers.
+//
+// These do NOT change the existing human-readable API above. They emit
+// single-line JSON so log aggregators can index on stable field names.
+//
+// Never pass secrets, API keys, request bodies, or user prompts through
+// these helpers. Only operational metadata (provider, model, status, timing).
+// ---------------------------------------------------------------------------
+
+const STRUCTURED_LEVEL = {
+  debug: "debug",
+  info: "info",
+  warn: "warn",
+  error: "error",
+};
+
+/**
+ * Emit a single-line structured JSON log record.
+ *
+ * @param {"debug"|"info"|"warn"|"error"} level
+ * @param {string} event - Stable, low-cardinality event name (e.g. "circuit_breaker_open").
+ * @param {object} [fields] - Flat key/value metadata. Must not contain secrets.
+ */
+export function structured(level, event, fields = {}) {
+  const record = {
+    ts: new Date().toISOString(),
+    level: STRUCTURED_LEVEL[level] || "info",
+    event,
+    ...fields,
+  };
+  let line;
+  try {
+    line = JSON.stringify(record);
+  } catch {
+    // Non-serialisable payload: fall back to a minimal record rather than throwing.
+    line = JSON.stringify({ ts: record.ts, level: record.level, event, error: "unserialisable_fields" });
+  }
+  if (record.level === "error") {
+    console.error(line);
+  } else if (record.level === "warn") {
+    console.warn(line);
+  } else {
+    console.log(line);
+  }
+  return record;
+}
+
+export const structuredDebug = (event, fields) => structured("debug", event, fields);
+export const structuredInfo = (event, fields) => structured("info", event, fields);
+export const structuredWarn = (event, fields) => structured("warn", event, fields);
+export const structuredError = (event, fields) => structured("error", event, fields);

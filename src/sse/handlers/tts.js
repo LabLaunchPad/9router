@@ -1,6 +1,6 @@
 import {
   extractApiKey, isValidApiKey,
-  getProviderCredentials, markAccountUnavailable,
+  getProviderCredentials, markAccountUnavailable, clearAccountError, recordProviderFailure,
 } from "../services/auth.js";
 import { getSettings } from "@/lib/localDb";
 import { getModelInfo, getComboModels } from "../services/model.js";
@@ -79,8 +79,32 @@ async function handleSingleModelTts(body, modelStr, responseFormat, language, st
 
   // noAuth providers — no credential needed
   if (!CREDENTIALED_PROVIDERS.has(provider)) {
+    // The circuit breaker is a provider-level control, and this path does
+    // not go through getProviderCredentials - so it never consulted the
+    // breaker, and its failures never tripped it. The credential lookup is
+    // where the breaker is consulted (canRequest), so it is used here as
+    // the gate. The credential itself is not used: this path needs none.
+    const gate = await getProviderCredentials(provider, null, model);
+    if (!gate) {
+      // A no-auth provider has no credentials that could be missing, so the
+      // only reason the lookup returns nothing is an open circuit. The
+      // refusal is a 404, like every other circuit refusal, so it counts
+      // as a request and not as a 5xx error.
+      return errorResponse(HTTP_STATUS.NOT_FOUND, `Provider temporarily unavailable: ${provider}`);
+    }
+
     const result = await handleTtsCore({ provider, model, input: body.input, responseFormat, language, style });
-    if (result.success) return result.response;
+
+    if (result.success) {
+      // The lookup claimed the breaker's half-open probe, and only a
+      // SUCCESS resolves it.
+      await clearAccountError(gate.connectionId, gate, model);
+      return result.response;
+    }
+
+    // A no-auth provider has no account to lock, so the failure is
+    // recorded on the breaker directly.
+    recordProviderFailure(provider, result.status);
     return errorResponse(result.status || HTTP_STATUS.BAD_GATEWAY, result.error || "TTS failed");
   }
 
@@ -106,7 +130,16 @@ async function handleSingleModelTts(body, modelStr, responseFormat, language, st
 
     const result = await handleTtsCore({ provider, model, input: body.input, credentials, responseFormat, language, style });
 
-    if (result.success) return result.response;
+    if (result.success) {
+      // The credential lookup claimed the circuit breaker's half-open probe
+      // (auth.js, canRequest()), and only a SUCCESS resolves it: the probe
+      // asked "does this provider work now?", the provider answered, so the
+      // probe succeeded. Without this, a provider that had recovered was
+      // blackholed for the whole reset window - fifteen minutes by default -
+      // for EVERY handler, not only this one.
+      await clearAccountError(credentials.connectionId, credentials, model);
+      return result.response;
+    }
 
     const { shouldFallback } = await markAccountUnavailable(credentials.connectionId, result.status, result.error, provider, model);
     if (shouldFallback) {

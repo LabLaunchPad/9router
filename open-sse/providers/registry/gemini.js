@@ -86,4 +86,13 @@ export default {
     pricingUrl: "https://ai.google.dev/pricing",
     freeTier: "Free tier: 15 RPM, 1M tokens/day on gemini-2.5-flash via AI Studio.",
   },
+  // Circuit breaker config per provider (overrides default)
+  circuitBreaker: {
+    // Lower threshold and a shorter cool-down than the default (5 failures /
+    // 5 minutes): Gemini's 5xx and quota errors are often transient, so the
+    // circuit is given fewer chances and recovers sooner.
+    failureThreshold: 3,
+    coolDownWindowMs: 120000, // 2 minutes
+    resetWindowMs: 600000,    // 10 minutes
+  },
 };

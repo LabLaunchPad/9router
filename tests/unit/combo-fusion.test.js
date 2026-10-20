@@ -130,6 +130,42 @@ describe("fusion combo", () => {
     expect(judged).toBe(false);
   });
 
+  it("degrades to a panel answer when the judge hangs, without re-issuing the request", async () => {
+    // The judge is subject to the same hard cap as the panel, so a hung
+    // judge must not stall the request. The degraded answer is the panel
+    // answer that is already in hand — NOT a second upstream call, which
+    // would cost the user twice and could hang for as long as the upstream
+    // allowed (that call is not wrapped in the hard timeout).
+    const attempted = [];
+    const handleSingleModel = vi.fn(async (_body, model) => {
+      attempted.push(model);
+      if (model === "p/judge") {
+        await new Promise((r) => setTimeout(r, 500));
+        return okResponse("late judge");
+      }
+      return okResponse(`ans-${model}`);
+    });
+
+    const res = await handleFusionChat({
+      body: { messages: [{ role: "user", content: "Q" }] },
+      models: ["p/a", "p/b"],
+      handleSingleModel,
+      log,
+      judgeModel: "p/judge",
+      tuning: { minPanel: 2, stragglerGraceMs: 50, panelHardTimeoutMs: 100 },
+    });
+
+    expect(res.ok).toBe(true);
+    const body = await res.json();
+    expect(JSON.stringify(body)).toContain("ans-");
+    expect(JSON.stringify(body)).not.toContain("late judge");
+
+    // Exactly one call per panel model plus the (timed-out) judge. No
+    // re-issued request to a panel model.
+    expect(attempted.filter((m) => m !== "p/judge")).toEqual(["p/a", "p/b"]);
+    expect(attempted.filter((m) => m === "p/judge")).toHaveLength(1);
+  });
+
   it("returns 503 when the whole panel fails", async () => {
     const handleSingleModel = vi.fn(async () => errResponse(500));
     const res = await handleFusionChat({

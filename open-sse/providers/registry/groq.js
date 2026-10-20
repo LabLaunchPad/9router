@@ -34,6 +34,12 @@ export default {
     { id: "distil-whisper-large-v3-en", name: "Distil Whisper Large v3 EN", params: ["language","response_format","temperature","prompt"], kind: "stt" },
   ],
   serviceKinds: ["llm","imageToText","stt"],
+  // Circuit breaker config per provider (overrides default)
+  circuitBreaker: {
+    failureThreshold: 4, // Groq: moderate tolerance
+    coolDownWindowMs: 180000, // 3 minutes
+    resetWindowMs: 900000,    // 15 minutes
+  },
   sttConfig: {
     baseUrl: "https://api.groq.com/openai/v1/audio/transcriptions",
     authType: "apikey",

@@ -139,8 +139,23 @@ export async function handleVideoProxyCore({
     if (first.planError) return createErrorResult(HTTP_STATUS.BAD_REQUEST, `[${provider}] ${first.planError}`);
     upstream = first.response;
   } catch (error) {
-    if (error?.name === "AbortError" || error?.name === "TimeoutError") {
-      return createErrorResult(HTTP_STATUS.REQUEST_TIMEOUT, `[${provider}] video ${method} aborted: ${error.message}`);
+    if (error?.name === "TimeoutError") {
+      // The upstream did not answer within VIDEO_FETCH_TIMEOUT_MS. That is a
+      // signal about the PROVIDER: every account would hang the same way, so
+      // the provider-level circuit has to see it. Every other core reports an
+      // upstream failure as 502 for the same reason - a timeout is not a
+      // client problem, and 408 is not a 5xx, so the error budget would not
+      // see it either.
+      return createErrorResult(HTTP_STATUS.BAD_GATEWAY, sanitizeSecrets(`[${provider}] video ${method} timed out: ${error.message}`, credentials));
+    }
+    if (error?.name === "AbortError") {
+      // The CLIENT cancelled: the handler passes the request's own signal, so
+      // a client that walks away aborts the fetch. That says nothing about
+      // the provider - the request may never have been answered. chatCore
+      // reports the same thing as 499, and the breaker releases the probe
+      // for it instead of closing the circuit as though the provider had
+      // replied.
+      return createErrorResult(499, sanitizeSecrets(`[${provider}] video ${method} aborted: ${error.message}`, credentials));
     }
     // Never re-send a creation POST on network error — the job may already exist upstream.
     return createErrorResult(HTTP_STATUS.BAD_GATEWAY, sanitizeSecrets(`[${provider}] video upstream fetch failed: ${error.message}`, credentials));

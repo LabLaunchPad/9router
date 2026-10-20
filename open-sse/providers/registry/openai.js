@@ -82,4 +82,10 @@ export default {
   embeddingConfig: { baseUrl: "https://api.openai.com/v1/embeddings", authType: "apikey", authHeader: "bearer" },
   imageConfig: { baseUrl: "https://api.openai.com/v1/images/generations" },
   searchViaChat: { defaultModel: "gpt-4o-mini", pricingUrl: "https://openai.com/api/pricing" },
+  // Circuit breaker config per provider (overrides default)
+  circuitBreaker: {
+    failureThreshold: 3, // OpenAI: recover faster after failures
+    coolDownWindowMs: 120000, // 2 minutes
+    resetWindowMs: 600000,    // 10 minutes
+  },
 };

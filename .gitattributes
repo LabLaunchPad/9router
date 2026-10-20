@@ -1,0 +1,17 @@
+# A shebang combined with CRLF line endings breaks Vite's ES-module
+# transform. Git for Windows defaults to core.autocrlf=true, so a Windows
+# checkout has CRLF in the working tree, and the stray `\r` left on the
+# shebang line becomes a syntax error the moment a test imports the module:
+#
+#   SyntaxError: Invalid or unexpected token
+#
+# Node's own loader copes with a CRLF shebang — it strips the whole line —
+# and so does a `require()` of a CommonJS file. Vite's ESM transform does
+# not, so the failure only appears in the test suite and not when the
+# script is run.
+#
+# `scripts/ci/validate-slo.mjs` is the one ES module in the repository that
+# carries a shebang AND is imported by a test
+# (`tests/unit/slo-gate.test.js` imports it to exercise `evaluate()`).
+# Keep its line endings as they are committed.
+scripts/ci/validate-slo.mjs text eol=lf

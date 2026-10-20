@@ -1,0 +1,43 @@
+{
+  "title": "Real-Time Infrastructure Architecture Decision Record",
+  "status": "proposed",
+  "context": "9router application - AI provider dashboard with SSE streaming, collaborative editing, and model combo management",
+  "decisionDate": "2026-10-19",
+  "tags": ["realtime", "sse", "crdt", "xyflow", "dnd-kit", "monaco", "concurrency"],
+  "decision makers": ["Realtime Collaboration Engineer"],
+  "stakeholders": ["Product", "Engineering", "AI/ML"],
+  "problem statement": "Synchronize XYFlow diagram state, DnD-kit drag-and-drop events, Monaco editor content, and SSE-streamed AI responses across clients with convergence, resilience, and scalability requirements. Must survive network partitions, reconnects, concurrent edits, and deploys without data loss or divergence.",
+  "considered options": [
+    "WebSocket-only with manual reconnect logic",
+    "SSE with polling fallback",
+    "CRDT-based document state with server-arbitrated sequencing",
+    "OT (Operational Transforms) with central transformer",
+    "Server-arbitrated last-writer-wins for all state"
+  ],
+  "decision": "Hybrid approach: CRDT machinery for text/collaborative state where convergence matters, server-arbitrated last-writer-wins for status/fields, and ephemeral TTL-scoped presence. XYFlow state transmitted via seq-numbered ops over WebSocket with idempotent apply. DnD-kit events as durable ops. Monaco editor content as CRDT-backed document. SSE streaming as separate channel from durable state.",
+  "objectives": [
+    "Exactly-once delivery of durable ops (idempotent apply by opId)",
+    "Convergent text state (CRDT or OT) so concurrent edits merge",
+    "Predictable conflict resolution (last-writer-wins for non-text)",
+    "Resume from last acknowledged seq on reconnect (no data loss)",
+    "Presence ephemeral (TTL-based, lossy by design)",
+    "Backpressure before memory exhaustion",
+    "Deploy-safe drain (no thundering herd)",
+    "Hostile-network test coverage in CI"
+  ],
+  "resolved issues": [
+    "Convergence: CRDT for text (Yjs-like fractional indexing), LWW for status fields",
+    "Ordering: Server-assigned sequence numbers; client timestamps are wishes only",
+    "Idempotency: Every operation keyed by client-generated opId; duplicate apply is no-op",
+    "Presence vs documents: Separate channels - presence TTL-scoped, document ops durable log",
+    "Reconnect: Client tracks lastServerSeq; server replays gap from append-only op log",
+    "Backpressure: Coalesce updates (last-cursor-wins), bound queues, drop-then-resync"
+  ],
+  "related ADRs": [
+    {
+      "id": "SRE_ADR",
+      "name": "SRE Architecture Decision Record",
+      "location": "C:\\9router\\SRE_ADR.md"
+    }
+  ]
+}

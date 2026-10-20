@@ -1,0 +1,227 @@
+{
+  "project_status": {
+    "framework": "Next.js 16 app (v0.5.104)",
+    "testing": "Vitest v5.0.5 with ~300+ unit tests",
+    "dependencies": "621 npm packages",
+    "total_files": 1797,
+    "completed_fixes": [
+      "Pattern matching test expectations (combo-caps-resolver.test.js): 2 expectations updated from 200k to 1M",
+      "FIX_PLAN.md, FIX_SUMMARY.md, FINAL_SUMMARY.md created",
+      "web-performance-analysis.md created",
+      "4-point drift prevention checklist created (STATUS_UPDATE.md)"
+    ],
+    "active_issues": 3,
+    "risk_level": "Medium"
+  },
+  
+  "active_issues": {
+    "vitest_alias_resolution": {
+      "description": "Vitest config alias {find: /^@\\//, replacement: resolve(__dirname, \"../src\") + /} not resolving properly for all test files",
+      "affected_test_files": 5,
+      "import_instances": 15,
+      "affected_files": [
+        "tests/unit/bedrock-provider-api-secrets.test.js",
+        "tests/unit/force-stream-config.test.js",
+        "tests/unit/db-migration-chain.test.js"
+      ],
+      "root_cause": "Alias depends on test execution directory; __dirname resolves differently when running from C:\\9router vs C:\\9router\\tests",
+      "fix_options": [
+        {
+          "option": "A",
+          "description": "Ensure vitest runs from C:\\9router\\tests directory",
+          "effort": "1 min",
+          "risk": "Very Low"
+        },
+        {
+          "option": "B",
+          "description": "Update test imports to use relative paths instead of @/",
+          "effort": "1-2 hrs",
+          "risk": "Very Low"
+        },
+        {
+          "option": "C",
+          "description": "Fix vitest config __dirname resolution",
+          "effort": "30 min",
+          "risk": "Low"
+        }
+      ],
+      "status": "Pending"
+    },
+    
+    "minimax_tts_test_expectations": {
+      "description": "3 test expectations in minimax-tts.test.js expect result.success = false but code correctly returns true",
+      "affected_test_lines": [15, 35, 72, 91, 99],
+      "root_cause": "Minimax provider IS configured in registry (open-sse/providers/registry/minimax.js line 73) with ttsConfig.format: minimax-tts, but test expectations outdated",
+      "fix_required": {
+        "line_35": "expect(result.success).toBe(false) → expect(result.success).toBe(true)",
+        "line_91": "expect(result.success).toBe(false) → expect(result.success).toBe(true)",
+        "line_69_body": "expect(body).toEqual({ audio: \"AAECAw==\", format: \"mp3\" })" - should work correctly
+      },
+      "status": "Pending"
+    },
+    
+    "web_performance_improvements": {
+      "description": "Top 3 high-impact/low-effort perf fixes identified but not yet implemented",
+      "fixes": [
+        {
+          "id": "1",
+          "description": "Add preconnect to fonts.gstatic.com in layout.js",
+          "effort": "5 min",
+          "impact": "+100-200ms LCP",
+          "risk": "Very Low"
+        },
+        {
+          "id": "2",
+          "description": "Reduce Material Symbols font loading timeout from 3s to 1s",
+          "effort": "5 min",
+          "impact": "+200ms FCP",
+          "risk": "Very Low"
+        },
+        {
+          "id": "3",
+          "description": "Verify Tailwind v4 purge configuration; optimize CSS",
+          "effort": "30 min",
+          "impact": "50-100KB CSS savings",
+          "risk": "Low"
+        }
+      ],
+      "status": "Optional - post-test-fix"
+    }
+  },
+  
+  "task_breakdown": {
+    "priority_1_immediate": [
+      {
+        "id": "T1",
+        "description": "Fix vitest config alias resolution - Option A: ensure tests run from C:\\9router\\tests",
+        "effort": "1 min",
+        "owner": "PM",
+        "depends_on": [],
+        "deliverable": "npx vitest run completes without 'Cannot find package' errors for affected files"
+      },
+      {
+        "id": "T2",
+        "description": "Update minimax-tts test expectations: line 35 and line 91, change .toBe(false) to .toBe(true)",
+        "effort": "15 min",
+        "owner": "PM",
+        "depends_on": ["T1"],
+        "deliverable": "minimax-tts.test.js expectations match actual handleTtsCore behavior"
+      }
+    ],
+    
+    "priority_2_short_term": [
+      {
+        "id": "T3",
+        "description": "Run full test suite: npx vitest run from repository root",
+        "effort": "60-120 min",
+        "owner": "PM/Dev",
+        "depends_on": ["T1", "T2"],
+        "deliverable": "Test suite results document; baseline.txt created"
+      },
+      {
+        "id": "T4",
+        "description": "Apply top 3 web performance fixes (preconnect, font timeout, Tailwind purge)",
+        "effort": "40 min",
+        "owner": "Dev",
+        "depends_on": ["T3"],
+        "deliverable": "web-performance-analysis.md fixes implemented; Lighthouse scores improved"
+      }
+    ],
+    
+    "priority_3_optional": [
+      {
+        "id": "T5",
+        "description": "Create drift prevention CI check: add 4-point checklist to GitHub Actions",
+        "effort": "30 min",
+        "owner": "PM",
+        "depends_on": ["T3"],
+        "deliverable": ".github/workflows CI step that runs vitest and checks drift"
+      },
+      {
+        "id": "T6",
+        "description": "Add focus-visible styles to globals.css",
+        "effort": "10 min",
+        "owner": "Dev",
+        "depends_on": ["T3"],
+        "deliverable": "Accessibility improvement with no perf tradeoff"
+      }
+    ]
+  },
+  
+  "definitions_of_done": {
+    "vitest_alias_fix": "npx vitest run completes without 'Cannot find package' errors for all 5 affected test files; all @/... imports resolve correctly",
+    "minimax_tts_tests": "All 3 test expectations match actual handleTtsCore behavior; expect(result.success) = true; hex audio conversion produces expected base64 output",
+    "full_test_suite": "npx vitest run completes with 0 unexpected failures (known failures documented); baseline.txt recorded",
+    "web_performance": "Preconnect added to layout.js for fonts.gstatic.com; font timeout reduced from 3s to 1s; Tailwind purge verified; focus-visible styles added to globals.css"
+  },
+  
+  "drift_prevention_checklist": {
+    "four_points": [
+      "1. Run npx vitest run on affected test file(s) - record baseline",
+      "2. Verify all imports resolve (in test environment)",
+      "3. Check if change affects pattern matching order (capabilities.js)",
+      "4. Verify Math.min/max logic is intentional (combo caps aggregation)"
+    ],
+    "governance": {
+      "pre_commit": "Run 4-point checklist on changed files",
+      "ci_cd": "Add vitest run as gate on pull requests",
+      "monthly": "Review drift-report.txt for systematic issues",
+      "quarterly": "Full test suite run + performance audit"
+    }
+  },
+  
+  "recommendations": {
+    "sprint_planning": {
+      "sprint_1": {
+        "goal": "Enable test suite execution and verify core fixes",
+        "tasks": ["T1", "T2"],
+        "success_criteria": "Test suite runs without 'Cannot find package' errors; 2 of 3 minimax TTS tests pass"
+      },
+      "sprint_2": {
+        "goal": "Full test suite pass and baseline establishment",
+        "tasks": ["T3"],
+        "success_criteria": "npx vitest run completes; baseline.txt created; remaining failures documented"
+      },
+      "sprint_3": {
+        "goal": "Web performance improvements",
+        "tasks": ["T4", "T5", "T6"],
+        "success_criteria": "Perf improvements implemented; Lighthouse scores optimized"
+      }
+    },
+    "technical_debt_paydown": {
+      "vitest_alias": {"owner": "PM/Dev", "timeline": "This sprint", "effort": "30 min", "dependencies": "None"},
+      "minimax_tts_tests": {"owner": "PM/Dev", "timeline": "This sprint", "effort": "15 min", "dependencies": "T1"},
+      "full_test_suite": {"owner": "PM", "timeline": "Next sprint", "effort": "1 hr", "dependencies": "T1, T2"},
+      "pattern_documentation": {"owner": "Dev", "timeline": "Next sprint", "effort": "15 min", "dependencies": "None"}
+    },
+    "code_review_guidelines": {
+      "required_checks": [
+        "Run npx vitest run on affected test files - no new failures",
+        "Verify all imports resolve in test environment",
+        "If changing capabilities.js PATTERN_CAPABILITIES: check pattern order implications",
+        "If changing aggregateComboCapabilities: verify Math.min/max semantics preserved",
+        "Check drift-prevention 4-point checklist applied"
+      ],
+      "automated_gates": [
+        "npx vitest run must pass (or show only documented known failures)",
+        "Drift report must not show systematic new failures",
+        "Pattern order in capabilities.js must be reviewed on any change"
+      ]
+    },
+    "onboarding_new_developers": {
+      "key_concepts": [
+        "PATTERN_CAPABILITIES ordering: first match wins; specific before generic",
+        "Provider override short-circuiting: PROVIDER_CAPABILITIES wins over patterns (intentional)",
+        "Math.min/max semantics: contextWindow takes min across models; maxOutput takes max",
+        "Vitest alias system: @/ resolves to ../src/ but only when running from tests/ directory",
+        "Drift prevention: 4-point checklist must be followed on every change"
+      ],
+      "first_tasks": [
+        "Run npx vitest run from C:\\9router\\tests - verify it works",
+        "Read FIX_SUMMARY.md and FINAL_SUMMARY.md to understand investigation history",
+        "Fix one of the 5 affected test import paths to understand the alias issue",
+        "Update the minimax-tts test expectations to see the TTS flow in action"
+      ]
+    }
+  }
+}

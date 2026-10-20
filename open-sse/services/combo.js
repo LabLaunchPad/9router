@@ -374,9 +374,20 @@ export async function handleComboChat({ body, models, handleSingleModel, log, co
       try {
         const errorBody = await result.clone().json();
         errorText = errorBody?.error?.message || errorBody?.error || errorBody?.message || errorText;
-        retryAfter = errorBody?.retryAfter || null;
+        retryAfter = errorBody?.retryAfter || errorBody?.error?.retryAfter || null;
       } catch {
         // Ignore JSON parse errors
+      }
+
+      // The retry hint normally travels in the `retry-after` header (seconds),
+      // not in the body — that is what unavailableResponse() emits. Normalise
+      // it to an ISO timestamp so the earliest-value comparison below is
+      // meaningful and the exhausted-combo response can forward the hint.
+      if (!retryAfter) {
+        const headerSeconds = Number(result.headers?.get?.("retry-after"));
+        if (Number.isFinite(headerSeconds) && headerSeconds > 0) {
+          retryAfter = new Date(Date.now() + headerSeconds * 1000).toISOString();
+        }
       }
 
       // Track earliest retryAfter across all combo models
@@ -580,6 +591,35 @@ function collectPanel(calls, { minPanel, stragglerGraceMs, panelHardTimeoutMs })
 }
 
 /**
+ * Degrade to a panel answer that is already in hand.
+ *
+ * The panel responses are complete responses in the client's format, so the
+ * degraded answer can be returned as-is. Re-issuing the request to the panel
+ * model instead would:
+ *   - cost a second upstream call for a request the user already paid for,
+ *   - fail with 429/5xx even though a good answer was available, and
+ *   - hang for as long as the upstream allowed, because that call was not
+ *     wrapped in the hard timeout — the exact hang the judge timeout exists
+ *     to prevent.
+ *
+ * Trade-off: the panel responses are collected non-streaming, so a client that
+ * asked for `stream: true` receives the degraded answer as a complete
+ * response body rather than as an SSE stream. A complete answer in the
+ * client's own format beats a stream that may never arrive.
+ *
+ * Only the JUDGE degradation uses this. The "only one panel member
+ * succeeded" path keeps re-issuing with the client's original body, because
+ * that path has no hang to prevent and the re-issue preserves the client's
+ * stream flag and tools — both of which the panel response does not carry.
+ *
+ * @param {{ model: string, text: string, response: Response }} answer
+ * @returns {Response}
+ */
+function degradeToPanelAnswer(answer) {
+  return answer.response;
+}
+
+/**
  * Handle a fusion combo: fan the prompt out to every panel model in parallel,
  * then a judge model synthesizes one final answer from all panel responses.
  *
@@ -653,7 +693,10 @@ export async function handleFusionChat({ body, models, handleSingleModel, log, c
       const json = await res.clone().json();
       const text = extractPanelText(json);
       if (text) {
-        answers.push({ model, text });
+        // Keep the panel's own Response alongside the extracted text. It is a
+        // complete response in the client's format, so it can be returned as
+        // the degraded answer without issuing a second upstream request.
+        answers.push({ model, text, response: res });
         log.info("FUSION", `Panel ${model} ok (${text.length} chars)`);
       } else {
         log.warn("FUSION", `Panel ${model} returned empty content`);
@@ -672,6 +715,10 @@ export async function handleFusionChat({ body, models, handleSingleModel, log, c
     );
   }
   if (answers.length === 1) {
+    // Only one panel member succeeded and no judge ran. The client's original
+    // body is re-issued so the answer keeps the client's stream flag and its
+    // tools — the panel response has neither (the panel body is built with
+    // `stream: false` and the tools stripped).
     log.info("FUSION", `Only ${answers[0].model} succeeded — answering directly (no fusion)`);
     return handleSingleModel(body, answers[0].model);
   }
@@ -679,5 +726,21 @@ export async function handleFusionChat({ body, models, handleSingleModel, log, c
   // 4. Judge analyzes + writes one final answer (streams to client if requested).
   const judgeBody = appendUserTurn(body, buildJudgePrompt(answers));
   log.info("FUSION", `Judging ${answers.length} answers with ${judge}`);
-  return handleSingleModel(judgeBody, judge);
+
+  // The judge is subject to the same hard cap as the panel. Without it a hung
+  // judge stalls the request forever, which is worse than losing the
+  // synthesis: the panel answers are already in hand, so degrade to the first
+  // one instead of failing the request outright.
+  const judged = await withTimeout(handleSingleModel(judgeBody, judge), cfg.panelHardTimeoutMs);
+  if (judged?.__timeout) {
+    log.warn("FUSION", `Judge ${judge} timed out — degrading to first panel answer`);
+    return degradeToPanelAnswer(answers[0]);
+  }
+  if (judged?.__error) {
+    log.warn("FUSION", `Judge ${judge} threw — degrading to first panel answer`, {
+      error: judged.__error?.message || String(judged.__error),
+    });
+    return degradeToPanelAnswer(answers[0]);
+  }
+  return judged;
 }

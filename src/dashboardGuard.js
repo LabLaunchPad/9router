@@ -22,6 +22,13 @@ async function hasValidCliToken(request) {
 // Public API paths — no auth required (LLM API has its own key auth inside handler).
 const PUBLIC_API_PATHS = [
   "/api/health",
+  // Prometheus exposition endpoint. The CI SLO gate fetches it unauthenticated
+  // (scripts/ci/validate-slo.mjs uses a bare fetch with no cookies and no
+  // bearer token), so it has to be reachable. The payload is operational
+  // metadata only — request counters, latency histograms, breaker states and
+  // the error-budget gauge. No request payloads, credentials, headers or user
+  // data are exposed.
+  "/api/metrics",
   "/api/init",
   "/api/locale",
   "/api/auth/login",

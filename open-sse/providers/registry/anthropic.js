@@ -27,4 +27,10 @@ export default {
     { id: "claude-3-5-sonnet-20241022", name: "Claude 3.5 Sonnet" },
   ],
   serviceKinds: ["llm","imageToText"],
+  // Circuit breaker config per provider (overrides default)
+  circuitBreaker: {
+    failureThreshold: 4, // Anthropic: slightly more tolerant
+    coolDownWindowMs: 180000, // 3 minutes
+    resetWindowMs: 900000,    // 15 minutes
+  },
 };

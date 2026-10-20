@@ -26,8 +26,8 @@ afterEach(() => {
 
 describe("Schema migrations", () => {
   it("fresh DB → applies migrations & stamps schemaVersion", async () => {
-    const { getAdapter } = await import("@/lib/db/driver.js");
-    const { latestVersion } = await import("@/lib/db/migrations/index.js");
+    const { getAdapter } = await import("../../../src/lib/db/driver.js");
+    const { latestVersion } = await import("../../../src/lib/db/migrations/index.js");
     const db = await getAdapter();
     const row = db.get(`SELECT value FROM _meta WHERE key='schemaVersion'`);
     expect(parseInt(row.value, 10)).toBe(latestVersion());

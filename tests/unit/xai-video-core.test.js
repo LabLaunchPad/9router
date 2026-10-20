@@ -265,7 +265,12 @@ describe("handleVideoProxyCore", () => {
     expect(result.error).toContain("[redacted]");
   });
 
-  it("maps client aborts to 408 without retrying", async () => {
+  it("maps client aborts to 499 without retrying", async () => {
+    // The client cancelled: the request's own signal aborted the fetch, so
+    // the provider may never have answered. 499 is the status chatCore
+    // reports for the same event, and the breaker releases the half-open
+    // probe for it rather than closing the circuit as though the provider
+    // had replied.
     const abortError = new Error("This operation was aborted");
     abortError.name = "AbortError";
     global.fetch.mockRejectedValueOnce(abortError);
@@ -279,7 +284,29 @@ describe("handleVideoProxyCore", () => {
     });
 
     expect(result.success).toBe(false);
-    expect(result.status).toBe(408);
+    expect(result.status).toBe(499);
+    expect(global.fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("maps an upstream timeout to 502 without retrying", async () => {
+    // The upstream did not answer within VIDEO_FETCH_TIMEOUT_MS. That is a
+    // provider that is hanging, so it is a provider-level failure and
+    // belongs with the 502s every other core reports - 408 was neither a
+    // 5xx for the error budget nor a provider failure for the circuit, and
+    // both controls were blind to a provider that hangs.
+    const timeoutError = new Error("The operation was aborted due to timeout");
+    timeoutError.name = "TimeoutError";
+    global.fetch.mockRejectedValueOnce(timeoutError);
+
+    const result = await handleVideoProxyCore({
+      provider: "xai",
+      action: "generations",
+      rawBody: "{}",
+      credentials: { accessToken: "tok" },
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.status).toBe(502);
     expect(global.fetch).toHaveBeenCalledTimes(1);
   });
 });
