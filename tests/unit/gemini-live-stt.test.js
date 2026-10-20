@@ -446,6 +446,8 @@ describe("App-layer custom transport resolution (stt.js)", () => {
         // through this one; the test is about the transport, so the
         // resolver is a no-op here.
         clearAccountError: async () => {},
+        // The no-auth path records a failure on the breaker directly.
+        recordProviderFailure: async () => {},
       }));
       // getModelInfo stays REAL: "gemini/..." is a reserved-prefix passthrough,
       // so the parse→route hop in the chain is exercised, not stubbed.
