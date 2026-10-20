@@ -22,11 +22,16 @@ const WORKFLOW = readFileSync(WORKFLOW_PATH, "utf8");
 const GATE_SCRIPT = readFileSync(resolve(ROOT, "scripts/ci/validate-slo.mjs"), "utf8");
 const DOCS = readFileSync(resolve(ROOT, "PRODUCTION_READINESS_CONTROLS.md"), "utf8");
 
+// The workflow's lines, once. Several of the checks below read the file
+// differently - the path filter, the env block of a named step - and they
+// have to be looking at the same file.
+const WORKFLOW_LINES = WORKFLOW.split(/\r?\n/);
+
 /**
  * The `paths:` list of the pull_request trigger.
  */
 function pathPatterns() {
-  const lines = WORKFLOW.split(/\r?\n/);
+  const lines = WORKFLOW_LINES;
   const start = lines.findIndex((l) => /^\s{4}paths:\s*$/.test(l));
   expect(start, "the workflow must have a pull_request paths filter").toBeGreaterThan(-1);
 
@@ -134,20 +139,55 @@ describe("the drift workflow: the knobs it forwards to the SLO gate", () => {
     return knobs;
   }
 
-  it("forwards every knob the controls document lists", () => {
+  /**
+   * The env block of one step, read out of the workflow.
+   *
+   * Which block a knob is in is the whole point: the two env blocks have
+   * different jobs. The pre-check needs the endpoint, the alias, the skip
+   * and the override. The step that RUNS THE GATE SCRIPT needs every knob
+   * the script reads, because that block is the script's configuration and
+   * there is no other source for it.
+   *
+   * A check against the whole file cannot tell the two apart, so a knob
+   * forwarded only into the pre-check would pass it - and the operator would
+   * set it and never see it take effect.
+   */
+  function stepEnv(stepName) {
+    const start = WORKFLOW_LINES.findIndex((l) => l.includes("- name:") && l.includes(stepName));
+    expect(start, `the workflow must have a step named "${stepName}"`).toBeGreaterThan(-1);
+
+    const envAt = WORKFLOW_LINES.findIndex((l, i) => i > start && /^\s*env:\s*$/.test(l));
+    expect(envAt, `the step "${stepName}" must have an env block`).toBeGreaterThan(-1);
+
+    const indent = WORKFLOW_LINES[envAt].match(/^\s*/)[0].length;
+    const env = {};
+    for (let i = envAt + 1; i < WORKFLOW_LINES.length; i += 1) {
+      const line = WORKFLOW_LINES[i];
+      if (line.trim() === "") continue;
+      if (line.match(/^\s*/)[0].length <= indent) break;
+      const m = line.trim().match(/^([A-Z][A-Z0-9_]*):\s*(.*)$/);
+      if (m) env[m[1]] = m[2];
+    }
+    return env;
+  }
+
+  it("forwards every knob the controls document lists, to the step that runs the gate", () => {
     const knobs = documentedKnobs();
     expect(knobs.length).toBeGreaterThan(10);
 
+    // The block that matters is the one on the step that RUNS the script.
+    // The script's configuration comes from there and nowhere else.
+    const gateEnv = stepEnv("Run SLO validation gate");
+
     for (const knob of knobs) {
-      // The endpoint is a secret, the rest are repository variables; what
-      // matters is that the name reaches the gate's environment.
-      expect(WORKFLOW, `${knob} must be passed to the SLO gate`).toContain(`${knob}:`);
+      expect(gateEnv, `${knob} must reach the step that runs the gate script`).toHaveProperty(knob);
     }
   });
 
   it("forwards the knobs as repository variables, not as literals", () => {
     // A literal cannot be changed by an operator without a commit to this
     // repository — and the knobs in the table exist to be changed.
+    const gateEnv = stepEnv("Run SLO validation gate");
     for (const knob of [
       "SLO_REQUIRE_FULL_WINDOW",
       "SLO_MIN_SAMPLE_SECONDS",
@@ -155,10 +195,21 @@ describe("the drift workflow: the knobs it forwards to the SLO gate", () => {
       "SLO_MAX_REDIRECTS",
       "SLO_FETCH_TIMEOUT_MS",
     ]) {
-      expect(WORKFLOW, `${knob} must come from a repository variable`).toContain(
-        `${knob}: \${{ vars.${knob} }}`,
+      expect(gateEnv[knob], `${knob} must come from a repository variable`).toBe(
+        `\${{ vars.${knob} }}`,
       );
     }
+  });
+
+  it("forwards the endpoint to the pre-check as a secret", () => {
+    // The pre-check decides whether the gate can run at all, so it needs
+    // the endpoint — and the documented alias — plus the two ways an
+    // operator can release the gate without one.
+    const precheckEnv = stepEnv("Check SLO gate configuration");
+    expect(precheckEnv.SLO_METRICS_ENDPOINT).toBe("\${{ secrets.SLO_METRICS_ENDPOINT }}");
+    expect(precheckEnv.METRICS_ENDPOINT).toBe("\${{ secrets.METRICS_ENDPOINT }}");
+    expect(precheckEnv.SLO_GATE_SKIP).toBe("\${{ vars.SLO_GATE_SKIP }}");
+    expect(precheckEnv.SLO_GATE_OVERRIDE_APPROVED).toBe("\${{ vars.SLO_GATE_OVERRIDE_APPROVED }}");
   });
 
   it("forwards a knob the gate script reads", () => {
@@ -174,8 +225,9 @@ describe("the drift workflow: the knobs it forwards to the SLO gate", () => {
 
   it("forwards the knobs that are already forwarded", () => {
     // The ones that work today must keep working.
+    const gateEnv = stepEnv("Run SLO validation gate");
     for (const knob of ["SLO_GATE_SKIP", "SLO_GATE_OVERRIDE_APPROVED", "SLO_GATE_OVERRIDE_REASON"]) {
-      expect(WORKFLOW).toContain(`${knob}: \${{ vars.${knob} }}`);
+      expect(gateEnv[knob]).toBe(`\${{ vars.${knob} }}`);
     }
   });
 });
