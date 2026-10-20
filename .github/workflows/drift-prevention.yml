@@ -235,16 +235,16 @@ jobs:
           # Strip the ANSI escape sequences before anything parses the output
           # (see the baseline step for why).
           sed -r 's/\x1B\[[0-9;]*[a-zA-Z]//g' new-raw.txt > new-results.txt
-          # The summary line is "Tests  82 failed | 3760 passed | ...". vitest
+          # The summary line is "Tests  42 failed | 3695 passed | ...". vitest
           # prints TWO spaces, and the passed count is not always next to the
           # word "Tests" — in a failing run it is the second field. The
           # pattern that asked for exactly one space never matched anything,
           # so every run reported "Tests 0 passed" and the fallback hid it.
           # The field is taken out of the summary line instead.
           #
-          # The match is "3760 passed", and the echo below adds its own unit,
+          # The match is "3695 passed", and the echo below adds its own unit,
           # so the match is reduced to the bare number first. Without that,
-          # the line read "Baseline: Tests 3415 passed passed" — which is
+          # the line read "Baseline: Tests 3695 passed passed" — which is
           # exactly what the first run with this fix printed.
           BASELINE_PASSED=$(grep -E '^[[:space:]]*Tests[[:space:]]+' baseline-results.txt | tail -1 | grep -oE '[0-9]+ passed' | head -1 | cut -d' ' -f1 || true)
           NEW_PASSED=$(grep -E '^[[:space:]]*Tests[[:space:]]+' new-results.txt | tail -1 | grep -oE '[0-9]+ passed' | head -1 | cut -d' ' -f1 || true)

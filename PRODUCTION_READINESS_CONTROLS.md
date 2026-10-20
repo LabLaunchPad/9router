@@ -379,7 +379,7 @@ reading it, and all of them fixed here:
 - **The failure count was read from reporter-specific marker characters**
   (`×` / `✖`), and the baseline used a different reporter from the new run, so
   the two counts were not comparable. The count now comes from vitest's own
-  summary line (`Tests  77 failed | 3695 passed | …`), which every reporter
+  summary line (`Tests  42 failed | 3695 passed | …`), which every reporter
   emits identically.
 
 > **Any failure count quoted in this document is a number a run produced, not a
