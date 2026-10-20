@@ -128,12 +128,12 @@ describe("circuit breaker: every handler that claims the probe resolves it", () 
   it("has no handler that claims the probe without a way to resolve it", () => {
     // `clearAccountError` records the success; `recordProviderSuccess` is
     // the narrower way to do the same. Either is a resolver.
-    const RESOLVERS = ["clearAccountError", "recordProviderSuccess"];
+    const RESOLVERS = /\b(clearAccountError|recordProviderSuccess)\s*\(/;
 
     const offenders = [];
     for (const name of handlersThatObtainCredentials()) {
       const source = fs.readFileSync(path.join(HANDLERS_DIR, name), "utf8");
-      if (!RESOLVERS.some((r) => source.includes(r))) offenders.push(name);
+      if (!RESOLVERS.test(source)) offenders.push(name);
     }
 
     // A handler that obtains credentials and never resolves the probe
@@ -143,6 +143,78 @@ describe("circuit breaker: every handler that claims the probe resolves it", () 
     expect(
       offenders,
       `these handlers obtain credentials but never resolve the breaker's probe: ${offenders.join(", ")}`,
+    ).toEqual([]);
+  });
+
+  /**
+   * The blocks a line sits inside, outermost last.
+   *
+   * The chain is found by walking up the source and taking every line whose
+   * indentation is strictly smaller than the current level — those are the
+   * blocks the line is nested in. A closing brace at a smaller indentation
+   * ends the innermost block, so the level moves out to it and the walk
+   * continues above it.
+   */
+  function enclosingBlocks(lines, index) {
+    const blocks = [];
+    let level = lines[index].search(/\S/);
+    for (let j = index - 1; j >= 0; j -= 1) {
+      const indent = lines[j].search(/\S/);
+      if (indent < 0) continue; // blank line
+      if (indent >= level) continue; // still inside the current block
+      const text = lines[j].trim();
+      if (text.endsWith("{")) blocks.push(text);
+      level = indent;
+    }
+    return blocks;
+  }
+
+  /**
+   * Is this block one the SUCCESS path goes through?
+   *
+   * Two shapes count: the success callback the cores invoke once the
+   * upstream request has answered, and a branch on a success flag that is
+   * not negated. A branch on `!result.success` is the failure path, and a
+   * resolver there does not resolve a successful request's probe.
+   */
+  function isSuccessBlock(text) {
+    if (/onRequestSuccess\s*:/.test(text)) return true;
+    const m = text.match(/^(?:\}\s*else\s+)?if\s*\((.*)\)/);
+    if (!m) return false;
+    const cond = m[1];
+    if (!/success/i.test(cond)) return false;
+    if (/!\s*\w*success/i.test(cond)) return false;
+    return true;
+  }
+
+  it("resolves the probe on the success path, not merely somewhere in the file", () => {
+    // The check above is a presence proxy: a handler that NAMES a resolver
+    // but calls it only on its failure path passes it, and leaves exactly
+    // the defect this file is about — a successful request whose probe
+    // stays claimed. So the resolver is tied to the success path here.
+    const RESOLVERS = /\b(clearAccountError|recordProviderSuccess)\s*\(/;
+
+    const offenders = [];
+    for (const name of handlersThatObtainCredentials()) {
+      const source = fs.readFileSync(path.join(HANDLERS_DIR, name), "utf8");
+      const lines = source.split(/\r?\n/);
+
+      let resolvedOnSuccess = false;
+      lines.forEach((line, i) => {
+        if (resolvedOnSuccess) return;
+        if (!RESOLVERS.test(line)) return;
+        if (enclosingBlocks(lines, i).some(isSuccessBlock)) resolvedOnSuccess = true;
+      });
+
+      if (!resolvedOnSuccess) offenders.push(name);
+    }
+
+    // A resolver that is only reached on the failure path is as good as no
+    // resolver at all: the success path is the one that leaves the probe
+    // claimed, and it is the one that blackholes the provider.
+    expect(
+      offenders,
+      `these handlers obtain credentials but do not resolve the breaker's probe on the success path: ${offenders.join(", ")}`,
     ).toEqual([]);
   });
 });
