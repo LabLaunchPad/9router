@@ -12,22 +12,20 @@
  * That failure is silent. No test fails, no log line appears, the circuit
  * closes, and a provider that is still down is declared healthy.
  *
- * So the marking is checked, not trusted. The cores are scanned for the
- * places where a local failure is produced, and every one of them has to
- * say what it is. Two shapes count as a local failure:
+ * This file is the CHEAP SECOND NET: a scan of the cores for the places
+ * where a local failure is produced. It catches a failure that is written
+ * out inline and forgets to say what it is.
  *
- *   - a failure built with the error constructor and a LITERAL 4xx status.
- *     A provider's own 4xx never reaches a core as a literal — it arrives
- *     as `providerResponse.status` — so a literal 4xx in a core is always
- *     the core's own decision, and it is always raised before the call.
- *   - a hand-built failure object with a literal 4xx status. The search and
- *     fetch cores assemble their results as literals rather than through
- *     the constructor, which is exactly how they slipped past the
- *     constructor-based convention.
+ * It is not the control, and it does not claim to be. A scan can only
+ * recognise the shapes it was told about, and every helper that builds a
+ * failure result is a shape it does not know about — a scan of the source
+ * cannot see what a core RETURNS after it has wrapped a result. The control
+ * is behavioural: `local-failure-hand-built-cores.test.js` calls the cores'
+ * public entry points and asserts on the result that comes back.
  *
- * This is the shape of the guard in `breaker-probe-resolution.test.js`: a
- * scan of the source, because a control that is only enforced by the
- * reviewer's attention is a convention.
+ * The scan earns its place by being wider than the control in one respect:
+ * it sees the constructor-based cores, which are awkward to drive, and it
+ * sees a local failure the moment it is written, wherever it is written.
  */
 
 import { describe, expect, it } from "vitest";
@@ -39,9 +37,15 @@ const CORES_DIR = path.join(process.cwd(), "open-sse", "handlers");
 /** The 4xx statuses a core can raise on its own account. */
 const LOCAL_STATUSES = ["400", "401", "403", "404", "406", "409", "422"];
 
-/** A status a provider can answer with, named as a literal in the source. */
+/**
+ * A call whose first argument is a LITERAL 4xx — named (`HTTP_STATUS.
+ * BAD_REQUEST`) or written out (`400`). The numeric form matters: a
+ * failure written as `createErrorResult(400, …)` is the same local failure
+ * as one written as `createErrorResult(HTTP_STATUS.BAD_REQUEST, …)`, and a
+ * scan that only knows the named form does not see it.
+ */
 const LITERAL_4XX_CALL = new RegExp(
-  `createErrorResult\\(\\s*HTTP_STATUS\\.(BAD_REQUEST|UNAUTHORIZED|FORBIDDEN|NOT_FOUND|NOT_ACCEPTABLE|UNPROCESSABLE_ENTITY)`,
+  `\\(\\s*(?:HTTP_STATUS\\.)?(BAD_REQUEST|UNAUTHORIZED|FORBIDDEN|NOT_FOUND|NOT_ACCEPTABLE|UNPROCESSABLE_ENTITY|${LOCAL_STATUSES.join("|")})\\b`,
 );
 
 /** A hand-built failure object with a literal 4xx status. */
@@ -92,7 +96,7 @@ function localFailures() {
 
       const statement = statementAt(lines, i);
       const marked =
-        statement.includes("createLocalErrorResult") || statement.includes("upstreamContacted: false");
+        statement.includes("createLocalErrorResult") || statement.includes("upstreamContacted");
 
       found.push({
         file: path.relative(process.cwd(), file).replace(/\\/g, "/"),
@@ -129,17 +133,20 @@ describe("the cores: a local failure has to say it is one", () => {
   });
 
   it("covers the cores that build their results by hand", () => {
-    // The search and fetch cores never went through the error constructor.
-    // They are the reason the check above has to look at object literals as
-    // well, and they are pinned here so that a later refactor back to the
-    // constructor does not quietly narrow the scan.
+    // The search, fetch and chat-search cores never went through the error
+    // constructor. They are the reason the check above has to look at object
+    // literals and at numeric status literals as well, and they are pinned
+    // here so that a later refactor back to the constructor does not quietly
+    // narrow the scan.
     const failures = localFailures();
-    const fetch = failures.filter((f) => f.file === "open-sse/handlers/fetch/index.js");
-    const search = failures.filter((f) => f.file === "open-sse/handlers/search/index.js");
+    const handBuilt = failures.filter(
+      (f) =>
+        f.file === "open-sse/handlers/fetch/index.js" ||
+        f.file === "open-sse/handlers/search/index.js" ||
+        f.file === "open-sse/handlers/search/chatSearch.js",
+    );
 
-    expect(fetch.length).toBeGreaterThan(0);
-    expect(search.length).toBeGreaterThan(0);
-    expect(fetch.every((f) => f.marked)).toBe(true);
-    expect(search.every((f) => f.marked)).toBe(true);
+    expect(handBuilt.length).toBeGreaterThan(0);
+    expect(handBuilt.every((f) => f.marked)).toBe(true);
   });
 });

@@ -108,7 +108,11 @@ export function recordProviderFailure(provider, status, options = {}) {
   // and it is counted as one.
   if (Number(status) === 499) {
     cb.releaseProbe();
-    log.warn(
+    // `info`, not `warn`: a client that walked away is ordinary — a
+    // cancelled request, a closed tab — and the chat and video paths both
+    // produce them. The counter is the durable signal and the one an alert
+    // would be built on; the log line matches the event, not the rate.
+    log.info(
       "AUTH",
       `${provider} | request abandoned by the client (499) — probe released, breaker ${cb.state}`,
     );

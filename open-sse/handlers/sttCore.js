@@ -212,7 +212,7 @@ function textResponse(body) {
 
 // HuggingFace: POST raw binary to {baseUrl}/{model_id}
 async function transcribeHuggingFace(cfg, file, model, token) {
-  if (model.includes("..") || model.includes("//")) return createErrorResult(400, "Invalid model ID");
+  if (model.includes("..") || model.includes("//")) return createLocalErrorResult(400, "Invalid model ID");
   const url = `${cfg.baseUrl.replace(/\/+$/, "")}/${model}`;
   const buf = await file.arrayBuffer();
   const res = await fetch(url, {

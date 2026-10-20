@@ -43,13 +43,25 @@ function jsonResponse(payload, status = 200) {
   });
 }
 
-/** Wrap an error result with a Response object so the auth wrapper can return it directly. */
-function errorResult(status, error) {
+/**
+ * Wrap an error result with a Response object so the auth wrapper can return it
+ * directly.
+ *
+ * `upstreamContacted` says whether the provider was asked anything. A failure
+ * that never reached the provider says `false`; a failure that came back from
+ * the provider says `true`. It has to travel WITH the status, because the
+ * breaker tells the two apart by that fact: a provider that answered a 400 is
+ * alive, and a request that was never sent says nothing about it. A failure
+ * that loses the fact on the way out is read as "the provider ANSWERED", and
+ * it closes the half-open circuit of a provider that is still down.
+ */
+function errorResult(status, error, { upstreamContacted = true } = {}) {
   return {
     success: false,
     status,
     error,
-    response: jsonResponse({ error: { message: error, code: status } }, status)
+    response: jsonResponse({ error: { message: error, code: status } }, status),
+    upstreamContacted
   };
 }
 
@@ -166,7 +178,7 @@ export async function handleSearchCore({ body, provider, providerConfig, credent
 
   // 1. Sanitize query
   const { clean, error: sanitizeError } = sanitizeQuery(body.query || "");
-  if (sanitizeError) return errorResult(400, sanitizeError);
+  if (sanitizeError) return errorResult(400, sanitizeError, { upstreamContacted: false });
   const normalizedBody = { ...body, query: clean };
 
   // 2. Route: dedicated search API takes priority over chat-based
@@ -190,7 +202,7 @@ export async function handleSearchCore({ body, provider, providerConfig, credent
       log
     });
   } else {
-    return errorResult(400, `Provider ${provider.id} does not support web search`);
+    return errorResult(400, `Provider ${provider.id} does not support web search`, { upstreamContacted: false });
   }
 
   if (result.success) return successResult(result.data);
@@ -214,5 +226,10 @@ export async function handleSearchCore({ body, provider, providerConfig, credent
     if (fallback.success) return successResult(fallback.data);
   }
 
-  return errorResult(result.status || 502, result.error || "Search failed");
+  // The fact has to travel with the failure: this wraps the result the
+  // provider attempt produced, and a wrapper that rebuilds the result
+  // without carrying the fact turns every local failure into "the provider
+  // ANSWERED" — which closes the half-open circuit of a provider that is
+  // still down.
+  return errorResult(result.status || 502, result.error || "Search failed", { upstreamContacted: result.upstreamContacted });
 }

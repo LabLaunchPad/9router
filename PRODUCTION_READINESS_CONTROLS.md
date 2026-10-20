@@ -1013,14 +1013,24 @@ healthy and sending traffic back to it.
 
 That distinction is **checked, not trusted**, because the default is
 "contacted" and an unmarked local failure is silent: no test fails, no log
-line appears, the circuit closes. `tests/unit/local-failure-marking.test.js`
-scans the cores for the places where a local failure is produced — a failure
-built with a literal `4xx` status, whether it comes from the error
-constructor or from a hand-built object — and fails if any of them does not
-say that the provider was never contacted. The scan covers the search, fetch
-and chat-search cores, which assemble their results as literals rather than
-through the constructor; that is exactly how they slipped past a
-constructor-based convention.
+line appears, the circuit closes.
+
+The check that enforces it is behavioural:
+`tests/unit/local-failure-hand-built-cores.test.js` calls the cores' public
+entry points and asserts on the result that comes back. That layer matters —
+the search core does not return the result it is given, it wraps it, and a
+wrapper that rebuilds the result without carrying the fact turns every local
+failure back into "the provider ANSWERED". A test asserted one layer below
+the wrapper passes while the path is still broken: the fact is right at the
+producer and gone at the consumer.
+
+`tests/unit/local-failure-marking.test.js` is the cheap second net: a scan
+of the cores for the places where a local failure is produced, whether it
+comes from the error constructor or from a hand-built object. It is not the
+control — a scan of the source cannot see what a core *returns* after it has
+wrapped a result — but it sees the constructor-based cores, which are
+awkward to drive, and it sees a local failure the moment it is written,
+wherever it is written.
 
 A path that returns to the client without going through the account-failure
 path has to release the probe itself, or the provider is blackholed for the
@@ -1032,6 +1042,15 @@ sent, a client that walked away during it, and a credential with no API key
 version of `markAccountUnavailable` for those: it touches the breaker only
 and leaves the account alone, because the account is demonstrably not at
 fault.
+
+The reach of that rule is not "the handlers directory". It is every file in
+the tree that claims a probe — `tests/unit/breaker-probe-resolution.test.js`
+scans the whole of `src/` for files that call `getProviderCredentials`, and
+requires each of them to resolve the probe on its success path and to
+release it on the paths that produce no answer. The gemini native route is
+the file that leaked for twelve rounds precisely because it was outside the
+scope of the old scan: a control that depends on where the file that claims
+the probe happens to live is not a control.
 
 The no-auth free providers take an early return that hands back a **synthetic
 credential**, and that credential carries its `provider` — like a real one
@@ -1085,12 +1104,22 @@ Prometheus text exposition. Exports `sse_requests_total`,
 histogram, so memory is bounded regardless of traffic),
 `sse_error_budget_consumed`, `sse_circuit_breaker_state`,
 `sse_circuit_breaker_transitions_total`, `sse_circuit_breaker_rejections_total`,
+`sse_provider_local_failures_total`, `sse_provider_aborted_requests_total`,
 `sse_metrics_sample_age_seconds`, and `sse_metrics_dropped_series_total`.
 
 The `sse_error_budget_consumed` gauge is the signal the SLO gate reads. The
 sample-age gauge is what lets the gate tell whether the sample spans the SLO
 window — see the window note in section 1. The dropped-series gauge is
 non-zero when the registry had to refuse a series; it should always be zero.
+
+Two of the counters say what the others cannot. `sse_provider_local_failures_total`
+counts requests that **never reached the provider** — a request that could not
+be built, a missing field, a credential with no key. They are not provider
+failures, and they must not be read as such: a rising count is a problem in
+the request path, not an outage. `sse_provider_aborted_requests_total` counts
+requests the **client walked away** from. Neither series appears in the
+error budget — neither is a provider failure — but both explain a provider
+sitting in `half-open`: a probe that was claimed and never resolved.
 
 Both routes are in the dashboard guard's `PUBLIC_API_PATHS`: the SLO gate
 fetches `/api/metrics` unauthenticated (no cookies, no bearer token), so it
