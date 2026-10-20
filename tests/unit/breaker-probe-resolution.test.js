@@ -282,17 +282,77 @@ describe("circuit breaker: every file that claims the probe resolves it", () => 
     return blocks;
   }
 
-  /** The header line of the function a line sits in, or -1. */
-  function enclosingFunction(lines, index) {
+  /**
+   * The scope of a path: the blocks it sits inside, innermost first.
+   *
+   * A block is found by its header: the nearest line above whose indentation
+   * is smaller and which ends with `{`. Its body is the run of lines below
+   * the header that are indented deeper than it.
+   *
+   * The scope is what a path is inside, and a function body IS a block — so
+   * the scope of a path does not depend on how the function is written. An
+   * arrow-function handler, a nested helper and a `function` declaration all
+   * have a body, and this walk finds all three. Brace counting is not used:
+   * the source is full of template literals whose braces are not blocks.
+   */
+  function scopeOf(lines, index) {
+    const blocks = [];
     let level = lines[index].search(/\S/);
     for (let j = index - 1; j >= 0; j -= 1) {
       const indent = lines[j].search(/\S/);
-      if (indent < 0) continue;
-      if (indent >= level) continue;
-      if (/^(export\s+)?(async\s+)?function\s+\w+/.test(lines[j].trim())) return j;
+      if (indent < 0) continue; // blank line
+      if (indent >= level) continue; // still inside the current block
+      if (lines[j].trim().endsWith("{")) {
+        const body = [];
+        for (let k = j + 1; k <= index; k += 1) {
+          const inner = lines[k].search(/\S/);
+          if (inner < 0) continue; // blank
+          if (inner <= indent) break; // the block ended
+          body.push({ text: lines[k], index: k });
+        }
+        blocks.push({ header: lines[j].trim(), headerLine: j, body });
+      }
       level = indent;
     }
-    return -1;
+    return blocks;
+  }
+
+  /**
+   * Is a lookup in the scope of a path?
+   *
+   * The lookup is in scope when the path sits inside the scope the lookup
+   * is in: the blocks the lookup is in are the path's blocks, compared from
+   * the outermost inward. A lookup in a different function is not in scope
+   * — whether the path reached it through a call is not something a scan of
+   * the source can tell, and a check that cannot tell has to say so.
+   */
+  function isInScope(lookupScope, pathScope) {
+    if (lookupScope.length > pathScope.length) return false;
+    for (let k = 0; k < lookupScope.length; k += 1) {
+      const outer = lookupScope[lookupScope.length - 1 - k];
+      const outerPath = pathScope[pathScope.length - 1 - k];
+      if (!outerPath || outer.headerLine !== outerPath.headerLine) return false;
+    }
+    return true;
+  }
+
+  /**
+   * The name of the function a line sits in, or null when it cannot be
+   * found.
+   *
+   * The innermost function wins: a helper nested inside another function is
+   * the one that runs first.
+   */
+  function functionNameAt(lines, index) {
+    for (const block of scopeOf(lines, index)) {
+      const declared = block.header.match(/^(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s+(\w+)/);
+      if (declared) return declared[1];
+      const assigned = block.header.match(
+        /^(?:export\s+)?(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s*)?(?:\(|function\b)/,
+      );
+      if (assigned) return assigned[1];
+    }
+    return null;
   }
 
   it("has no error response after the credential lookup that leaves the probe claimed", () => {
@@ -307,6 +367,12 @@ describe("circuit breaker: every file that claims the probe resolves it", () => 
     // away before the request was sent, a client that walked away during
     // it, and a credential with no API key — and none of them touched the
     // breaker.
+    //
+    // The scope of a path is its chain of enclosing blocks, and a function
+    // body is a block: the check does not have to recognise how a function
+    // is written to know what encloses a path. An arrow-function handler
+    // and a nested helper are in scope exactly like a declaration — and a
+    // path the check cannot place is reported, not skipped.
     const ERROR_RESPONSE_AT_RETURN = /return\s+(new\s+)?Response(\.json)?\s*\(/;
     const ERROR_RESPONSE_BY_HELPER =
       /return\s+\w*(error|Error|unavailable|Unavailable|jsonResponse|JsonResponse)\w*\s*\(/;
@@ -314,10 +380,19 @@ describe("circuit breaker: every file that claims the probe resolves it", () => 
       /\b(?:status:\s*|HTTP_STATUS\.)(400|401|403|404|406|409|422|499|BAD_REQUEST|UNAUTHORIZED|FORBIDDEN|NOT_FOUND|NOT_ACCEPTABLE|UNPROCESSABLE_ENTITY)\b/;
 
     const offenders = [];
+    const undetermined = [];
 
     for (const file of filesThatObtainCredentials()) {
       const source = fs.readFileSync(path.join(process.cwd(), file), "utf8");
       const lines = source.split(/\r?\n/);
+
+      // Every credential lookup in the file, with the scope it sits in.
+      const lookups = [];
+      lines.forEach((line, i) => {
+        if (/getProviderCredentials\s*\(/.test(line)) {
+          lookups.push({ index: i, scope: scopeOf(lines, i) });
+        }
+      });
 
       lines.forEach((line, i) => {
         if (!/return\s+/.test(line)) return;
@@ -333,29 +408,52 @@ describe("circuit breaker: every file that claims the probe resolves it", () => 
         }
         if (!LOCAL_4XX.test(statement.join("\n"))) return;
 
-        // The probe is claimed by the credential lookup, so only a function
-        // that performs one can leak it — and only a path that comes after
-        // that lookup.
-        const fn = enclosingFunction(lines, i);
-        if (fn < 0) return;
-        const lookup = lines.findIndex(
-          (l, k) => k > fn && k < i && /getProviderCredentials\s*\(/.test(l),
-        );
-        if (lookup < 0) return;
+        const scope = scopeOf(lines, i);
 
-        const chain = blocksAbove(lines, i);
+        // The probe is claimed by the credential lookup, so only a path that
+        // comes after one can leak it.
+        const earlier = lookups.filter((l) => l.index < i);
+        if (!earlier.length) return; // nothing had been claimed yet
+
+        // A lookup is in this path's scope when the path sits inside the
+        // scope the lookup is in.
+        const inScope = earlier.filter((l) => isInScope(l.scope, scope));
+
+        // A lookup in another scope is this path's business only if the
+        // path calls the function that holds it — a sibling function's own
+        // lookup is nobody else's business.
+        const reachable = earlier.filter((l) => {
+          if (isInScope(l.scope, scope)) return false;
+          const name = functionNameAt(lines, l.index);
+          if (!name) return true; // the holder cannot be named → cannot tell
+          const call = new RegExp(`\\b${name}\\s*\\(`);
+          return scope.some((b) => b.body.some((line) => call.test(line.text)));
+        });
+
+        if (!inScope.length && reachable.length) {
+          // The lookup is in a helper this path calls. Whether the probe was
+          // claimed on this path is not something a scan of the source can
+          // tell, and a check that cannot tell has to say so rather than
+          // pass quietly.
+          undetermined.push(`${file}:${i + 1}  ${line.trim()}`);
+          return;
+        }
+        if (!inScope.length) return; // nothing on this path could have claimed it
 
         // The branch where the lookup found nothing: the probe was never
         // claimed there, so nothing is owed.
-        const target = lines[lookup].match(/(?:const|let|var)\s+(\w+)\s*=/);
-        const foundNothing = target
-          ? new RegExp(`(!\\s*${target[1]}\\b|${target[1]}\\.allRateLimited\\b)`)
-          : /(\!\s*credentials\b|credentials\.allRateLimited\b)/;
-        if (chain.some((b) => foundNothing.test(b.header))) return;
+        const foundNothing = inScope.some((lookup) => {
+          const target = lines[lookup.index].match(/(?:const|let|var)\s+(\w+)\s*=/);
+          const pattern = target
+            ? new RegExp(`(!\\s*${target[1]}\\b|${target[1]}\\.allRateLimited\\b)`)
+            : /(!\s*credentials\b|credentials\.allRateLimited\b)/;
+          return scope.some((b) => pattern.test(b.header));
+        });
+        if (foundNothing) return;
 
         // A resolver anywhere in the chain of enclosing blocks counts: the
         // release may be made once above the branch rather than inside it.
-        if (chain.some((b) => RESOLVERS.test(b.body))) return;
+        if (scope.some((b) => b.body.some((l) => RESOLVERS.test(l.text)))) return;
 
         offenders.push(`${file}:${i + 1}  ${line.trim()}`);
       });
@@ -364,6 +462,13 @@ describe("circuit breaker: every file that claims the probe resolves it", () => 
     expect(
       offenders,
       `these paths return an error after claiming the probe without releasing it: ${offenders.join(" | ")}`,
+    ).toEqual([]);
+
+    // A path the check cannot place is a path the check cannot vouch for.
+    // Silence would read as coverage.
+    expect(
+      undetermined,
+      `these paths are in a scope the check cannot determine: ${undetermined.join(" | ")}`,
     ).toEqual([]);
   });
 });

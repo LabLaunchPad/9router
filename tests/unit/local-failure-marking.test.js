@@ -1,10 +1,10 @@
 /**
- * A local failure has to SAY that it is one.
+ * A failure has to SAY what it is.
  *
  * The breaker tells two failures apart by a fact, not by a status: a
  * provider that ANSWERED with a 400 is alive, and a request that was never
  * sent says nothing at all. The fact travels on the failure record
- * (`upstreamContacted: false`), and the default is "contacted" — so a local
+ * (`upstreamContacted`), and the default is "contacted" — so a local
  * failure that is not marked is indistinguishable from a provider that
  * answered, and the half-open circuit closes as though the provider had
  * replied.
@@ -13,19 +13,31 @@
  * closes, and a provider that is still down is declared healthy.
  *
  * This file is the CHEAP SECOND NET: a scan of the cores for the places
- * where a local failure is produced. It catches a failure that is written
- * out inline and forgets to say what it is.
+ * where a failure is produced. It has two rules.
  *
- * It is not the control, and it does not claim to be. A scan can only
- * recognise the shapes it was told about, and every helper that builds a
- * failure result is a shape it does not know about — a scan of the source
- * cannot see what a core RETURNS after it has wrapped a result. The control
- * is behavioural: `local-failure-hand-built-cores.test.js` calls the cores'
- * public entry points and asserts on the result that comes back.
+ *   1. A LOCAL failure — one raised on the core's own account, before
+ *      anything was sent — has to say `upstreamContacted: false`.
+ *   2. EVERY failure result has to carry the fact, whatever its status.
+ *
+ * The second rule is the one that closes the shape that round 14 found: a
+ * function that is handed a marked result and rebuilds it without the mark.
+ * The rule is a property of the RESULT, not of the function that made it,
+ * so it does not care how the function is written — a nested helper, an
+ * arrow function and a one-line object literal are all the same thing to
+ * it. A rule that recognises a shape is a rule a refactor can walk out of,
+ * and this class of defect is the one that has cost two rounds now.
+ *
+ * It is still not the control, and it does not claim to be. A scan of the
+ * source cannot see what a core RETURNS after it has wrapped a result, and
+ * it cannot see the handler that reads it. The control is behavioural:
+ * `local-failure-hand-built-cores.test.js` calls the cores' public entry
+ * points and asserts on the result that comes back, and
+ * `local-failure-wiring.test.js` drives the handler that hands it to the
+ * breaker.
  *
  * The scan earns its place by being wider than the control in one respect:
  * it sees the constructor-based cores, which are awkward to drive, and it
- * sees a local failure the moment it is written, wherever it is written.
+ * sees a failure the moment it is written, wherever it is written.
  */
 
 import { describe, expect, it } from "vitest";
@@ -68,11 +80,16 @@ function coreFiles() {
 }
 
 /**
- * The statement a match sits in: the matched line and the lines after it
- * up to the one that ends the statement.
+ * The statement a match sits in: the matched line and the lines after it up
+ * to the one that ENDS the statement.
+ *
+ * A line that ends the statement itself ends it there. Reading past it
+ * would let a fact that belongs to a later statement vouch for this one,
+ * which is the difference between a check and a coincidence.
  */
 function statementAt(lines, index) {
   const parts = [lines[index]];
+  if (lines[index].includes(";")) return parts.join("\n");
   for (let j = index + 1; j < lines.length && j <= index + 12; j += 1) {
     parts.push(lines[j]);
     if (lines[j].includes(";")) break;
@@ -81,7 +98,7 @@ function statementAt(lines, index) {
 }
 
 /**
- * Every local failure the cores raise, and whether it says what it is.
+ * Every failure the cores raise, and whether it says what it is.
  */
 function localFailures() {
   const found = [];
@@ -103,6 +120,35 @@ function localFailures() {
         line: i + 1,
         text: line.trim(),
         marked,
+      });
+    });
+  }
+  return found;
+}
+
+/**
+ * Every failure RESULT the cores build by hand, and whether it carries the
+ * fact.
+ *
+ * The shared constructors are not in this list: `createErrorResult` states
+ * that the provider was asked and `createLocalErrorResult` states that it
+ * was not, so a failure built through either of them carries the fact by
+ * construction. This is about the object literals — the ones a core writes
+ * out for itself, which is where a fact gets lost.
+ */
+function handBuiltFailures() {
+  const found = [];
+  for (const file of coreFiles()) {
+    const lines = fs.readFileSync(file, "utf8").split(/\r?\n/);
+    lines.forEach((line, i) => {
+      if (!line.includes("success: false")) return;
+
+      const statement = statementAt(lines, i);
+      found.push({
+        file: path.relative(process.cwd(), file).replace(/\\/g, "/"),
+        line: i + 1,
+        text: line.trim(),
+        carries: statement.includes("upstreamContacted"),
       });
     });
   }
@@ -151,87 +197,26 @@ describe("the cores: a local failure has to say it is one", () => {
   });
 });
 
-/**
- * The functions in the cores that BUILD a failure result.
- *
- * A function that takes a failure and hands it on — a status, an error, a
- * whole result — has to carry the fact with it. This is the shape that
- * round 14's defect had: the search core's `errorResult` was given a marked
- * result, rebuilt it without the mark, and the fact was gone by the time
- * the handler read it. The call-site scan above sees the arguments; it
- * cannot see the return value of the function they were passed to.
- *
- * The scope is the functions that FORWARD a failure. A function that builds
- * a fresh failure out of an upstream response has no fact to forward — the
- * provider demonstrably answered — so it is not in scope here.
- */
-function failureBuilders() {
-  const found = [];
-  const FUNCTION = /^(export\s+)?(async\s+)?function\s+(\w+)\s*\(([^)]*)\)/;
-  // A parameter that carries a failure: a status, an error, a whole result.
-  const FORWARDS_A_FAILURE = /\b(status|error|result|err|failure|outcome)\b/i;
-
-  for (const file of coreFiles()) {
-    const lines = fs.readFileSync(file, "utf8").split(/\r?\n/);
-    lines.forEach((line, i) => {
-      const m = line.match(FUNCTION);
-      if (!m) return;
-      const [, , , name, params] = m;
-
-      // The body: to the end of the function, by indentation.
-      const level = line.search(/\S/);
-      const body = [];
-      for (let j = i + 1; j < lines.length; j += 1) {
-        const indent = lines[j].search(/\S/);
-        if (indent < 0) continue;
-        if (indent <= level && lines[j].trim().startsWith("}")) break;
-        body.push(lines[j]);
-      }
-      const text = body.join("\n");
-
-      // Does it build a failure result at all?
-      const builds = text.includes("success: false") || /create(Local)?ErrorResult\s*\(/.test(text);
-      if (!builds) return;
-
-      // Does it forward a failure it was given?
-      if (!FORWARDS_A_FAILURE.test(params)) return;
-
-      found.push({
-        file: path.relative(process.cwd(), file).replace(/\\/g, "/"),
-        line: i + 1,
-        name,
-        text: line.trim(),
-        carries: text.includes("upstreamContacted"),
-      });
-    });
-  }
-  return found;
-}
-
-describe("the cores: a function that forwards a failure forwards the fact", () => {
-  it("finds the failure builders, so the check below is not vacuous", () => {
-    const builders = failureBuilders();
-    expect(builders.length).toBeGreaterThan(0);
-    // The function that dropped the fact in round 14 is pinned here: it is
-    // in scope, and it carries the fact now.
-    const errorResult = builders.find((b) => b.name === "errorResult");
-    expect(errorResult, "the search core's errorResult is in scope").toBeTruthy();
-    expect(errorResult.file).toBe("open-sse/handlers/search/index.js");
+describe("the cores: every failure result carries the fact", () => {
+  it("finds the hand-built failure results, so the check below is not vacuous", () => {
+    const failures = handBuiltFailures();
+    expect(failures.length).toBeGreaterThan(0);
+    expect(failures.some((f) => f.carries)).toBe(true);
   });
 
-  it("has no failure builder that forwards a failure without the fact", () => {
-    const offenders = failureBuilders()
-      .filter((b) => !b.carries)
-      .map((b) => `${b.file}:${b.line}  ${b.text}`);
+  it("has no failure result that drops the fact", () => {
+    const dropped = handBuiltFailures()
+      .filter((f) => !f.carries)
+      .map((f) => `${f.file}:${f.line}  ${f.text}`);
 
-    // A builder that drops the fact turns every local failure it handles
-    // back into "the provider ANSWERED" — the half-open circuit closes, and
-    // a provider that is still down is declared healthy. The mark is
-    // correct at the call site and gone at the consumer, which is the
-    // hardest kind of defect to see.
+    // A failure result without the fact is read by the breaker as "the
+    // provider ANSWERED" — whether it was a local failure or an upstream
+    // one, the reader cannot tell. The mark is right at the producer and
+    // gone at the consumer, which is the hardest kind of defect to see:
+    // nothing fails, nothing is logged, and the circuit closes.
     expect(
-      offenders,
-      `these functions forward a failure without forwarding the fact: ${offenders.join(" | ")}`,
+      dropped,
+      `these failure results do not carry the fact: ${dropped.join(" | ")}`,
     ).toEqual([]);
   });
 });

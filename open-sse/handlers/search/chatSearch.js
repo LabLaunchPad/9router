@@ -491,11 +491,12 @@ export async function handleChatSearch({
     clearTimeout(timer);
     if (err?.name === "AbortError") {
       log?.warn?.(`[chatSearch] timeout provider=${provider}`);
-      return { success: false, status: 504, error: "Upstream timeout" };
+      return { success: false, status: 504, error: "Upstream timeout", upstreamContacted: true };
     }
     log?.error?.(`[chatSearch] network error provider=${provider}: ${err?.message}`);
     return {
       success: false,
+      upstreamContacted: true,
       status: 502,
       error: `Network error: ${err?.message || "unknown"}`
     };
@@ -509,6 +510,7 @@ export async function handleChatSearch({
   } catch {
     return {
       success: false,
+      upstreamContacted: true,
       status: 502,
       error: `Invalid upstream response (status ${resp.status})`
     };
@@ -523,6 +525,7 @@ export async function handleChatSearch({
     log?.warn?.(`[chatSearch] upstream error provider=${provider} status=${resp.status}`);
     return {
       success: false,
+      upstreamContacted: true,
       status: resp.status,
       error: typeof errMsg === "string" ? errMsg : JSON.stringify(errMsg)
     };

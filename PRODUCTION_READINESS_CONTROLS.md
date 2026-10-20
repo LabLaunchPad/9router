@@ -1024,6 +1024,19 @@ failure back into "the provider ANSWERED". A test asserted one layer below
 the wrapper passes while the path is still broken: the fact is right at the
 producer and gone at the consumer.
 
+The fact has three legs: the core marks it, the handler passes it on, the
+breaker reads it. The first leg is guarded by the behavioural core tests and
+the scan below; the third by the breaker's own rules. The middle leg is the
+one that had a single handler covered out of ten, and it is now guarded
+twice. `tests/unit/local-failure-wiring.test.js` drives the embeddings
+handler and the search handler — the search path is the one that broke in
+round 14 — and asserts that the value reaches the account-failure path.
+The same file scans the handler layer: every call to `markAccountUnavailable`
+in `src/sse/` has to state the fact, so a handler cannot drop it by
+accident. The scan cannot tell a hard-coded `true` from the fact read off
+the result — the behavioural tests are what prove the value — but it proves
+that no call site is left to the default at all.
+
 `tests/unit/local-failure-marking.test.js` is the cheap second net: a scan
 of the cores for the places where a local failure is produced, whether it
 comes from the error constructor or from a hand-built object. It is not the
@@ -1032,11 +1045,21 @@ wrapped a result — but it sees the constructor-based cores, which are
 awkward to drive, and it sees a local failure the moment it is written,
 wherever it is written.
 
-The scan has a second rule for the shape that round 14 found: a function
-that *forwards* a failure — one that is handed a status, an error, or a
-whole result and hands it on — has to forward the fact with it. The
+The scan has a second rule for the shape that round 14 found: **every
+failure result a core builds carries the fact**, whatever its status. The
 call-site rule sees the arguments; it cannot see the return value of the
 function they were passed to, and that is where the fact was lost.
+
+That rule is a property of the *result*, not of the function that made it,
+and that is the whole point. A rule that recognises a shape — a function
+declaration at the top level of a file, with a parameter named after a
+failure — is a rule a refactor can walk out of: a nested helper, an arrow
+function and a one-line object literal all escape it, and the demo in the
+test's own history saw one wrapper in four. The per-site rule sees all of
+them, because it asks what the result carries rather than how the code that
+built it is spelled. The shared constructors state the fact once — the one
+for a failure where the provider was asked, and the one for a failure where
+it was not — and the hand-built results say it at the site.
 
 A path that returns to the client without going through the account-failure
 path has to release the probe itself, or the provider is blackholed for the
@@ -1055,8 +1078,10 @@ the equivalent failure on the STT path (a credential with no token): a
 credential that can never work is put aside for a cooldown rather than
 re-selected on every request. So that one goes through
 `markAccountUnavailable(..., { upstreamContacted: false })` — the local
-failure releases the probe and records nothing against the provider, and the
-credential is locked. The two decisions are independent: the breaker asks
+failure releases the probe and records no *failure* against the provider, and
+the credential is locked. The counter is a separate thing: the exit is
+counted in `sse_provider_local_failures_total`, under the provider's label,
+because that counter exists to count exactly these exits. The two decisions are independent: the breaker asks
 "was the provider asked anything?" and the account asks "can this
 credential work?", and a failure can fail the first while passing the
 second.
@@ -1070,13 +1095,27 @@ the file that leaked for twelve rounds precisely because it was outside the
 scope of the old scan: a control that depends on where the file that claims
 the probe happens to live is not a control.
 
-The "no answer" check is scoped to the function that claims the probe — a
-path that returns an error after the credential lookup, in a function that
+The "no answer" check is scoped to the *scope* that claims the probe — a
+path that returns an error after the credential lookup, in a scope that
 performs one, has to release the probe on the way out. It reads an error
 response whether it is built at the return site or handed back by a helper,
 and it looks at the whole chain of enclosing blocks, so a release made once
 above the branch counts. The branch where the lookup found *nothing* is
 excluded: the probe was never claimed there, so nothing is owed.
+
+The scope is the chain of enclosing blocks, and a function body is a block —
+so the check does not have to recognise how a function is written to know
+what encloses a path. An arrow-function handler and a nested helper are in
+scope exactly like a `function` declaration. The earlier version matched
+function declarations instead, and a file written with an arrow function was
+outside the check without saying so: the paths were skipped, and the check
+still reported the tree as clean.
+
+A path whose scope the check cannot place is **reported**, not skipped. The
+case is a handler that obtains its credentials in a helper: whether the
+probe was claimed on that path is not something a scan of the source can
+tell, and a check that cannot tell has to say so — silence reads as
+coverage.
 
 The no-auth free providers take an early return that hands back a **synthetic
 credential**, and that credential carries its `provider` — like a real one

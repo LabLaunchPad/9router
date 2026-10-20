@@ -90,11 +90,19 @@ export async function parseUpstreamError(response, executor = null) {
 }
 
 /**
- * Create error result for chatCore handler
+ * Create error result for a failure where the provider was asked.
+ *
+ * The result says `upstreamContacted: true`: the upstream call was made and
+ * it failed, so the provider was asked and it answered — with a refusal, an
+ * error, or nothing at all. The circuit breaker needs to know that
+ * difference. A provider that ANSWERED is alive, and a request that was
+ * never sent says nothing about it — `createLocalErrorResult` is the one
+ * that says the latter.
+ *
  * @param {number} statusCode - HTTP status code
  * @param {string} message - Error message
  * @param {number} [resetsAtMs] - Optional precise cooldown expiry (ms epoch) for provider-specific quota errors
- * @returns {{ success: false, status: number, error: string, response: Response, resetsAtMs?: number }}
+ * @returns {{ success: false, status: number, error: string, response: Response, resetsAtMs?: number, upstreamContacted: true }}
  */
 export function createErrorResult(statusCode, message, resetsAtMs, extraHeaders = null) {
   return {
@@ -102,6 +110,7 @@ export function createErrorResult(statusCode, message, resetsAtMs, extraHeaders 
     status: statusCode,
     error: message,
     resetsAtMs,
+    upstreamContacted: true,
     response: errorResponse(statusCode, message, extraHeaders)
   };
 }

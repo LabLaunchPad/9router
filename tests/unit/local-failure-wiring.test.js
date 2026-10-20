@@ -15,9 +15,19 @@
  * is the shape this branch's reviews have kept finding: a control that
  * exists, is tested in isolation, and is not connected to the path it claims
  * to govern.
+ *
+ * The handler half is guarded two ways. The behavioural tests below drive a
+ * handler and assert that the fact reaches the breaker — one of them for
+ * the embeddings path and one for the search path, which is the path round
+ * 14 broke. The scan below covers the rest: every call site that hands a
+ * failure to the breaker has to state the fact, so a handler cannot drop it
+ * by accident. The behavioural tests prove the VALUE; the scan proves that
+ * no call site is left to the default.
  */
 
 import { describe, expect, it, vi, beforeEach } from "vitest";
+import fs from "node:fs";
+import path from "node:path";
 
 const authMocks = vi.hoisted(() => ({
   getProviderCredentials: vi.fn(async () => ({
@@ -37,11 +47,13 @@ const authMocks = vi.hoisted(() => ({
 
 const coreMocks = vi.hoisted(() => ({
   handleEmbeddingsCore: vi.fn(),
+  handleSearchCore: vi.fn(),
 }));
 
 vi.mock("@/sse/services/auth.js", () => authMocks);
 vi.mock("@/lib/localDb", () => ({
   getSettings: vi.fn(async () => ({ requireApiKey: false })),
+  getCombos: vi.fn(async () => []),
 }));
 vi.mock("@/sse/services/model.js", () => ({
   getModelInfo: vi.fn(async () => ({ provider: "openai", model: "text-embedding-3-small" })),
@@ -49,15 +61,26 @@ vi.mock("@/sse/services/model.js", () => ({
 vi.mock("@/sse/services/keyAccess.js", () => ({
   getKeyAccessContext: vi.fn(async () => ({})),
   enforceKeyAccessResolved: vi.fn(async () => null),
+  enforceKeyAccessProvider: vi.fn(async () => null),
 }));
 vi.mock("@/sse/services/tokenRefresh.js", () => ({
   checkAndRefreshToken: vi.fn(async (_p, creds) => creds),
   updateProviderCredentials: vi.fn(async () => {}),
 }));
+vi.mock("@/sse/services/combo.js", () => ({
+  handleComboChat: vi.fn(),
+  getComboModelsFromData: vi.fn(() => null),
+}));
 vi.mock("@/lib/usageDb.js", () => ({ saveRequestUsage: vi.fn(async () => {}) }));
 vi.mock("open-sse/handlers/embeddingsCore.js", () => coreMocks);
+vi.mock("open-sse/handlers/search/index.js", () => coreMocks);
+vi.mock("@/shared/constants/providers.js", () => ({
+  AI_PROVIDERS: { openai: { searchConfig: { authType: "bearer" } } },
+  resolveProviderId: (id) => id,
+}));
 
 const { handleEmbeddings } = await import("../../src/sse/handlers/embeddings.js");
+const { handleSearch } = await import("../../src/sse/handlers/search.js");
 // The real core, for the two cases that are about what the core produces.
 // The handler drives the mocked one, so that the two halves of the chain
 // are tested against the same contract.
@@ -70,9 +93,17 @@ const request = () =>
     body: JSON.stringify({ model: "openai/text-embedding-3-small", input: "hello" }),
   });
 
+const searchRequest = () =>
+  new Request("http://localhost/v1/search", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ provider: "openai", query: "hello" }),
+  });
+
 beforeEach(() => {
   authMocks.markAccountUnavailable.mockClear();
   coreMocks.handleEmbeddingsCore.mockReset();
+  coreMocks.handleSearchCore.mockReset();
 });
 
 describe("the core says whether the provider was contacted", () => {
@@ -132,6 +163,33 @@ describe("the handler passes it on", () => {
     );
   });
 
+  it("tells the breaker that the provider was never contacted, on the search path", async () => {
+    // The search path is the one round 14 broke: the core marked the
+    // failure and the wrapper threw the marking away. The handler is the
+    // layer that reads the fact, so it is the layer that has to be proven
+    // on this path too.
+    coreMocks.handleSearchCore.mockResolvedValueOnce({
+      success: false,
+      status: 400,
+      error: "Query contains invalid control characters",
+      upstreamContacted: false,
+    });
+
+    await handleSearch(searchRequest());
+
+    expect(
+      authMocks.markAccountUnavailable,
+      "the local-failure fact has to reach the account-failure path",
+    ).toHaveBeenCalledWith(
+      "conn-1",
+      400,
+      "Query contains invalid control characters",
+      "openai",
+      "websearch:openai",
+      { upstreamContacted: false },
+    );
+  });
+
   it("assumes the provider was contacted when the core does not say", async () => {
     // An upstream failure: the provider WAS asked, and it answered with a
     // 502. The fact is absent, and the default has to be "contacted" — the
@@ -152,5 +210,85 @@ describe("the handler passes it on", () => {
       "text-embedding-3-small",
       { upstreamContacted: true },
     );
+  });
+});
+
+/**
+ * Every place a handler hands a failure to the breaker.
+ *
+ * The call has to state the fact. Leaving it to the default means the
+ * handler's author has to know what the default is and that it happens to
+ * be right for this call — and the failure that gets it wrong is silent:
+ * a local failure is read as "the provider ANSWERED", the half-open circuit
+ * closes, and a provider that is still down is declared healthy.
+ *
+ * The scan cannot tell a hard-coded `true` from the fact read off the
+ * result; the behavioural tests above are what prove the value. What this
+ * proves is that no call site is left to the default at all.
+ */
+const SRC_DIR = path.join(process.cwd(), "src");
+
+function breakerCallSites() {
+  const found = [];
+  const walk = (dir) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        walk(full);
+      } else if (entry.name.endsWith(".js")) {
+        const lines = fs.readFileSync(full, "utf8").split(/\r?\n/);
+        lines.forEach((line, i) => {
+          if (!/markAccountUnavailable\s*\(/.test(line)) return;
+          // The definition is not a call site.
+          if (/function\s+markAccountUnavailable/.test(line)) return;
+          // A comment is not a call site.
+          const trimmed = line.trim();
+          if (trimmed.startsWith("//") || trimmed.startsWith("*")) return;
+
+          // The call's arguments: the statement the call sits in.
+          const parts = [line];
+          if (!line.includes(");")) {
+            for (let j = i + 1; j < lines.length && j <= i + 12; j += 1) {
+              parts.push(lines[j]);
+              if (lines[j].includes(");")) break;
+            }
+          }
+          const call = parts.join("\n");
+
+          found.push({
+            file: path.relative(process.cwd(), full).replace(/\\/g, "/"),
+            line: i + 1,
+            text: trimmed,
+            states: call.includes("upstreamContacted"),
+          });
+        });
+      }
+    }
+  };
+  walk(SRC_DIR);
+  return found;
+}
+
+describe("the handler layer: every call states the fact", () => {
+  it("finds the call sites, so the check below is not vacuous", () => {
+    const sites = breakerCallSites();
+    expect(sites.length).toBeGreaterThan(0);
+    // The call sites are pinned: the handlers and the gemini native route.
+    // They are the ones that hand a failure to the breaker, and a file
+    // that stops appearing here is a file that has stopped being covered.
+    expect(sites.map((s) => s.file)).toContain("src/sse/handlers/chat.js");
+    expect(sites.map((s) => s.file)).toContain("src/sse/handlers/search.js");
+    expect(sites.map((s) => s.file)).toContain("src/app/api/v1beta/models/[...path]/route.js");
+  });
+
+  it("has no call that leaves the fact to the default", () => {
+    const silent = breakerCallSites()
+      .filter((s) => !s.states)
+      .map((s) => `${s.file}:${s.line}  ${s.text}`);
+
+    expect(
+      silent,
+      `these calls hand a failure to the breaker without saying whether the provider was contacted: ${silent.join(" | ")}`,
+    ).toEqual([]);
   });
 });

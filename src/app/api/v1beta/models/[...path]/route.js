@@ -350,7 +350,12 @@ async function forwardGeminiNativeRequest(request, body, model, action) {
         status,
         errorText,
         "gemini",
-        modelId
+        modelId,
+        // The upstream call was made and it failed, so the provider WAS
+        // asked. The fact is stated rather than left to the default,
+        // because a reader of this call should not have to know what the
+        // default is.
+        { upstreamContacted: true }
       );
 
       if (shouldFallback) {
@@ -384,7 +389,10 @@ async function forwardGeminiNativeRequest(request, body, model, action) {
       upstreamResponse.status,
       errorText,
       "gemini",
-      modelId
+      modelId,
+      // The provider answered with an error status, so it was asked and it
+      // replied. The fact is stated rather than left to the default.
+      { upstreamContacted: true }
     );
 
     if (shouldFallback) {
