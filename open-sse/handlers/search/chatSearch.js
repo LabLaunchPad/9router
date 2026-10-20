@@ -442,12 +442,13 @@ export async function handleChatSearch({
     return {
       success: false,
       status: 400,
-      error: `Unsupported chat-search provider: ${provider}`
+      error: `Unsupported chat-search provider: ${provider}`,
+      upstreamContacted: false,
     };
   }
 
   if (!query || typeof query !== "string") {
-    return { success: false, status: 400, error: "Missing query" };
+    return { success: false, status: 400, error: "Missing query", upstreamContacted: false };
   }
 
   const token = credentials?.apiKey || credentials?.accessToken;
@@ -455,13 +456,14 @@ export async function handleChatSearch({
     return {
       success: false,
       status: 401,
-      error: "Missing credentials (apiKey or accessToken)"
+      error: "Missing credentials (apiKey or accessToken)",
+      upstreamContacted: false,
     };
   }
 
   const credentialError = cfg.requireCredentials?.(credentials);
   if (credentialError) {
-    return { success: false, status: 401, error: credentialError };
+    return { success: false, status: 401, error: credentialError, upstreamContacted: false };
   }
 
   const limit =

@@ -67,7 +67,7 @@ async function tryDedicatedProvider({ provider, providerConfig, body, credential
   const token = credentials?.apiKey || credentials?.accessToken || undefined;
 
   if (providerConfig.authType !== "none" && !token) {
-    return { success: false, status: 401, error: `No credentials for provider: ${provider.id}` };
+    return { success: false, status: 401, error: `No credentials for provider: ${provider.id}`, upstreamContacted: false };
   }
 
   const params = {
@@ -89,7 +89,12 @@ async function tryDedicatedProvider({ provider, providerConfig, body, credential
   try {
     ({ url, init } = buildSearchRequest({ id: provider.id, ...providerConfig }, params));
   } catch (err) {
-    return { success: false, status: 400, error: err?.message || `Invalid request for ${provider.id}` };
+    return {
+      success: false,
+      status: 400,
+      error: err?.message || `Invalid request for ${provider.id}`,
+      upstreamContacted: false,
+    };
   }
 
   // Timeout = min(provider timeout, remaining global)

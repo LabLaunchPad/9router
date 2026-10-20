@@ -222,7 +222,10 @@ async function handleSingleProviderSearch(body, providerInput, request, apiKey, 
 
     if (result.success) return result.response;
 
-    const { shouldFallback } = await markAccountUnavailable(credentials.connectionId, result.status, result.error, credentialProviderId, searchLockKey, result.upstreamContacted ?? true);
+    const { shouldFallback } = await markAccountUnavailable(
+      credentials.connectionId, result.status, result.error, credentialProviderId, searchLockKey,
+      { upstreamContacted: result.upstreamContacted ?? true },
+    );
 
     if (shouldFallback) {
       log.warn("AUTH", `Account ${credentials.connectionName} unavailable (${result.status}), trying fallback`);

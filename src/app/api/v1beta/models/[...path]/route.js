@@ -4,6 +4,7 @@ import {
   getProviderCredentials,
   isValidApiKey,
   markAccountUnavailable,
+  releaseProviderProbe,
 } from "@/sse/services/auth.js";
 import { getSettings } from "@/lib/localDb";
 import { PROVIDER_MODELS } from "@/shared/constants/models";
@@ -266,6 +267,12 @@ async function forwardGeminiNativeRequest(request, body, model, action) {
 
     const authHeaders = buildGeminiNativeAuthHeaders(credentials);
     if (!authHeaders) {
+      // The credential was obtained, so the half-open probe it claimed has to
+      // be released: no upstream call is made, and the account is not at
+      // fault — it is the key that is missing. Leaving the probe claimed
+      // would refuse this provider for the whole reset window, and every
+      // refusal is counted as an error against the error budget.
+      releaseProviderProbe("gemini", 404);
       return Response.json(
         { error: { message: "No Gemini API key configured" } },
         { status: 404 }
@@ -285,6 +292,11 @@ async function forwardGeminiNativeRequest(request, body, model, action) {
 
     if (request.signal?.aborted) {
       console.log(`[GEMINI_NATIVE] client aborted model=${modelId} ms=0 conn=${safeConnection}`);
+      // The probe the credential lookup claimed has to be released. A client
+      // that walked away is not a signal about the provider, and a request
+      // that was never sent says nothing at all — either way the probe is
+      // released and nothing is recorded.
+      releaseProviderProbe("gemini", 499);
       return Response.json({ error: { message: "Client closed request" } }, { status: 499 });
     }
 
@@ -306,6 +318,11 @@ async function forwardGeminiNativeRequest(request, body, model, action) {
       const durationMs = Date.now() - startedAt;
       if (request.signal?.aborted && !timedOut) {
         console.log(`[GEMINI_NATIVE] client aborted model=${modelId} ms=${durationMs} conn=${safeConnection}`);
+        // The client walked away mid-request. The provider may have received
+        // the request, so this is an abandoned request rather than a local
+        // failure — but it is not an answer either, so the probe is released
+        // and nothing is recorded.
+        releaseProviderProbe("gemini", 499, { upstreamContacted: true });
         return Response.json({ error: { message: "Client closed request" } }, { status: 499 });
       }
 

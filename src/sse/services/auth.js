@@ -96,6 +96,26 @@ export function recordProviderFailure(provider, status, options = {}) {
   const cbConfig = getProviderCircuitBreakerConfig(providerId);
   const cb = getCircuitBreaker(providerId, cbConfig);
 
+  // A request the CLIENT abandoned (499) is not a signal about the provider:
+  // the client went away, and the provider may never have been reached. It
+  // must not trip the circuit, and it must not be recorded as a success
+  // either - the branch below is for a provider that ANSWERED, and an
+  // abandoned request is not an answer. The probe is released instead, so
+  // the next request is the probe again.
+  //
+  // This is checked BEFORE the local-failure branch below: a request that
+  // was abandoned is an abandoned request, whether or not it had been sent,
+  // and it is counted as one.
+  if (Number(status) === 499) {
+    cb.releaseProbe();
+    log.warn(
+      "AUTH",
+      `${provider} | request abandoned by the client (499) — probe released, breaker ${cb.state}`,
+    );
+    incrementCounter("sse_provider_aborted_requests_total", { provider: providerId });
+    return false;
+  }
+
   // A request that never reached the provider is not a signal about it: the
   // provider was never asked anything, so nothing was learned. It must not
   // trip the circuit, and it must not be recorded as a success either - the
@@ -113,17 +133,6 @@ export function recordProviderFailure(provider, status, options = {}) {
       `${provider} | request failed before the upstream call (${status ?? "local error"}) — probe released, breaker ${cb.state}`,
     );
     incrementCounter("sse_provider_local_failures_total", { provider: providerId });
-    return false;
-  }
-
-  // A request the CLIENT abandoned (499) is not a signal about the provider:
-  // the client went away, and the provider may never have been reached. It
-  // must not trip the circuit, and it must not be recorded as a success
-  // either - the branch below is for a provider that ANSWERED, and an
-  // abandoned request is not an answer. The probe is released instead, so
-  // the next request is the probe again.
-  if (Number(status) === 499) {
-    cb.releaseProbe();
     return false;
   }
 
@@ -156,6 +165,37 @@ export function recordProviderFailure(provider, status, options = {}) {
     `${provider} | provider failure (${status ?? "transport error"}) — breaker ${cb.state} (${cb.failureCount}/${cb.failureThreshold})`,
   );
   return true;
+}
+
+/**
+ * Release the half-open probe for a request that produced no signal about
+ * the provider.
+ *
+ * The probe slot is claimed by `canRequest()` inside `getProviderCredentials`,
+ * and it has to be resolved by something. A path that returns to the client
+ * without going through `markAccountUnavailable` — a client that walked
+ * away, a request that turned out to need no upstream call at all — leaves
+ * the slot claimed, and the provider is then refused for the whole reset
+ * window: every later request to it is a "circuit open" refusal, and every
+ * refusal is counted as an error against the error budget.
+ *
+ * This is the narrow version of `markAccountUnavailable`: it touches the
+ * breaker only, and leaves the account alone. Use it where the account is
+ * demonstrably not at fault and the request produced no answer.
+ *
+ * @param {string|null} provider
+ * @param {number|string|null} [status] - the status being reported
+ * @param {{ upstreamContacted?: boolean }} [options]
+ *   `upstreamContacted: false` (the default) means no upstream call was
+ *   made. Pass `true` when the request was sent and the provider may have
+ *   received it — a `499` says the client walked away, not that nothing was
+ *   sent. A `499` is handled as an abandoned request either way: that branch
+ *   is checked first, and it releases the probe and records nothing.
+ * @returns {boolean} true when a failure was recorded on the breaker
+ */
+export function releaseProviderProbe(provider, status = null, options = {}) {
+  const { upstreamContacted = false } = options;
+  return recordProviderFailure(provider, status, { upstreamContacted });
 }
 
 /**
@@ -480,13 +520,21 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
  * @param {string} errorText
  * @param {string|null} provider
  * @param {string|null} model - The specific model that triggered the error
- * @param {boolean} [upstreamContacted] - false when the request never reached
- *   the provider: the account is not at fault and the provider was never
- *   asked anything.
- * @param {number|null} [resetsAtMs] - Optional precise cooldown expiry (ms epoch) for provider-specific quota errors
+ * @param {{ upstreamContacted?: boolean, resetsAtMs?: number|null }} [options]
+ *   `upstreamContacted: false` means the request never reached the provider:
+ *   the account is not at fault and the provider was never asked anything.
+ *   `resetsAtMs` is an optional precise cooldown expiry (ms epoch) for
+ *   provider-specific quota errors.
  * @returns {{ shouldFallback: boolean, cooldownMs: number }}
  */
-export async function markAccountUnavailable(connectionId, status, errorText, provider = null, model = null, upstreamContacted = true, resetsAtMs = null) {
+export async function markAccountUnavailable(connectionId, status, errorText, provider = null, model = null, options = {}) {
+  // An options object, not two positional parameters: the two are unrelated
+  // and a caller that put one where the other belonged would be silently
+  // wrong — a `resetsAtMs` read as a truthy `upstreamContacted` loses the
+  // precise cooldown, which is the opposite failure from the one this
+  // function exists to prevent.
+  const { upstreamContacted = true, resetsAtMs = null } = options;
+
   // A provider-level failure (5xx, transport error) trips the circuit
   // breaker. This is the upstream error path, so a provider that is genuinely
   // down is skipped instead of being retried into the ground. Per-account

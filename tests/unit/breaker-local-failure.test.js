@@ -131,7 +131,9 @@ describe("the breaker: a request that never reached the provider", () => {
     // `markAccountUnavailable`, which hands it to the breaker. A null
     // connection id stops it before the account lookup, so this exercises
     // the wiring and not the database.
-    markAccountUnavailable(null, 400, "Missing required field: input", PROVIDER, null, false);
+    markAccountUnavailable(null, 400, "Missing required field: input", PROVIDER, null, {
+      upstreamContacted: false,
+    });
 
     expect(
       cb.state,

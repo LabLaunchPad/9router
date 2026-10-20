@@ -134,7 +134,10 @@ export async function handleStt(request) {
       return result.response;
     }
 
-    const { shouldFallback } = await markAccountUnavailable(credentials.connectionId, result.status, result.error, provider, model, result.upstreamContacted ?? true);
+    const { shouldFallback } = await markAccountUnavailable(
+      credentials.connectionId, result.status, result.error, provider, model,
+      { upstreamContacted: result.upstreamContacted ?? true },
+    );
     if (shouldFallback) {
       excludeConnectionIds.add(credentials.connectionId);
       lastError = result.error;

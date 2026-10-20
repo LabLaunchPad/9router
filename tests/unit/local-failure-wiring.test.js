@@ -128,7 +128,7 @@ describe("the handler passes it on", () => {
       "Missing required field: input",
       "openai",
       "text-embedding-3-small",
-      false,
+      { upstreamContacted: false },
     );
   });
 
@@ -150,7 +150,7 @@ describe("the handler passes it on", () => {
       "upstream failed",
       "openai",
       "text-embedding-3-small",
-      true,
+      { upstreamContacted: true },
     );
   });
 });

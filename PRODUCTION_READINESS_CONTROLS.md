@@ -945,6 +945,7 @@ The breaker is a **provider-level** control, and the distinction matters:
 |---|---|---|
 | `5xx`, transport error (no status) | **Yes** | The provider is failing; every account will fail the same way. |
 | `401`, `402`, `403`, `429` | **No** | About one credential. The provider itself is healthy. |
+| `499` — the client abandoned the request | **No** | Not an answer: the client went away, and the provider may never have been reached. The probe is released, not resolved. |
 | "no credentials configured" | **No** | A local configuration problem, and no upstream call is made. |
 | "every account locked or rate-limited" | **No** | Same: the provider is healthy and no upstream call is made. |
 | A request that never reached the provider | **No** | Same: a purely local problem — the provider was never asked anything, so nothing was learned about it. |
@@ -1009,6 +1010,28 @@ number and different facts, so the core says which one it is
 on. Without the distinction, a single malformed client request could close
 the half-open circuit of a provider that was still down — declaring it
 healthy and sending traffic back to it.
+
+That distinction is **checked, not trusted**, because the default is
+"contacted" and an unmarked local failure is silent: no test fails, no log
+line appears, the circuit closes. `tests/unit/local-failure-marking.test.js`
+scans the cores for the places where a local failure is produced — a failure
+built with a literal `4xx` status, whether it comes from the error
+constructor or from a hand-built object — and fails if any of them does not
+say that the provider was never contacted. The scan covers the search, fetch
+and chat-search cores, which assemble their results as literals rather than
+through the constructor; that is exactly how they slipped past a
+constructor-based convention.
+
+A path that returns to the client without going through the account-failure
+path has to release the probe itself, or the provider is blackholed for the
+whole reset window and every refusal is counted as an error against the
+error budget. The gemini native path is the one that returns directly, and
+it has three such exits: a client that walked away before the request was
+sent, a client that walked away during it, and a credential with no API key
+(so nothing was sent at all). `releaseProviderProbe()` is the narrow
+version of `markAccountUnavailable` for those: it touches the breaker only
+and leaves the account alone, because the account is demonstrably not at
+fault.
 
 The no-auth free providers take an early return that hands back a **synthetic
 credential**, and that credential carries its `provider` — like a real one

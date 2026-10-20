@@ -92,10 +92,10 @@ async function readJsonOrText(res) {
  */
 export async function handleFetchCore({ url, format, maxCharacters, provider, providerConfig, credentials, log }) {
   if (!url || typeof url !== "string") {
-    return { success: false, status: 400, error: "url is required" };
+    return { success: false, status: 400, error: "url is required", upstreamContacted: false };
   }
   if (!provider) {
-    return { success: false, status: 400, error: "provider is required" };
+    return { success: false, status: 400, error: "provider is required", upstreamContacted: false };
   }
 
   const fmt = format || DEFAULT_FORMAT;
@@ -132,7 +132,7 @@ export async function handleFetchCore({ url, format, maxCharacters, provider, pr
     if (provider === "tinyfish") {
       return await runTinyfish({ url, fmt, timeoutMs, apiKey, maxCharacters, costPerQuery, startedAt, baseUrl: providerConfig?.baseUrl });
     }
-    return { success: false, status: 400, error: `Unsupported provider: ${provider}` };
+    return { success: false, status: 400, error: `Unsupported provider: ${provider}`, upstreamContacted: false };
   } catch (err) {
     log?.("fetch handler error:", err?.message || err);
     return { success: false, status: 502, error: err?.message || "Internal fetch error" };
@@ -140,7 +140,7 @@ export async function handleFetchCore({ url, format, maxCharacters, provider, pr
 }
 
 async function runTinyfish({ url, fmt, timeoutMs, apiKey, maxCharacters, costPerQuery, startedAt, baseUrl }) {
-  if (!["markdown", "html"].includes(fmt)) return { success: false, status: 400, error: `Unsupported TinyFish format: ${fmt}` };
+  if (!["markdown", "html"].includes(fmt)) return { success: false, status: 400, error: `Unsupported TinyFish format: ${fmt}`, upstreamContacted: false };
   const upstreamStart = Date.now();
   const r = await tryFetch(baseUrl, {
     method: "POST",

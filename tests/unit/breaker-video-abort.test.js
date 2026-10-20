@@ -104,7 +104,7 @@ describe("the video path tells a client cancellation from a provider timeout", (
       expect.any(String),
       "xai",
       expect.anything(),
-      true,
+      { upstreamContacted: true },
     );
   });
 
@@ -126,7 +126,7 @@ describe("the video path tells a client cancellation from a provider timeout", (
       expect.any(String),
       "xai",
       expect.anything(),
-      true,
+      { upstreamContacted: true },
     );
   });
 });
