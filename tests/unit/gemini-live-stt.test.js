@@ -442,6 +442,10 @@ describe("App-layer custom transport resolution (stt.js)", () => {
           apiKey: "AIza-TEST", connectionId: "c1", connectionName: "t", providerSpecificData: {},
         }),
         markAccountUnavailable: async () => ({ shouldFallback: false }),
+        // The success path resolves the circuit breaker's half-open probe
+        // through this one; the test is about the transport, so the
+        // resolver is a no-op here.
+        clearAccountError: async () => {},
       }));
       // getModelInfo stays REAL: "gemini/..." is a reserved-prefix passthrough,
       // so the parse→route hop in the chain is exercised, not stubbed.
