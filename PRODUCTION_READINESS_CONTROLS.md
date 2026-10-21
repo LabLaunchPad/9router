@@ -29,7 +29,8 @@ code is the verdict, never a reading of the output.
 | the local-failure fact (`upstreamContacted`) | a request that never reached the provider being reported as a provider failure | `open-sse/utils/error.js` and every core | `tests/unit/local-failure-marking.test.js` | yes — the fact has to be RIGHT, not merely present |
 | the hand-built cores | a core that builds its result by hand and skips the fact | `open-sse/handlers/{fetch,search,chatSearch}` | `tests/unit/local-failure-hand-built-cores.test.js` | yes — it drives the three cores |
 | the handler-layer scan | a call to the breaker that does not state the fact | `tests/unit/local-failure-wiring.test.js` | the same file, and `tests/unit/fixtures/breaker-call-comment-fact.js` | yes — restore the text reading and the test fails |
-| the no-auth paths | a no-auth provider's failure reported as "the provider answered" | `src/sse/handlers/{stt,tts}.js` | `tests/unit/local-failure-no-auth-paths.test.js` | yes — the VALUE is asserted, not the presence |
+| the no-auth paths | a no-auth provider's failure reported as "the provider answered" | `src/sse/handlers/{stt,tts,imageGeneration}.js` | `tests/unit/local-failure-no-auth-paths.test.js` | yes — the VALUE is asserted, not the presence |
+| the no-credential gate | a provider that needs no credential being refused as though its circuit were open | `src/sse/services/auth.js` and `src/sse/handlers/{imageGeneration,stt,tts}.js` | `tests/unit/auth-no-credential-lookup.test.js` and `tests/unit/breaker-image-noauth-path.test.js` | yes — without the flag the lookup returns nothing, and the flag is what makes it a gate |
 | the probe-resolution scans | a path that claims a probe and leaves it claimed | `tests/unit/breaker-probe-resolution.test.js` | the same file, and six fixtures | yes — the scope rule, the comment rule and the code-reading rule are each pinned by a mutation |
 | the shared source reader | three scans each carrying their own approximation of "is this code?" | `tests/unit/source-scan.js` | `tests/unit/source-scan.test.js` | yes — the reader's own shapes are pinned |
 | the account-lock option (`persistLock: false`) | a persisted `modelLock_*` outliving a quota reset | `src/sse/services/auth.js` | `tests/unit/breaker-persist-lock-option.test.js` | yes — delete the branch and the test fails |
@@ -43,7 +44,7 @@ code is the verdict, never a reading of the output.
 
 The controls' **reach** is stated where it is easy to get wrong: the
 breaker controls reach every path that claims a probe and every path that
-hands a failure to the breaker, and the two paths that do neither are
+hands a failure to the breaker, and the one path that does neither is
 declared rather than left as a hole — see *The reach has a declared
 boundary* below.
 
@@ -1386,6 +1387,12 @@ because that path does make an upstream request: the response resolves it.
 The two early returns that release it explicitly are the ones that make no
 upstream request at all.
 
+A provider that needs no credential is not always a *free* provider, and the
+early return above only covered the `category: "free"` ones. The rest had to
+ask for the credential by name — `noCredentialRequired` — and they get the
+same synthetic credential, with the same `provider` on it, for the same
+reason: the success path resolves the provider from the credential.
+
 The no-auth request paths go through the credential lookup as well, and for
 the same reason: that lookup is where the breaker is consulted. `canRequest()`
 has one production call site — inside `getProviderCredentials` — and
@@ -1442,19 +1449,58 @@ the first and ignores the second.
 The reach has a **declared boundary**, and it is a boundary rather than a
 claim of coverage. The control reaches every path that **claims a probe** —
 every path that calls the credential lookup — and every path that **hands a
-failure to the breaker**. Two no-auth paths do neither: the image-generation
-path for `sdwebui` and `comfyui`, and the parity no-auth path in the fetch
-handler. They never call the credential lookup, so they claim no probe; and
-they never report a failure to the breaker, so a failing `sdwebui` does not
-trip anything and its provider is never taken out of service.
+failure to the breaker**. One no-auth path did neither: the image-generation
+path for `sdwebui` and `comfyui`. It never called the credential lookup, so
+it claimed no probe; and it never reported a failure to the breaker, so a
+failing `sdwebui` tripped nothing and its provider was never taken out of
+service.
 
-That gap is not closed here, and the reason matters. The correct fix is for
-those paths to *consult* the breaker as well as report to it — a failure
-reported to a breaker that was never consulted makes the metrics lie, and
-can take a provider out of rotation for a path that never asks it. That is a
-behaviour change on a live path, and it belongs in its own pull request with
-its own review. Stating it here is what keeps it a boundary rather than a
-hole.
+That gap is closed now, and the way it was closed matters. The correct fix
+is for the path to *consult* the breaker as well as report to it — a failure
+reported to a breaker that was never consulted makes the metrics lie, and can
+take a provider out of rotation for a path that never asks it. It consults
+it through the credential lookup, which is the one place `canRequest()` is
+called, and it reports through `recordProviderFailure`, which is the direct
+entry point for a provider that has no account to lock.
+
+The lookup needed one thing it did not have: a way to be asked for a
+provider that has no credential. `sdwebui` and `comfyui` are local servers,
+and there is no connection to find for them — so the lookup returned null,
+and a null that means "no connection configured" cannot be told apart from a
+null that means "the circuit is open". A path that read null as "the circuit
+is open" would have refused **every** request to a local image server that
+was never in trouble. `noCredentialRequired` is what separates the two: the
+lookup still consults the breaker, and does not go looking for a connection
+that was never going to be there.
+
+**And the same null was refusing every request to the five local speech
+providers.** `edge-tts`, `google-tts`, `coqui`, `tortoise` and `local-device`
+are `noAuth: true` and `category: "freeTier"`, and the synthetic credential
+above is only handed to the `category: "free"` providers — so for these five
+the lookup went looking for a connection that does not exist, found none, and
+returned null. The two speech paths read that null as an open circuit, and
+answered `404 Provider temporarily unavailable` — for a provider whose
+circuit was closed and which was never in trouble. The flag is the same one,
+and the fix is the same one.
+
+The one limit is in the success-path check, and it is stated rather than
+papered over. That check asks whether a file resolves the probe on its
+success path, and it asks it of the FILE: a file with two claims — a no-auth
+branch and a credentialed loop — has one resolver in each, and a check that
+counted resolvers in the file would pass a file whose no-auth branch leaks
+its probe, because the credentialed branch resolves one. It is not a hole
+that this change opens, and the shape is older than it: `search.js` has
+claimed a probe in two places with one resolver since before this. It is
+covered here by the path's own test rather than by the scan, and the limit
+belongs in a pull request of its own — the scope model the scan reads the
+source with cannot say that a claim inside a conditional reaches a call
+further down the same block, and a rule that guesses is worse than a
+declared boundary.
+
+One no-auth path is still outside the reach: the parity no-auth path in the
+fetch handler. It does neither today, and it is dead code — no fetch
+provider sets `noAuth`, so the branch is never taken. Stating it here is
+what keeps the boundary a boundary rather than a hole.
 
 ### The breaker's transitions are observable
 
