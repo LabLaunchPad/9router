@@ -1,0 +1,30 @@
+name: 🔍 Pull Request Automated Review & Security Audit Gate
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  pr-security-and-formatting:
+    name: 🛡️ PR Security & File Inspection
+    runs-on: ubuntu-latest
+    steps:
+      - name: 📦 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 🔒 Check for Leaked Secrets & Sensitive Patterns
+        run: |
+          echo "Scanning PR for accidental secret inclusion..."
+          if grep -rE "sk-[a-zA-Z0-9]{32,}" src/ open-sse/ --exclude-dir=node_modules; then
+            echo "::error::Potential hardcoded secret key detected!"
+            exit 1
+          fi
+          echo "No hardcoded secrets detected."
+
+      - name: 📋 Check PR Title Conventional Commit Format
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          if [[ ! "$PR_TITLE" =~ ^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([a-zA-Z0-9_-]+\))?: .+ ]]; then
+            echo "::warning::PR title '$PR_TITLE' does not follow Conventional Commits format (e.g. feat(gateway): add new provider)."
+          fi
