@@ -89,6 +89,15 @@ describe("the no-auth request paths consult the breaker", () => {
       mocks.getProviderCredentials,
       "the no-auth TTS path must consult the breaker before the upstream call",
     ).toHaveBeenCalled();
+    // The lookup has to be told that the provider needs no credential. A
+    // no-auth provider never has a connection, so without this the lookup
+    // reports "no connection configured" — a null the path cannot tell
+    // apart from "the circuit is open", and it refused every request to a
+    // local speech server that was never in trouble.
+    expect(
+      mocks.getProviderCredentials.mock.calls[0][3],
+      "the lookup must be told the provider needs no credential",
+    ).toEqual({ noCredentialRequired: true });
   });
 
   it("the STT path asks for credentials, which is where the breaker is consulted", async () => {
@@ -100,6 +109,10 @@ describe("the no-auth request paths consult the breaker", () => {
       mocks.getProviderCredentials,
       "the no-auth STT path must consult the breaker before the upstream call",
     ).toHaveBeenCalled();
+    expect(
+      mocks.getProviderCredentials.mock.calls[0][3],
+      "the lookup must be told the provider needs no credential",
+    ).toEqual({ noCredentialRequired: true });
   });
 
   it("a refused circuit stops the request before the upstream call", async () => {

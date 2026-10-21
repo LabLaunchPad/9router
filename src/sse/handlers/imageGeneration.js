@@ -4,6 +4,7 @@ import {
   clearAccountError,
   extractApiKey,
   isValidApiKey,
+  recordProviderFailure,
 } from "../services/auth.js";
 import { getSettings } from "@/lib/localDb";
 import { getModelInfo, getComboModels } from "../services/model.js";
@@ -101,13 +102,49 @@ async function handleSingleModelImage(body, modelStr, { wantsStream, binaryOutpu
 
   // noAuth providers — no credential needed
   if (NO_AUTH_PROVIDERS.has(provider)) {
+    // The circuit breaker is a provider-level control, and this path does
+    // not go through the credentialed fallback loop — so without this it
+    // never consulted the breaker, and its failures never tripped it. The
+    // credential lookup is where the breaker is consulted (canRequest), so
+    // it is used here as the gate.
+    //
+    // `noCredentialRequired` says what it says: this provider needs no
+    // credential, so the lookup does not go looking for one. Without it the
+    // lookup would look for a connection, find none, and return null — and
+    // a null that means "no connection configured" cannot be told apart
+    // from a null that means "the circuit is open", so the path would
+    // refuse every request to a local image server that was never in
+    // trouble.
+    const gate = await getProviderCredentials(provider, null, model, { noCredentialRequired: true });
+    if (!gate) {
+      // The provider needs no credential, so there is none that could be
+      // missing: the only reason the lookup returns nothing is an open
+      // circuit. The refusal is a 404, like every other circuit refusal, so
+      // it counts as a request and not as a 5xx error.
+      return errorResponse(HTTP_STATUS.NOT_FOUND, `Provider temporarily unavailable: ${provider}`);
+    }
+
     const result = await handleImageGenerationCore({
       body,
       modelInfo: { provider, model },
       credentials: null,
       binaryOutput,
     });
-    if (result.success) return result.response;
+    if (result.success) {
+      // The lookup claimed the breaker's half-open probe, and only a
+      // SUCCESS resolves it.
+      await clearAccountError(gate.connectionId, gate, model);
+      return result.response;
+    }
+
+    // A no-auth provider has no account to lock, so the failure is
+    // recorded on the breaker directly. The fact travels with it: a core
+    // that failed before the call was made says so, and a core that got an
+    // answer from the provider says that instead. Leaving it to the default
+    // would report a client that sent no prompt as a provider that
+    // answered 400 — and a 400 on a half-open circuit resolves the probe as
+    // a success, which declares a provider that is still down healthy.
+    recordProviderFailure(provider, result.status, { upstreamContacted: result.upstreamContacted ?? true });
     return errorResponse(result.status || HTTP_STATUS.BAD_GATEWAY, result.error || "Image generation failed");
   }
 

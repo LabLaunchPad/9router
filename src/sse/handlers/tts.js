@@ -84,12 +84,20 @@ async function handleSingleModelTts(body, modelStr, responseFormat, language, st
     // breaker, and its failures never tripped it. The credential lookup is
     // where the breaker is consulted (canRequest), so it is used here as
     // the gate. The credential itself is not used: this path needs none.
-    const gate = await getProviderCredentials(provider, null, model);
+    //
+    // `noCredentialRequired` says what it says: this provider needs no
+    // credential, so the lookup does not go looking for one. Without it the
+    // lookup looks for a connection, finds none - a no-auth provider never
+    // has one - and returns null. A null that means "no connection
+    // configured" cannot be told apart from a null that means "the circuit
+    // is open", so the path refused EVERY request to a local speech server
+    // that was never in trouble.
+    const gate = await getProviderCredentials(provider, null, model, { noCredentialRequired: true });
     if (!gate) {
-      // A no-auth provider has no credentials that could be missing, so the
-      // only reason the lookup returns nothing is an open circuit. The
-      // refusal is a 404, like every other circuit refusal, so it counts
-      // as a request and not as a 5xx error.
+      // The provider needs no credential, so there is none that could be
+      // missing: the only reason the lookup returns nothing is an open
+      // circuit. The refusal is a 404, like every other circuit refusal, so
+      // it counts as a request and not as a 5xx error.
       return errorResponse(HTTP_STATUS.NOT_FOUND, `Provider temporarily unavailable: ${provider}`);
     }
 

@@ -250,6 +250,11 @@ function githubMonthlyResetMs(status, errorText, provider) {
  * @param {string} provider - Provider name
  * @param {Set<string>|string|null} excludeConnectionIds - Connection ID(s) to exclude (for retry with next account)
  * @param {string|null} model - Model name for per-model rate limit filtering
+ * @param {object} [options]
+ * @param {boolean} [options.noCredentialRequired] - The provider needs no
+ *   credential (a local server such as `sdwebui`, or a public one that takes
+ *   no key). The lookup still consults the circuit breaker, but it does not
+ *   look for a connection, because there is none to find.
  */
 export async function getProviderCredentials(provider, excludeConnectionIds = null, model = null, options = {}) {
   // Normalize to Set for consistent handling
@@ -258,6 +263,7 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     : (excludeConnectionIds ? new Set([excludeConnectionIds]) : new Set());
   const preferredConnectionId = options?.preferredConnectionId || null;
   const requestedModel = options?.requestedModel || model;
+  const noCredentialRequired = options?.noCredentialRequired === true;
   // Acquire mutex to prevent race conditions
   const currentMutex = selectionMutex;
   let resolveMutex;
@@ -319,6 +325,33 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
           vercelRelayUrl: resolvedProxy.vercelRelayUrl || "",
           strictProxy: resolvedProxy.strictProxy === true,
         },
+      };
+    }
+
+    // A provider that needs NO credential still has to be able to ask the
+    // breaker whether it may be used. The breaker is consulted above —
+    // canRequest() — and this is the branch that says "there is no
+    // connection to find, and there never was one".
+    //
+    // It is here, and not in the lookup below, because the lookup below
+    // answers a different question: "is there a credential to use?". For a
+    // provider that needs none, that question has the answer NO, and the
+    // lookup would say so by returning null — which the caller cannot tell
+    // apart from "the circuit is open". A path that reads null as "the
+    // circuit is open" and refuses the request would then refuse EVERY
+    // request to a local image server that was never in trouble.
+    if (noCredentialRequired) {
+      return {
+        id: "noauth",
+        connectionName: "Public",
+        isActive: true,
+        accessToken: "public",
+        // The provider has to be ON the credential, for the same reason the
+        // free providers carry it: `clearAccountError` reads the provider
+        // from here to record the success on the breaker, and without it the
+        // half-open probe is never resolved.
+        provider: providerId,
+        providerSpecificData: {},
       };
     }
 
