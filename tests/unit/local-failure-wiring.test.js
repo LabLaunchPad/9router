@@ -225,8 +225,20 @@ describe("the handler passes it on", () => {
  * The scan cannot tell a hard-coded `true` from the fact read off the
  * result; the behavioural tests above are what prove the value. What this
  * proves is that no call site is left to the default at all.
+ *
+ * The reach is every entry point that hands a FAILURE to the breaker, not
+ * just the one the account-fallback loop uses. `markAccountUnavailable`
+ * locks an account, so it only exists on the paths that have one — the
+ * no-auth providers have no account to lock and go to the breaker
+ * directly, and a scan that stopped at `markAccountUnavailable` would not
+ * see them at all. `releaseProviderProbe` is the third entry point: the
+ * narrow one, for a request that produced no signal about the provider.
  */
 const SRC_DIR = path.join(process.cwd(), "src");
+
+// The entry points that hand a failure to the breaker. `recordProviderSuccess`
+// is not one of them: a success has no direction to state.
+const BREAKER_ENTRY_POINTS = /^(markAccountUnavailable|recordProviderFailure|releaseProviderProbe)$/;
 
 function breakerCallSites() {
   const found = [];
@@ -238,9 +250,10 @@ function breakerCallSites() {
       } else if (entry.name.endsWith(".js")) {
         const lines = fs.readFileSync(full, "utf8").split(/\r?\n/);
         lines.forEach((line, i) => {
-          if (!/markAccountUnavailable\s*\(/.test(line)) return;
+          const call = line.match(/\b(markAccountUnavailable|recordProviderFailure|releaseProviderProbe)\s*\(/);
+          if (!call) return;
           // The definition is not a call site.
-          if (/function\s+markAccountUnavailable/.test(line)) return;
+          if (new RegExp(`function\\s+${call[1]}\\b`).test(line)) return;
           // A comment is not a call site.
           const trimmed = line.trim();
           if (trimmed.startsWith("//") || trimmed.startsWith("*")) return;
@@ -253,13 +266,14 @@ function breakerCallSites() {
               if (lines[j].includes(");")) break;
             }
           }
-          const call = parts.join("\n");
+          const statement = parts.join("\n");
 
           found.push({
             file: path.relative(process.cwd(), full).replace(/\\/g, "/"),
             line: i + 1,
             text: trimmed,
-            states: call.includes("upstreamContacted"),
+            entry: call[1],
+            states: statement.includes("upstreamContacted"),
           });
         });
       }
@@ -279,6 +293,12 @@ describe("the handler layer: every call states the fact", () => {
     expect(sites.map((s) => s.file)).toContain("src/sse/handlers/chat.js");
     expect(sites.map((s) => s.file)).toContain("src/sse/handlers/search.js");
     expect(sites.map((s) => s.file)).toContain("src/app/api/v1beta/models/[...path]/route.js");
+    // Every entry point is in reach. A scan that only saw
+    // `markAccountUnavailable` would not see the no-auth paths at all —
+    // those have no account to lock, so they go to the breaker directly.
+    expect(sites.map((s) => s.entry)).toContain("markAccountUnavailable");
+    expect(sites.map((s) => s.entry)).toContain("recordProviderFailure");
+    expect(sites.map((s) => s.entry)).toContain("releaseProviderProbe");
   });
 
   it("has no call that leaves the fact to the default", () => {

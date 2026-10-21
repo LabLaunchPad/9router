@@ -1119,6 +1119,36 @@ Between them the two rules pin the fact to the status: a failure that says
 "the provider was never asked" has to name a local 4xx, and a failure that
 names a local 4xx has to say "the provider was never asked".
 
+A local failure is not only a status: it is a request that never left the
+building. The search core's dedicated path can fail that way — our own SSRF
+guard refuses a URL it will not talk to, before anything is sent — and a
+catch-all that reports every throw as a 502 reports the guard's refusal as
+"the provider ANSWERED 502". 502 is a provider-level failure, so the
+breaker counts it, and the circuit can open for a provider that never
+received a request. The guard's rejections carry a code so the core can
+tell them from a transport error without matching on the message, and the
+core answers a rejection with a local failure: a 400 with
+`upstreamContacted: false`.
+
+The code has to say WHICH refusal it is, because the two are different
+facts. A URL that is internal before the request is sent was never asked
+anything. A URL that was fine and was requested, and answered with a
+redirect to an internal target, was asked and answered — the guard refused
+the second hop, not the first. So the guard reports three codes:
+`SSRF_BLOCKED_URL` (nothing was sent), `SSRF_BLOCKED_REDIRECT` (the
+provider answered) and `SSRF_TOO_MANY_REDIRECTS` (the provider answered, and
+the chain never ended). Only the first is a local failure.
+`tests/unit/search-core-ssrf-fact.test.js` pins all three.
+
+An object literal is only a failure result when it says so. A configuration
+object that happens to carry a `status:` property is not a failure, and
+judging it as one turns the control into something to work around: the only
+ways to satisfy the scan would be to write a false statement on an object
+that is not a failure, or to rename the property so the scan stops looking
+at it. The rules that judge a failure's *value* ask the record whether it is
+one — `success: false` is the marker — and
+`tests/unit/fixtures/not-a-failure.js` is the shape that must not be judged.
+
 The fact is a statement about the *provider*, not about the request that
 failed. The video core's 401/403 path is the case that makes the
 difference: the first attempt goes out and the provider answers, the token
@@ -1193,6 +1223,33 @@ and it looks at the whole chain of enclosing blocks, so a release made once
 above the branch counts. The branch where the lookup found *nothing* is
 excluded: the probe was never claimed there, so nothing is owed.
 
+The check has two kinds of path. A path that answers the client with a local
+4xx owes a resolution, and so does an **account rotation**: the `continue`
+that hands the request to the next account. The lookup that claimed the
+probe is in the same loop, and the next iteration's lookup finds the breaker
+refusing this provider while the probe is still held — so a rotation that
+does not resolve the probe blackholes the provider for the whole reset
+window. The antigravity quota path was that shape: it deliberately takes no
+account lock, and it used to give the breaker no answer either, so the
+probe stayed claimed.
+
+The path now goes through the same breaker entry point as every other
+failure, and says `persistLock: false` — the account is not locked, the
+breaker still hears. The two questions are independent, and the account
+question is the conditional one: the lock depends on whether the model is
+exhausted until the upstream reset, while the breaker's answer does not
+depend on that at all. A path that answers the account question does not
+have to leave the other one open.
+
+And a resolver has to be one that the path actually reaches. Two shapes do
+not count: a resolver that is the **arm of a conditional expression** — it
+runs on one branch only — and a resolver in a **block the path does not sit
+inside** — the other arm of an if/else, or a callback. The blocks the
+resolver is in have to be the path's blocks, compared from the outermost
+inward: the same rule a credential lookup is held to. Before that, a
+resolver anywhere in the enclosing blocks counted, which is how the
+antigravity path passed a check that was supposed to be about it.
+
 The scope is the chain of enclosing blocks, and a function body is a block —
 so the check does not have to recognise how a function is written to know
 what encloses a path. An arrow-function handler and a nested helper are in
@@ -1226,6 +1283,25 @@ has one production call site — inside `getProviderCredentials` — and
 needs an account. A path that skips the lookup is a path the breaker cannot
 see: its provider is never taken out of service, and its failures never trip
 anything. The credential itself is not used on those paths; the *lookup* is.
+
+The no-auth paths hand their failure to the breaker **directly** —
+`recordProviderFailure` — because there is no account to lock, and that call
+owes the fact like every other one. The failure on that path is very often
+local: the STT core answers `Missing required field: file` and the TTS core
+answers `Missing required field: input`, both with a 400 and
+`upstreamContacted: false`. Left to the default, a client that forgot to
+attach a file is reported to the breaker as a provider that answered 400 —
+and a 4xx on a half-open circuit resolves the probe as a SUCCESS, so one
+malformed request closes the circuit of a provider that is still down.
+
+That is why the handler-layer scan's reach is **every entry point that hands
+a failure to the breaker** — `markAccountUnavailable`, `recordProviderFailure`
+and `releaseProviderProbe` — and not only the one the account-fallback loop
+uses. The no-auth providers have no account, so they go to the breaker
+directly, and a scan that stopped at `markAccountUnavailable` would not see
+them at all. `tests/unit/local-failure-no-auth-paths.test.js` drives both
+paths and proves the VALUE; the scan proves that no call site is left to the
+default.
 
 ### The breaker's transitions are observable
 

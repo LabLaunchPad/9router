@@ -310,8 +310,9 @@ async function forwardGeminiNativeRequest(request, body, model, action) {
       // The probe the credential lookup claimed has to be released. A client
       // that walked away is not a signal about the provider, and a request
       // that was never sent says nothing at all — either way the probe is
-      // released and nothing is recorded.
-      releaseProviderProbe("gemini", 499);
+      // released and nothing is recorded. The fact is stated rather than
+      // left to the default: the request never left the building.
+      releaseProviderProbe("gemini", 499, { upstreamContacted: false });
       return Response.json({ error: { message: "Client closed request" } }, { status: 499 });
     }
 

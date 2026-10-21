@@ -77,7 +77,7 @@ describe("the gemini native path releases the probe it claimed", () => {
     expect(
       authMocks.releaseProviderProbe,
       "the probe claimed by the credential lookup has to be released",
-    ).toHaveBeenCalledWith("gemini", 499);
+    ).toHaveBeenCalledWith("gemini", 499, { upstreamContacted: false });
   });
 
   it("when the credential has no API key, so nothing was sent", async () => {

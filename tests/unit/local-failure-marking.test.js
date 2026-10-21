@@ -397,9 +397,35 @@ function failuresIn(files) {
 /**
  * The failures that are raised on the core's own account, and what they
  * say about the fact.
+ *
+ * An object literal is only a failure result when it says so. A
+ * configuration object that happens to carry a `status:` property is not a
+ * failure, and asking it to carry a failure's fact turns the control into
+ * something a contributor has to work around: the only ways to satisfy the
+ * scan would be to write a false statement on an object that is not a
+ * failure, or to rename the property so the scan stops looking at it.
  */
+function localFailuresIn(records) {
+  return records.filter(
+    (f) => f.status && LOCAL_STATUSES.includes(f.status) && isFailureResult(f),
+  );
+}
+
 function localFailures() {
-  return failuresIn(coreFiles()).filter((f) => f.status && LOCAL_STATUSES.includes(f.status));
+  return localFailuresIn(failuresIn(coreFiles()));
+}
+
+/**
+ * Is this record a failure result?
+ *
+ * A call is one when it is a failure constructor or when it names a local
+ * status — the scan only records those. An object is one when it says
+ * `success: false`, which is the marker the tree uses for a result that is
+ * a failure.
+ */
+function isFailureResult(record) {
+  if (record.kind === "object") return record.isFailure;
+  return true;
 }
 
 /**
@@ -487,7 +513,12 @@ describe("the cores: every failure result carries the fact", () => {
 describe("the cores: the fact has to be RIGHT", () => {
   it("has no failure that claims the provider was never asked and is not one", () => {
     const wrong = failuresIn(coreFiles())
-      .filter((f) => f.says === "false" && !(f.status && LOCAL_STATUSES.includes(f.status)))
+      .filter(
+        (f) =>
+          f.says === "false" &&
+          isFailureResult(f) &&
+          !(f.status && LOCAL_STATUSES.includes(f.status)),
+      )
       .map((f) => `${f.file}:${f.line}  ${f.text}`);
 
     // A failure that says "the request never reached the provider" takes
@@ -504,6 +535,22 @@ describe("the cores: the fact has to be RIGHT", () => {
       wrong,
       `these failures say the provider was never contacted, but they do not name a local status: ${wrong.join(" | ")}`,
     ).toEqual([]);
+  });
+
+  it("does not judge an object that is not a failure result", () => {
+    // A configuration object that happens to carry a `status:` property is
+    // not a failure. The record knows it is not one — `isFailure` is false
+    // — and the rule that judges a failure's value has to ask.
+    const fixture = path.join(process.cwd(), "tests", "unit", "fixtures", "not-a-failure.js");
+    const records = failuresIn([fixture]);
+    const config = records.find((r) => r.kind === "object");
+
+    expect(config, "the scan did not see the object at all").toBeTruthy();
+    expect(config.status).toBe("400");
+    expect(config.isFailure).toBe(false);
+    // A local status on an object that is not a failure is not a local
+    // failure, so the rule has nothing to say about it.
+    expect(localFailuresIn(records).map((r) => r.line)).not.toContain(config.line);
   });
 
   it("sees a local failure written as a call spread over several lines", () => {

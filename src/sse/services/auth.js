@@ -524,11 +524,16 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
  * @param {string} errorText
  * @param {string|null} provider
  * @param {string|null} model - The specific model that triggered the error
- * @param {{ upstreamContacted?: boolean, resetsAtMs?: number|null }} [options]
+ * @param {{ upstreamContacted?: boolean, resetsAtMs?: number|null, persistLock?: boolean }} [options]
  *   `upstreamContacted: false` means the request never reached the provider:
  *   the account is not at fault and the provider was never asked anything.
  *   `resetsAtMs` is an optional precise cooldown expiry (ms epoch) for
  *   provider-specific quota errors.
+ *   `persistLock: false` means the account is NOT locked. The breaker still
+ *   hears about the failure — that is a separate question and it is answered
+ *   on every path through this function — but no modelLock is written. It is
+ *   for the paths that block a model in RAM until the upstream reset and must
+ *   not leave a lock behind that would outlive it.
  * @returns {{ shouldFallback: boolean, cooldownMs: number }}
  */
 export async function markAccountUnavailable(connectionId, status, errorText, provider = null, model = null, options = {}) {
@@ -537,7 +542,7 @@ export async function markAccountUnavailable(connectionId, status, errorText, pr
   // wrong — a `resetsAtMs` read as a truthy `upstreamContacted` loses the
   // precise cooldown, which is the opposite failure from the one this
   // function exists to prevent.
-  const { upstreamContacted = true, resetsAtMs = null } = options;
+  const { upstreamContacted = true, resetsAtMs = null, persistLock = true } = options;
 
   // A provider-level failure (5xx, transport error) trips the circuit
   // breaker. This is the upstream error path, so a provider that is genuinely
@@ -575,6 +580,21 @@ export async function markAccountUnavailable(connectionId, status, errorText, pr
   if (!shouldFallback) return { shouldFallback: false, cooldownMs: 0 };
 
   const reason = typeof errorText === "string" ? errorText.slice(0, 200) : "Provider error";
+
+  if (provider && status && reason) {
+    console.error(`❌ ${provider} [${status}]: ${reason}`);
+  }
+
+  if (!persistLock) {
+    // The account is not locked on this path: the model is blocked in RAM
+    // until the upstream reset, and a persisted modelLock would outlive
+    // that. The breaker has already been told (above the lock, in
+    // `recordProviderFailure`) — the two questions are independent, and
+    // answering one of them is not a reason to leave the other open.
+    log.info("AUTH", `${provider} | failure recorded, account not locked (persistLock: false) [${status}]`);
+    return { shouldFallback: true, cooldownMs };
+  }
+
   const lockUpdate = buildModelLockUpdate(githubResetAtMs ? null : model, cooldownMs);
 
   await updateProviderConnection(connectionId, {
@@ -589,10 +609,6 @@ export async function markAccountUnavailable(connectionId, status, errorText, pr
   const lockKey = Object.keys(lockUpdate)[0];
   const connName = conn?.displayName || conn?.name || conn?.email || connectionId.slice(0, 8);
   log.warn("AUTH", `${connName} locked ${lockKey} for ${Math.round(cooldownMs / 1000)}s [${status}]`);
-
-  if (provider && status && reason) {
-    console.error(`❌ ${provider} [${status}]: ${reason}`);
-  }
 
   return { shouldFallback: true, cooldownMs };
 }

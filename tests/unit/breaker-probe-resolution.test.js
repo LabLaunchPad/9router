@@ -318,6 +318,28 @@ describe("circuit breaker: every file that claims the probe resolves it", () => 
   }
 
   /**
+   * Does this resolver count for a path?
+   *
+   * A resolver counts when the path reaches it on every branch. Two shapes
+   * do not qualify:
+   *
+   * - the arm of a conditional expression. It runs on one branch only, and
+   *   the branch that takes the other arm never reaches it — so it cannot
+   *   stand in for the block it sits in.
+   * - a resolver in a block the path does not sit inside: the other arm of
+   *   an if/else, or a callback. It may not run on this path at all, so it
+   *   cannot stand in for it either. The blocks the resolver is in have to
+   *   be the path's blocks, compared from the outermost inward — the same
+   *   rule a credential lookup is held to.
+   */
+  function countsAsResolver(lines, line, pathScope) {
+    if (!RESOLVERS.test(line.text)) return false;
+    const trimmed = line.text.trim();
+    if (trimmed.startsWith("?") || trimmed.startsWith(":")) return false;
+    return isInScope(scopeOf(lines, line.index), pathScope);
+  }
+
+  /**
    * Is a lookup in the scope of a path?
    *
    * The lookup is in scope when the path sits inside the scope the lookup
@@ -394,7 +416,27 @@ describe("circuit breaker: every file that claims the probe resolves it", () => 
         }
       });
 
+      // Every path that can leave the request with the probe still claimed.
+      //
+      // Two kinds of path owe a resolution:
+      //
+      // - a return that answers the client with a local 4xx, and
+      // - an account rotation: the `continue` that hands the request to the
+      //   next account. The lookup that claimed the probe is in the same
+      //   loop, and the next iteration's lookup finds the breaker refusing
+      //   this provider while the probe is still held — so a rotation that
+      //   does not resolve the probe blackholes the provider for the whole
+      //   reset window.
+      const paths = [];
       lines.forEach((line, i) => {
+        const trimmed = line.trim();
+        if (trimmed.startsWith("//") || trimmed.startsWith("*")) return;
+
+        if (/^continue\s*;/.test(trimmed)) {
+          paths.push({ index: i, kind: "rotates to the next account" });
+          return;
+        }
+
         if (!/return\s+/.test(line)) return;
         // An error response: a response built at the return site, or a call
         // to a helper that builds one. The status is often on a line of its
@@ -407,13 +449,18 @@ describe("circuit breaker: every file that claims the probe resolves it", () => 
           if (lines[j].includes(";")) break;
         }
         if (!LOCAL_4XX.test(statement.join("\n"))) return;
+        paths.push({ index: i, kind: "returns an error" });
+      });
 
+      for (const path of paths) {
+        const i = path.index;
+        const line = lines[i];
         const scope = scopeOf(lines, i);
 
         // The probe is claimed by the credential lookup, so only a path that
         // comes after one can leak it.
         const earlier = lookups.filter((l) => l.index < i);
-        if (!earlier.length) return; // nothing had been claimed yet
+        if (!earlier.length) continue; // nothing had been claimed yet
 
         // A lookup is in this path's scope when the path sits inside the
         // scope the lookup is in.
@@ -436,9 +483,9 @@ describe("circuit breaker: every file that claims the probe resolves it", () => 
           // tell, and a check that cannot tell has to say so rather than
           // pass quietly.
           undetermined.push(`${file}:${i + 1}  ${line.trim()}`);
-          return;
+          continue;
         }
-        if (!inScope.length) return; // nothing on this path could have claimed it
+        if (!inScope.length) continue; // nothing on this path could have claimed it
 
         // The branch where the lookup found nothing: the probe was never
         // claimed there, so nothing is owed.
@@ -449,19 +496,29 @@ describe("circuit breaker: every file that claims the probe resolves it", () => 
             : /(!\s*credentials\b|credentials\.allRateLimited\b)/;
           return scope.some((b) => pattern.test(b.header));
         });
-        if (foundNothing) return;
+        if (foundNothing) continue;
 
-        // A resolver anywhere in the chain of enclosing blocks counts: the
-        // release may be made once above the branch rather than inside it.
-        if (scope.some((b) => b.body.some((l) => RESOLVERS.test(l.text)))) return;
+        // A resolver in the chain of enclosing blocks counts: the release
+        // may be made once above the branch rather than inside it.
+        //
+        // Two shapes do not count, because neither runs on every path that
+        // reaches here:
+        //
+        // - a resolver that is the arm of a conditional expression. It runs
+        //   on one branch only, and the branch that takes the other arm
+        //   never reaches it.
+        // - a resolver inside a function the path is not inside. A callback
+        //   that resolves the probe when the request succeeds says nothing
+        //   about the failure path being examined.
+        if (scope.some((b) => b.body.some((l) => countsAsResolver(lines, l, scope)))) continue;
 
-        offenders.push(`${file}:${i + 1}  ${line.trim()}`);
-      });
+        offenders.push(`${file}:${i + 1}  ${path.kind}: ${line.trim()}`);
+      }
     }
 
     expect(
       offenders,
-      `these paths return an error after claiming the probe without releasing it: ${offenders.join(" | ")}`,
+      `these paths leave the request with the probe still claimed and nothing resolving it: ${offenders.join(" | ")}`,
     ).toEqual([]);
 
     // A path the check cannot place is a path the check cannot vouch for.

@@ -10,7 +10,7 @@
 import { buildSearchRequest } from "./callers.js";
 import { normalizeSearchResponse } from "./normalizers.js";
 import { handleChatSearch } from "./chatSearch.js";
-import { fetchPublic } from "../../../src/shared/utils/ssrfGuard.js";
+import { fetchPublic, SSRF_BLOCKED_URL } from "../../../src/shared/utils/ssrfGuard.js";
 
 const GLOBAL_TIMEOUT_MS = 15000;
 const NON_RETRIABLE = new Set([400, 401, 403, 404]);
@@ -155,6 +155,25 @@ async function tryDedicatedProvider({ provider, providerConfig, body, credential
     };
   } catch (err) {
     clearTimeout(timer);
+
+    // The SSRF guard refusing the URL is a LOCAL failure: the request was
+    // never sent, so it says nothing about the provider. Reporting it as an
+    // upstream 502 charges the provider for a request that never left the
+    // building — and 502 is provider-level, so the circuit can open for a
+    // provider that never received one.
+    if (err?.code === SSRF_BLOCKED_URL) {
+      log?.error?.("SEARCH", `${provider.id} blocked: ${err.message}`);
+      return {
+        success: false,
+        status: 400,
+        error: `${provider.id} blocked: ${err.message}`,
+        upstreamContacted: false,
+      };
+    }
+
+    // Everything else here is the provider's answer (or its failure to
+    // answer): the request went out, so the fact is "the provider was
+    // asked".
     const isTimeout = err.name === "AbortError";
     const status = isTimeout ? 504 : 502;
     log?.error?.("SEARCH", `${provider.id} ${isTimeout ? "timeout" : "error"}: ${err.message}`);

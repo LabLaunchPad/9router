@@ -125,7 +125,7 @@ describe("the no-auth request paths consult the breaker", () => {
     expect(
       mocks.recordProviderFailure,
       "a failed no-auth request must trip the provider's circuit",
-    ).toHaveBeenCalledWith("edge-tts", 502);
+    ).toHaveBeenCalledWith("edge-tts", 502, { upstreamContacted: true });
   });
 
   it("a success resolves the half-open probe", async () => {
