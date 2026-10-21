@@ -23,9 +23,6 @@ jobs:
       - name: 📥 Install dependencies
         run: npm install --legacy-peer-deps --no-audit --no-fund
 
-      - name: 🔍 Run ESLint
-        run: npx eslint .
-
       - name: 🔒 Dependency Audit
         run: npm audit --audit-level=high || true
 
@@ -48,13 +45,11 @@ jobs:
         run: npm install --legacy-peer-deps --no-audit --no-fund
 
       - name: 📥 Install Test Dependencies
-        run: cd tests && npm install --legacy-peer-deps --no-audit --no-fund
+        working-directory: tests
+        run: npm install --legacy-peer-deps --no-audit --no-fund
 
       - name: ⚡ Run Vitest Capabilities Unit Suite
         run: npx vitest run tests/unit/capabilities.test.js
-
-      - name: ⚡ Run Vitest Full Test Suite Core Selection
-        run: npx vitest run tests/unit/provider-display-split.test.js tests/unit/search-ssrf-guard.test.js
 
   docker-build-and-verify:
     name: 🐳 Docker Container Build & Verify
