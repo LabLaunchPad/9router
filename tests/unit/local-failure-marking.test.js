@@ -79,6 +79,7 @@ import { describe, expect, it } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
 import { HTTP_STATUS } from "open-sse/config/runtimeConfig.js";
+import { codeOnly, codeLines, codeLineFlags } from "./source-scan.js";
 
 const CORES_DIR = path.join(process.cwd(), "open-sse", "handlers");
 
@@ -140,12 +141,12 @@ function coreFiles() {
  * call — reading to it would let a later call vouch for this one, which is
  * the difference between a check and a coincidence.
  */
-function callText(lines, index, open) {
+function callText(code, index, open) {
   const state = { quote: null };
   const parts = [];
   let depth = 1; // the call's own opening bracket
-  for (let j = index; j < lines.length && j <= index + 12; j += 1) {
-    const segment = j === index ? lines[j].slice(open + 1) : lines[j];
+  for (let j = index; j < code.length && j <= index + 12; j += 1) {
+    const segment = j === index ? code[j].slice(open + 1) : code[j];
     const scan = scanBrackets(segment, state, depth);
     if (scan.end >= 0) {
       parts.push(segment.slice(0, scan.end + 1));
@@ -207,9 +208,13 @@ function scanBrackets(text, state, depth = 0) {
  * guards — and they are separate statements of fact. The status is read
  * from the call's OWN first argument: the bracket of the condition is not
  * the bracket of the failure.
+ *
+ * The call is read from the CODE of the file, so a fact written in a
+ * comment inside the call's arguments is not a fact the call states, and a
+ * fact written in a string is not either.
  */
-function callsOn(lines, index) {
-  const line = lines[index];
+function callsOn(code, index) {
+  const line = code[index];
   const found = [];
   const pattern = /[A-Za-z_$][\w$]*\s*\(/g;
   let match;
@@ -217,7 +222,7 @@ function callsOn(lines, index) {
     const name = match[0].slice(0, -1).trim();
     if (NOT_A_CALL.includes(name)) continue;
     const open = match.index + match[0].length - 1;
-    found.push({ name, text: callText(lines, index, open) });
+    found.push({ name, text: callText(code, index, open) });
   }
   return found;
 }
@@ -230,11 +235,16 @@ function callsOn(lines, index) {
  * The fact and the status are siblings, and a sibling can be written
  * before or after — so the whole object is read, not the line the match
  * happened to be on. An object written on one line is that line.
+ *
+ * The object is read as CODE. A commented-out failure is not a failure the
+ * core raises, and a `success: false` inside a string is a sentence rather
+ * than a marker — so neither is counted, and the scan says what it saw
+ * rather than what it read.
  */
 function objectText(lines, index) {
   const line = lines[index];
   if (line.includes("{") && line.includes("}")) {
-    return { text: line, start: index };
+    return { text: codeOnly(line), start: index };
   }
 
   const indent = lines[index].search(/\S/);
@@ -252,7 +262,7 @@ function objectText(lines, index) {
     const inner = lines[j].search(/\S/);
     if (inner >= 0 && inner < indent) break; // the object is closed
   }
-  return { text: parts.join("\n"), start: first };
+  return { text: codeOnly(parts.join("\n")), start: first };
 }
 
 /**
@@ -329,11 +339,18 @@ function failuresIn(files) {
   const found = [];
   for (const file of files) {
     const lines = fs.readFileSync(file, "utf8").split(/\r?\n/);
+    const code = codeLines(lines);
+    const isCode = codeLineFlags(lines);
     const relative = path.relative(process.cwd(), file).replace(/\\/g, "/");
     const seenObjects = new Set();
 
     lines.forEach((line, i) => {
-      if (/^\s*(\/\/|\*)/.test(line)) return;
+      // A comment is not code, and neither is a line inside a block
+      // comment. A filter that only looks at the START of a line misses
+      // the body of a `/* … *\/` block, whose lines do not begin with a
+      // star — and a commented-out failure result is not a failure the
+      // core raises.
+      if (!isCode[i]) return;
 
       // A call that produces a failure. The call is the anchor: the status
       // may sit on the NEXT line, and a scan that reads the line the status
@@ -344,7 +361,7 @@ function failuresIn(files) {
       // was never asked and states its status as a variable is the defect
       // the third rule exists to catch, and a scan that only recorded the
       // calls with a local status would never see it.
-      for (const call of callsOn(lines, i)) {
+      for (const call of callsOn(code, i)) {
         const status = callStatus(call.text);
         const isFailure =
           FAILURE_CONSTRUCTORS.includes(call.name) ||
@@ -366,7 +383,9 @@ function failuresIn(files) {
 
       // A result object written out by hand. One record per object: the
       // status and the fact can be on different lines of the same literal.
-      if (line.includes("success: false") || /\bstatus:\s*/.test(line)) {
+      // The line has to SAY it, in code — a string that holds the words is
+      // a sentence, and a comment that holds them is a note.
+      if (code[i].includes("success: false") || /\bstatus:\s*/.test(code[i])) {
         const object = objectText(lines, i);
         if (seenObjects.has(object.start)) return;
         seenObjects.add(object.start);
@@ -551,6 +570,32 @@ describe("the cores: the fact has to be RIGHT", () => {
     // A local status on an object that is not a failure is not a local
     // failure, so the rule has nothing to say about it.
     expect(localFailuresIn(records).map((r) => r.line)).not.toContain(config.line);
+  });
+
+  it("does not judge a failure result that was commented out", () => {
+    // A commented-out failure result is a note about a failure, not a
+    // failure the core raises. The block comment's body does not begin
+    // with a star — that is how a person comments code out while they
+    // work — so a filter that decides "is this a comment?" by looking at
+    // the start of the line misses it entirely.
+    //
+    // The consequence is a false alarm about a failure that does not
+    // exist: the build fails, and the error names a failure result that
+    // is not there.
+    const fixture = path.join(process.cwd(), "tests", "unit", "fixtures", "commented-out-failure.js");
+    const records = failuresIn([fixture]);
+
+    // The fixture holds one failure result in CODE (a 400) and one in the
+    // comment (a 403). The scan has to see the first and ignore the
+    // second, and the status says which is which.
+    expect(
+      records.length,
+      `the scan saw ${records.length} failure results, and the fixture holds one: ${records.map((r) => `${r.line} ${r.status}`).join(", ")}`,
+    ).toBe(1);
+    expect(
+      records[0].status,
+      "the scan saw the commented-out failure rather than the one in code",
+    ).toBe("400");
   });
 
   it("sees a local failure written as a call spread over several lines", () => {

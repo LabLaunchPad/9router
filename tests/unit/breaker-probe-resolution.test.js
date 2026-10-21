@@ -37,6 +37,7 @@ import {
   clearAccountError,
   resetProviderFailureTracking,
 } from "../../src/sse/services/auth.js";
+import { codeOnly, codeLineFlags } from "./source-scan.js";
 
 // A real no-auth free provider: it takes the early return in
 // `getProviderCredentials` that hands back a synthetic credential, and it
@@ -71,108 +72,6 @@ const RESOLVERS =
   /\b(clearAccountError|recordProviderSuccess|markAccountUnavailable|recordProviderFailure|releaseProviderProbe)\s*\(/;
 
 /**
- * The CODE of a line: everything that is not a comment, and not the
- * CONTENTS of a string.
- *
- * A string's contents are removed rather than its quotes, so a call that
- * sits in an argument position still reads as a call:
- *
- *     markAccountUnavailable(provider, "the upstream said no")
- *
- * The quotes are tracked while the line is walked, so a "//" inside a
- * string — a URL, most often — is not mistaken for the start of a comment.
- *
- * The one thing this loses is a call made inside a template literal's
- * "${}", and a regex literal that holds a quote. Neither happens in the
- * tree, and the failure mode is the safe one in both cases: the call is
- * not counted, so the path is reported rather than hidden.
- */
-function codeOnly(text) {
-  let out = "";
-  let inSingle = false;
-  let inDouble = false;
-  let inBacktick = false;
-
-  for (let i = 0; i < text.length; i += 1) {
-    const ch = text[i];
-    if (ch === "\\") {
-      i += 1; // an escaped character cannot end a string
-      continue;
-    }
-    if (ch === "'" && !inDouble && !inBacktick) {
-      inSingle = !inSingle;
-      out += ch;
-      continue;
-    }
-    if (ch === '"' && !inSingle && !inBacktick) {
-      inDouble = !inDouble;
-      out += ch;
-      continue;
-    }
-    if (ch === "`" && !inSingle && !inDouble) {
-      inBacktick = !inBacktick;
-      out += ch;
-      continue;
-    }
-    if (!inSingle && !inDouble && !inBacktick) {
-      if (ch === "/" && (text[i + 1] === "/" || text[i + 1] === "*")) {
-        return out; // the rest of the line is a comment
-      }
-      out += ch;
-      continue;
-    }
-    // Inside a string: the contents are dropped, the quotes are kept.
-    if (ch === "'" || ch === '"' || ch === "`") out += ch;
-  }
-
-  return out;
-}
-
-/**
- * Which lines of a file are CODE.
- *
- * A line inside a block comment is not code, whatever it looks like: a
- * commented-out failure result is not a failure the core raises, and a
- * commented-out resolver is not a resolver.
- *
- * A filter that only looks at the START of a line misses the body of a
- * `/* ... *\/` block whose lines do not begin with a star — which is how
- * block comments are usually written. So the state is tracked across the
- * file rather than decided one line at a time.
- *
- * @param {string[]} lines
- * @returns {boolean[]} true where the line is code
- */
-function codeLineFlags(lines) {
-  const isCode = new Array(lines.length).fill(true);
-  let inBlock = false;
-
-  lines.forEach((line, i) => {
-    const trimmed = line.trim();
-
-    if (inBlock) {
-      isCode[i] = false;
-      if (trimmed.includes("*/")) inBlock = false;
-      return;
-    }
-    if (trimmed.startsWith("/*")) {
-      isCode[i] = false;
-      if (!trimmed.includes("*/", 2)) inBlock = true;
-      return;
-    }
-    if (trimmed.startsWith("//")) {
-      isCode[i] = false;
-      return;
-    }
-    if (trimmed.startsWith("*")) {
-      isCode[i] = false; // the body of a block comment
-    }
-  });
-
-  return isCode;
-}
-
-/**
  * Does this line CALL a resolver?
  *
  * A mention is not a call. A comment that names a resolver is not a
@@ -193,6 +92,10 @@ function codeLineFlags(lines) {
  * before the resolver is looked for. A line inside a block comment is
  * ruled out by `codeLineFlags`, which is the one thing a single line
  * cannot tell on its own.
+ *
+ * `codeOnly` and `codeLineFlags` live in `tests/unit/source-scan.js`, and
+ * the other two scans that read source use the same two — see the note at
+ * the top of that file for why there is one reader and not three.
  */
 function callsResolver(text, pattern) {
   const code = codeOnly(text);
@@ -576,7 +479,7 @@ describe("circuit breaker: every file that claims the probe resolves it", () => 
    * The fixtures carry those shapes, and they are scanned by this same
    * function — a fixture that proved something else would prove nothing.
    *
-   * @returns {{offenders: string[], undetermined: string[]}}
+   * @returns {{offenders: string[], undetermined: string[], candidates: object[]}}
    */
   function probeLeaksIn(file, source) {
     // An error response: a response built at the return site, or a call to
@@ -593,13 +496,20 @@ describe("circuit breaker: every file that claims the probe resolves it", () => 
     // unreadable is a path the scan has to ASK about — the same way it
     // asks about a path whose status it CAN read and knows to be local.
     //
-    // The status is read off an object (`result.status`), and it is the
-    // shape the no-auth paths use: the core answers a local 400 for a
-    // request it could not build, and the handler hands that status on
-    // without writing it out. A scan that only reads written-out statuses
-    // never sees those paths, and a path it never sees is a path it
-    // cannot vouch for.
-    const UNREADABLE_STATUS = /\.\s*status\b/;
+    // A status is READABLE when it is written out — a number, or a named
+    // constant — and unreadable when it is a variable. The variable can be
+    // a property of an object (`result.status`), an argument
+    // (`unavailableResponse(status, …)`) or a local name, and all three
+    // are the same shape: the scan cannot tell a local 4xx from an
+    // upstream status, so it has to ask.
+    //
+    // A scan that only reads written-out statuses never sees those paths,
+    // and a path it never sees is a path it cannot vouch for.
+    const STATUS_MENTIONED = /\bstatus\b/i;
+    const STATUS_WRITTEN_OUT =
+      /\bstatus\s*[:=]\s*(?:\d{3}|(?:HTTP_STATUS\.)?[A-Z][A-Z0-9_]*)\b/;
+    const statusIsUnreadable = (text) =>
+      STATUS_MENTIONED.test(text) && !STATUS_WRITTEN_OUT.test(text);
 
     const offenders = [];
     const undetermined = [];
@@ -630,6 +540,7 @@ describe("circuit breaker: every file that claims the probe resolves it", () => 
     //   does not resolve the probe blackholes the provider for the whole
     //   reset window.
     const paths = [];
+    const candidates = [];
     lines.forEach((line, i) => {
       const trimmed = line.trim();
       // A line that is not code is not a path. A return that was commented
@@ -651,8 +562,8 @@ describe("circuit breaker: every file that claims the probe resolves it", () => 
         if (lines[j].includes(";")) break;
       }
       const text = statement.join("\n");
-      if (!LOCAL_4XX.test(text) && !UNREADABLE_STATUS.test(text)) return;
-      paths.push({ index: i, kind: "returns an error" });
+      if (!LOCAL_4XX.test(text) && !statusIsUnreadable(text)) return;
+      paths.push({ index: i, kind: "returns an error", statement: text });
     });
 
     for (const path of paths) {
@@ -660,10 +571,19 @@ describe("circuit breaker: every file that claims the probe resolves it", () => 
       const line = lines[i];
       const scope = scopeOf(lines, i);
 
+      // Every path the scan ASKED about, and what became of it. The list
+      // is what the reach of the check is: a path the scan never asked
+      // about is a path it cannot vouch for, so the list is worth having.
+      const asked = { line: i + 1, kind: path.kind, statement: path.statement ?? null, fate: "" };
+
       // The probe is claimed by the credential lookup, so only a path that
       // comes after one can leak it.
       const earlier = lookups.filter((l) => l.index < i);
-      if (!earlier.length) continue; // nothing had been claimed yet
+      if (!earlier.length) {
+        asked.fate = "no credential lookup precedes it";
+        candidates.push(asked);
+        continue;
+      } // nothing had been claimed yet
 
       // A lookup is in this path's scope when the path sits inside the
       // scope the lookup is in.
@@ -685,10 +605,16 @@ describe("circuit breaker: every file that claims the probe resolves it", () => 
         // claimed on this path is not something a scan of the source can
         // tell, and a check that cannot tell has to say so rather than
         // pass quietly.
+        asked.fate = "the lookup is in a helper this path calls";
+        candidates.push(asked);
         undetermined.push(`${file}:${i + 1}  ${line.trim()}`);
         continue;
       }
-      if (!inScope.length) continue; // nothing on this path could have claimed it
+      if (!inScope.length) {
+        asked.fate = "no credential lookup in this path's scope";
+        candidates.push(asked);
+        continue;
+      } // nothing on this path could have claimed it
 
       // The branch where the lookup found nothing: the probe was never
       // claimed there, so nothing is owed.
@@ -699,7 +625,11 @@ describe("circuit breaker: every file that claims the probe resolves it", () => 
           : /(!\s*credentials\b|credentials\.allRateLimited\b)/;
         return scope.some((b) => pattern.test(b.header));
       });
-      if (foundNothing) continue;
+      if (foundNothing) {
+        asked.fate = "the lookup found nothing";
+        candidates.push(asked);
+        continue;
+      }
 
       // A resolver in the chain of enclosing blocks counts: the release
       // may be made once above the branch rather than inside it.
@@ -713,13 +643,18 @@ describe("circuit breaker: every file that claims the probe resolves it", () => 
       // - a resolver inside a function the path is not inside. A callback
       //   that resolves the probe when the request succeeds says nothing
       //   about the failure path being examined.
-      if (scope.some((b) => b.body.some((l) => countsAsResolver(lines, l, scope, isCode))))
+      if (scope.some((b) => b.body.some((l) => countsAsResolver(lines, l, scope, isCode)))) {
+        asked.fate = "a resolver in the path's own scope";
+        candidates.push(asked);
         continue;
+      }
 
+      asked.fate = "nothing resolves the probe on this path";
+      candidates.push(asked);
       offenders.push(`${file}:${i + 1}  ${path.kind}: ${line.trim()}`);
     }
 
-    return { offenders, undetermined };
+    return { offenders, undetermined, candidates };
   }
 
   it("has no error response after the credential lookup that leaves the probe claimed", () => {
@@ -820,6 +755,41 @@ describe("circuit breaker: every file that claims the probe resolves it", () => 
       inScope.offenders,
       "a resolver in the path's own scope resolves the path's probe",
     ).toEqual([]);
+  });
+
+  it("asks about a path whose status it cannot read", () => {
+    // The rule the document describes: a path whose status the check
+    // cannot read is a path it asks about. The status is a variable here,
+    // so it may hold a local 4xx as well as an upstream status, and the
+    // check cannot tell which.
+    //
+    // A narrower rule — one that reads the status only off an object,
+    // `result.status` — misses this shape, and the paths it misses are
+    // the ones the no-answer check exists for: a handler that answers the
+    // client with the status it was given, without writing it out.
+    const FIXTURES = path.join(process.cwd(), "tests", "unit", "fixtures");
+    const file = path.join(FIXTURES, "probe-unreadable-status.js");
+    const source = fs.readFileSync(file, "utf8");
+
+    const leaks = probeLeaksIn("probe-unreadable-status.js", source);
+
+    // The uncovered path is reported.
+    expect(
+      leaks.offenders.length,
+      `exactly one path is reported: the uncovered one — ${leaks.offenders.join(" | ")}`,
+    ).toBe(1);
+    expect(
+      leaks.offenders[0],
+      "the path that is reported is the uncovered one",
+    ).toContain("the request could not be built");
+
+    // And the covered one is not. A resolver in the path's own scope
+    // resolves the probe, and a rule that asked about it anyway would be a
+    // rule that fights correct code.
+    expect(
+      leaks.offenders.join(" | "),
+      "a resolver in the path's own scope resolves the path's probe",
+    ).not.toContain("the provider refused the request");
   });
 
   it("does not count a resolver that is only mentioned in a comment", () => {

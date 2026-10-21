@@ -28,6 +28,7 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
+import { codeLines, codeLineFlags } from "./source-scan.js";
 
 const authMocks = vi.hoisted(() => ({
   getProviderCredentials: vi.fn(async () => ({
@@ -235,43 +236,68 @@ describe("the handler passes it on", () => {
  * narrow one, for a request that produced no signal about the provider.
  */
 const SRC_DIR = path.join(process.cwd(), "src");
+const FIXTURES_DIR = path.join(process.cwd(), "tests", "unit", "fixtures");
 
 // The entry points that hand a failure to the breaker. `recordProviderSuccess`
 // is not one of them: a success has no direction to state.
 const BREAKER_ENTRY_POINTS = /^(markAccountUnavailable|recordProviderFailure|releaseProviderProbe)$/;
 
-function breakerCallSites() {
+/**
+ * Every call site in the tree that hands a failure to the breaker.
+ *
+ * The tree is the default, and the directory is a parameter so that a
+ * FIXTURE can be scanned by the same function: a rule that is only
+ * exercised against the real tree is a rule the tree does not happen to
+ * exercise. `tests/unit/fixtures/breaker-call-comment-fact.js` holds the
+ * shape this scan has to get right — a call whose fact is written in a
+ * comment — and the test at the end of this file says the scan does not
+ * accept it.
+ *
+ * The scan reads CODE, not text. A call site is a call: not a mention of
+ * one in a comment, and not one inside a string. And the question it asks
+ * of a call site — does this statement say whether the provider was
+ * contacted? — is asked of the CODE of the statement, for the same reason.
+ * A fact written in a comment is not a fact the call carries, and a call
+ * that carries no fact falls back to the default, which is *contacted*.
+ */
+function breakerCallSites(dir = SRC_DIR) {
   const found = [];
-  const walk = (dir) => {
-    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-      const full = path.join(dir, entry.name);
+  const walk = (current) => {
+    for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+      const full = path.join(current, entry.name);
       if (entry.isDirectory()) {
         walk(full);
       } else if (entry.name.endsWith(".js")) {
         const lines = fs.readFileSync(full, "utf8").split(/\r?\n/);
+        const code = codeLines(lines);
+        const isCode = codeLineFlags(lines);
         lines.forEach((line, i) => {
-          const call = line.match(/\b(markAccountUnavailable|recordProviderFailure|releaseProviderProbe)\s*\(/);
+          // A comment is not a call site, and neither is a line inside a
+          // block comment — whose body does not begin with a star.
+          if (!isCode[i]) return;
+          const lineCode = code[i];
+          const call = lineCode.match(
+            /\b(markAccountUnavailable|recordProviderFailure|releaseProviderProbe)\s*\(/,
+          );
           if (!call) return;
           // The definition is not a call site.
-          if (new RegExp(`function\\s+${call[1]}\\b`).test(line)) return;
-          // A comment is not a call site.
-          const trimmed = line.trim();
-          if (trimmed.startsWith("//") || trimmed.startsWith("*")) return;
+          if (new RegExp(`function\\s+${call[1]}\\b`).test(lineCode)) return;
 
-          // The call's arguments: the statement the call sits in.
-          const parts = [line];
-          if (!line.includes(");")) {
-            for (let j = i + 1; j < lines.length && j <= i + 12; j += 1) {
-              parts.push(lines[j]);
-              if (lines[j].includes(");")) break;
-            }
+          // The call's arguments: the statement the call sits in, read as
+          // CODE. A fact in a comment is not part of the statement the
+          // call makes, and a string's contents are not part of it either.
+          const parts = [];
+          const last = Math.min(lines.length - 1, i + 12);
+          for (let j = i; j <= last; j += 1) {
+            parts.push(code[j]);
+            if (code[j].includes(");")) break;
           }
           const statement = parts.join("\n");
 
           found.push({
             file: path.relative(process.cwd(), full).replace(/\\/g, "/"),
             line: i + 1,
-            text: trimmed,
+            text: line.trim(),
             entry: call[1],
             states: statement.includes("upstreamContacted"),
           });
@@ -279,7 +305,7 @@ function breakerCallSites() {
       }
     }
   };
-  walk(SRC_DIR);
+  walk(dir);
   return found;
 }
 
@@ -310,5 +336,26 @@ describe("the handler layer: every call states the fact", () => {
       silent,
       `these calls hand a failure to the breaker without saying whether the provider was contacted: ${silent.join(" | ")}`,
     ).toEqual([]);
+  });
+
+  it("does not accept a fact written in a comment", () => {
+    // The fixture holds two calls: the first writes the fact in a comment
+    // and does not pass it, the second passes it. The scan has to tell
+    // them apart — and a fact written in a comment is not a fact the call
+    // carries, so the first one is left to the default, and the default is
+    // *contacted*.
+    const sites = breakerCallSites(FIXTURES_DIR).filter((s) =>
+      s.file.endsWith("breaker-call-comment-fact.js"),
+    );
+
+    expect(sites.length, "the fixture holds two calls to the breaker").toBe(2);
+    expect(
+      sites[0].states,
+      `a call whose fact is written only in a comment must not count as stating it: ${sites[0].text}`,
+    ).toBe(false);
+    expect(
+      sites[1].states,
+      `a call that passes the fact must count as stating it: ${sites[1].text}`,
+    ).toBe(true);
   });
 });

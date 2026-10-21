@@ -11,6 +11,44 @@ how to roll it back.
 
 ---
 
+## The controls in this document — an inventory
+
+Every control this branch adds, what it forbids, and the test that proves
+it. A control with no test is a comment, and a comment is what this work
+has been replacing; a control whose test cannot fail is a comment with
+extra steps. The "does the proof bite?" column is the one that matters: it
+is the answer to *"if I delete this, does anything notice?"*, and every row
+in it was answered by deleting the control and running the test — the exit
+code is the verdict, never a reading of the output.
+
+| control | what it forbids | where it lives | the test that proves it | does the proof bite? |
+|---|---|---|---|---|
+| the SLO validation gate | a deploy going out against an exhausted error budget, and a gate that measures the CI runner instead of the service | `scripts/ci/validate-slo.mjs` | `tests/unit/slo-gate.test.js` | yes — it fails closed on every path, and it never sends a request to a loopback address |
+| the SSE state persistence | a state file that leaks a secret, or a restart that loses the state | `src/sse/services/state-persistence.js` | `tests/unit/sse-state-persistence.test.js` | yes — the round trip, and the "never persisted" list |
+| the chaos suite | a failure mode that only shows up under load | `tests/chaos/` | the suite itself — `npm run test:chaos` | yes — the scenarios fail when the behaviour is broken |
+| the local-failure fact (`upstreamContacted`) | a request that never reached the provider being reported as a provider failure | `open-sse/utils/error.js` and every core | `tests/unit/local-failure-marking.test.js` | yes — the fact has to be RIGHT, not merely present |
+| the hand-built cores | a core that builds its result by hand and skips the fact | `open-sse/handlers/{fetch,search,chatSearch}` | `tests/unit/local-failure-hand-built-cores.test.js` | yes — it drives the three cores |
+| the handler-layer scan | a call to the breaker that does not state the fact | `tests/unit/local-failure-wiring.test.js` | the same file, and `tests/unit/fixtures/breaker-call-comment-fact.js` | yes — restore the text reading and the test fails |
+| the no-auth paths | a no-auth provider's failure reported as "the provider answered" | `src/sse/handlers/{stt,tts}.js` | `tests/unit/local-failure-no-auth-paths.test.js` | yes — the VALUE is asserted, not the presence |
+| the probe-resolution scans | a path that claims a probe and leaves it claimed | `tests/unit/breaker-probe-resolution.test.js` | the same file, and six fixtures | yes — the scope rule, the comment rule and the code-reading rule are each pinned by a mutation |
+| the shared source reader | three scans each carrying their own approximation of "is this code?" | `tests/unit/source-scan.js` | `tests/unit/source-scan.test.js` | yes — the reader's own shapes are pinned |
+| the account-lock option (`persistLock: false`) | a persisted `modelLock_*` outliving a quota reset | `src/sse/services/auth.js` | `tests/unit/breaker-persist-lock-option.test.js` | yes — delete the branch and the test fails |
+| the SSRF guard's codes | our own refusal being reported as an upstream failure | `src/shared/utils/ssrfGuard.js` | `tests/unit/search-core-ssrf-fact.test.js` | yes — the transport error reported as local fails the test |
+| the 499 branch | a client abort counting as a provider failure | `src/sse/services/auth.js` | `tests/unit/breaker-local-failure.test.js` | yes |
+| `recordProviderFailure`'s local branch | a local failure recording a provider failure | `src/sse/services/auth.js` | `tests/unit/breaker-local-failure.test.js` | yes — both directions are pinned |
+| the antigravity quota path | the quota path taking an account lock, or telling no one | `src/sse/handlers/chat.js` | `tests/unit/chat-antigravity-probe-fact.test.js` | yes — the handler side; the function side is the `persistLock` row |
+| the gemini native route | a path that returns to the client without releasing the probe | `src/app/api/v1beta/models/[...path]/route.js` | `tests/unit/gemini-native-probe-release.test.js` | yes |
+| the video core's retry fact | a retried request losing the fact | `open-sse/handlers/videoCore.js` | `tests/unit/video-core-retry-fact.test.js` | yes |
+| the drift gate | a change to the failing-test set against the base | `.github/workflows/drift-prevention.yml` | the gate itself | yes — it compares the set test-by-test and re-runs each candidate file, so a flake does not fail the build |
+
+The controls' **reach** is stated where it is easy to get wrong: the
+breaker controls reach every path that claims a probe and every path that
+hands a failure to the breaker, and the two paths that do neither are
+declared rather than left as a hole — see *The reach has a declared
+boundary* below.
+
+---
+
 ## 1. SLO Validation Gate
 
 ### What it does
@@ -1226,29 +1264,51 @@ excluded: the probe was never claimed there, so nothing is owed.
 A path whose status the check **cannot read** is a path it asks about as
 well. A core answers a local 400 for a request it could not build, and the
 handler hands that status on without writing it out — the statement says
-`result.status` — so a check that only reads written-out statuses never sees
-the path at all. The two no-auth speech paths are that shape, and they are
-the paths that claim a probe. A path the check cannot see is a path it
-cannot vouch for.
+`result.status`, or passes the status on as a bare name — so a check that
+only reads written-out statuses never sees the path at all. The two no-auth
+speech paths are that shape, and they are the paths that claim a probe. A
+path the check cannot see is a path it cannot vouch for.
 
-The rule is exactly that: a status **read off an object**. A status written
-out as a literal is read directly — a local one makes the path a path, and
-anything else does not. The rule was measured rather than assumed, and the
-measurement is quoted here because it is a number about a tree that can
-change: it adds nine candidate paths across the ten files that obtain
-credentials, three of which the check skips because no credential lookup
-precedes them — the image-generation and fetch no-auth paths, which claim
-nothing — and the six that remain are all covered.
+The rule is exactly that: a status the check **cannot read**. A status is
+readable when it is written out — a number, or a named constant — and
+unreadable when it is a variable: a property of an object, an argument, or a
+local name. A variable may hold a local 4xx as well as an upstream status,
+so the check cannot tell which, and so it asks. The rule was measured
+rather than assumed, and the measurement is quoted here because it is a
+number about a tree that can change: across the ten files that obtain
+credentials the rule asks about 93 paths, of which 86 the narrower rule —
+a status read off an object — also asked about. The seven it adds are all
+accounted for. Six are in the branch where the lookup found *nothing*, so
+the probe was never claimed there and nothing is owed; the seventh has a
+resolver in its own scope. No path is newly reported, and none is newly
+hidden. The scan reports every path it asked about and what became of it, so
+the reach of the check can be read rather than taken on trust.
 
-The check reads **code**, not prose. A resolver has to be *called*: a comment
-that names one is a mention, a trailing comment on a line that is not a call
-is a mention, and a string that mentions one is a mention. A return that was
-commented out is not a path the request can take. Before this was settled,
-all three counted, and the cost was the worst kind: a path that really did
-leak the probe was reported as *covered*, because the only thing covering it
-was a sentence. A control that can be satisfied by writing a sentence is not
-a control. `tests/unit/fixtures/probe-comment-resolver.js` holds the shapes,
-and the test pins all of them.
+The rule used to be narrower than this sentence. A rule that is narrower
+than the sentence above it is a rule the next person to write a handler will
+rely on wrongly, and the wider rule is the one this paragraph describes —
+the measurement above is what it costs.
+
+The check reads **code**, not prose — and so do the other two source scans
+this branch added, which is why they read it through **one** reader,
+`tests/unit/source-scan.js`. A comment that names a resolver is a mention, a
+trailing comment on a line that is not a call is a mention, and a string
+that mentions one is a mention. A return that was commented out is not a
+path the request can take. Before this was settled, all three counted, and
+the cost was the worst kind: a path that really did leak the probe was
+reported as *covered*, because the only thing covering it was a sentence. A
+control that can be satisfied by writing a sentence is not a control.
+`tests/unit/fixtures/probe-comment-resolver.js` holds the shapes, and the
+test pins all of them.
+
+The same reader serves the handler-layer scan and the marking scan, and it
+is a control in its own right: `tests/unit/source-scan.test.js` pins the
+shapes that have actually broken a scan on this branch — a mention in a
+comment, a mention in a string, a comment the line filter could not see, and
+a string that holds a bracket. The reader's contract is one-sided: where it
+cannot tell code from prose it says "not code", and the scan that uses it
+reports the path rather than hiding it. A control that hides a path costs an
+incident; a control that raises a false alarm costs an hour.
 
 The check has two kinds of path. A path that answers the client with a local
 4xx owes a resolution, and so does an **account rotation**: the `continue`
@@ -1353,6 +1413,31 @@ directly, and a scan that stopped at `markAccountUnavailable` would not see
 them at all. `tests/unit/local-failure-no-auth-paths.test.js` drives both
 paths and proves the VALUE; the scan proves that no call site is left to the
 default.
+
+The scan asks its question of the **code** of the statement, and that is
+what makes the answer worth having. The question is "does this call say
+whether the provider was contacted?", and a fact written in a comment is not
+something the call carries: the call falls back to the default, and the
+default is *contacted* — a provider that never received the request is
+recorded as one that answered, which closes the half-open circuit of a
+provider that is still down. Before this was settled the scan read the
+statement as text, and a sentence was enough to satisfy it. The shape is in
+`tests/unit/fixtures/breaker-call-comment-fact.js`, which holds both a call
+whose fact is only in a comment and a call that passes it, and the test
+asserts that the scan tells them apart.
+
+The marking scan reads the cores' source for failure results, and it reads
+it the same way. A failure result that has been **commented out** is a note
+about a failure, not a failure the core raises — and the block comment's
+body does not begin with a star, so a filter that decides "is this a
+comment?" by looking at the start of the line misses it. The cost runs the
+other way from the other findings: this is a control that blocks correct
+work. Commenting out a failure result is an ordinary thing to do while
+working on a core, and it broke the build with an error about a failure
+that no longer existed. The shape is in
+`tests/unit/fixtures/commented-out-failure.js`, which holds one failure
+result in code and one in a comment, and the test asserts that the scan sees
+the first and ignores the second.
 
 The reach has a **declared boundary**, and it is a boundary rather than a
 claim of coverage. The control reaches every path that **claims a probe** —
