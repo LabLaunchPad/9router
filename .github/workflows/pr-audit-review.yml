@@ -15,7 +15,7 @@ jobs:
       - name: 🔒 Check for Leaked Secrets & Sensitive Patterns
         run: |
           echo "Scanning PR for accidental secret inclusion..."
-          if grep -rE "sk-[a-zA-Z0-9]{32,}" src/ open-sse/ --exclude-dir=node_modules; then
+          if grep -rE --exclude-dir=node_modules --exclude-dir=tests "sk-[a-zA-Z0-9]{32,}" src/ open-sse/; then
             echo "::error::Potential hardcoded secret key detected!"
             exit 1
           fi

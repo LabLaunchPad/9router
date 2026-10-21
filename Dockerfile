@@ -15,13 +15,13 @@ RUN if [ "$ALPINE_MIRROR" != "dl-cdn.alpinelinux.org" ]; then \
     fi
 
 FROM base AS builder
-ARG NPM_REGISTRY
+ARG NPM_REGISTRY=https://registry.npmjs.org/
 
 RUN apk add --no-cache python3 make g++ linux-headers
 
 COPY package.json ./
 RUN --mount=type=cache,target=/root/.npm \
-    npm install \
+    npm install --legacy-peer-deps \
       --registry="${NPM_REGISTRY}" \
       --fetch-retries=5 \
       --fetch-retry-factor=2 \

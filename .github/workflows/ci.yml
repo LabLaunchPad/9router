@@ -45,8 +45,7 @@ jobs:
         run: npm install --legacy-peer-deps --no-audit --no-fund
 
       - name: 📥 Install Test Dependencies
-        working-directory: tests
-        run: npm install --legacy-peer-deps --no-audit --no-fund
+        run: cd tests && npm install --legacy-peer-deps --no-audit --no-fund
 
       - name: ⚡ Run Vitest Capabilities Unit Suite
         run: npx vitest run tests/unit/capabilities.test.js
