@@ -90,11 +90,19 @@ export async function parseUpstreamError(response, executor = null) {
 }
 
 /**
- * Create error result for chatCore handler
+ * Create error result for a failure where the provider was asked.
+ *
+ * The result says `upstreamContacted: true`: the upstream call was made and
+ * it failed, so the provider was asked and it answered — with a refusal, an
+ * error, or nothing at all. The circuit breaker needs to know that
+ * difference. A provider that ANSWERED is alive, and a request that was
+ * never sent says nothing about it — `createLocalErrorResult` is the one
+ * that says the latter.
+ *
  * @param {number} statusCode - HTTP status code
  * @param {string} message - Error message
  * @param {number} [resetsAtMs] - Optional precise cooldown expiry (ms epoch) for provider-specific quota errors
- * @returns {{ success: false, status: number, error: string, response: Response, resetsAtMs?: number }}
+ * @returns {{ success: false, status: number, error: string, response: Response, resetsAtMs?: number, upstreamContacted: true }}
  */
 export function createErrorResult(statusCode, message, resetsAtMs, extraHeaders = null) {
   return {
@@ -102,7 +110,33 @@ export function createErrorResult(statusCode, message, resetsAtMs, extraHeaders 
     status: statusCode,
     error: message,
     resetsAtMs,
+    upstreamContacted: true,
     response: errorResponse(statusCode, message, extraHeaders)
+  };
+}
+
+/**
+ * Create an error result for a failure that never reached the provider.
+ *
+ * The status is the one the client sees, but the result also says
+ * `upstreamContacted: false`: no upstream call was made, so nothing was
+ * learned about the provider. The circuit breaker needs to know that
+ * difference — a provider that ANSWERED with the same status is alive, and
+ * a request that was never sent says nothing at all.
+ *
+ * Use this for every failure raised BEFORE the upstream call: a validation
+ * failure, a request that could not be built, a translation that failed.
+ *
+ * @param {number} statusCode - HTTP status code
+ * @param {string} message - Error message
+ * @param {number} [resetsAtMs] - Optional precise cooldown expiry (ms epoch)
+ * @param {ResponseInit|null} [extraHeaders] - Optional extra response headers
+ * @returns {{ success: false, status: number, error: string, response: Response, resetsAtMs?: number, upstreamContacted: false }}
+ */
+export function createLocalErrorResult(statusCode, message, resetsAtMs, extraHeaders = null) {
+  return {
+    ...createErrorResult(statusCode, message, resetsAtMs, extraHeaders),
+    upstreamContacted: false,
   };
 }
 

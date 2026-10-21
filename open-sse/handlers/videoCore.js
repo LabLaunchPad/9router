@@ -1,4 +1,4 @@
-import { createErrorResult } from "../utils/error.js";
+import { createErrorResult, createLocalErrorResult } from "../utils/error.js";
 import { HTTP_STATUS } from "../config/runtimeConfig.js";
 import { refreshTokenByProvider } from "../services/tokenRefresh.js";
 import { PROVIDER_MEDIA } from "../providers/index.js";
@@ -89,10 +89,10 @@ export async function handleVideoProxyCore({
 }) {
   const config = getVideoConfig(provider);
   if (!config) {
-    return createErrorResult(HTTP_STATUS.BAD_REQUEST, `Provider '${provider}' does not support video generation`);
+    return createLocalErrorResult(HTTP_STATUS.BAD_REQUEST, `Provider '${provider}' does not support video generation`);
   }
   if (!requestId && !VIDEO_ACTIONS.has(action)) {
-    return createErrorResult(HTTP_STATUS.BAD_REQUEST, `Unknown video action: ${action}`);
+    return createLocalErrorResult(HTTP_STATUS.BAD_REQUEST, `Unknown video action: ${action}`);
   }
 
   const adapter = getVideoAdapter(provider);
@@ -136,7 +136,7 @@ export async function handleVideoProxyCore({
   let upstream;
   try {
     const first = await doFetch();
-    if (first.planError) return createErrorResult(HTTP_STATUS.BAD_REQUEST, `[${provider}] ${first.planError}`);
+    if (first.planError) return createLocalErrorResult(HTTP_STATUS.BAD_REQUEST, `[${provider}] ${first.planError}`);
     upstream = first.response;
   } catch (error) {
     if (error?.name === "TimeoutError") {
@@ -181,7 +181,28 @@ export async function handleVideoProxyCore({
       } catch { /* noop */ }
       try {
         const retry = await doFetch();
-        if (retry.planError) return createErrorResult(HTTP_STATUS.BAD_REQUEST, `[${provider}] ${retry.planError}`);
+        if (retry.planError) {
+          // The provider WAS asked. The first attempt went out and it
+          // answered - with a 401 or a 403, which is what brought us here -
+          // and only the RETRY failed locally, when the request could not be
+          // planned with the refreshed token.
+          //
+          // The fact the breaker reads is whether the provider was asked
+          // anything, and it was. Marking this a local failure would release
+          // the probe as though the request had never left the building, and
+          // count an upstream answer as a local failure - the wrong side of
+          // the distinction, in the direction that keeps a dead provider in
+          // service.
+          //
+          // The status is the provider's own answer rather than a local one.
+          // The provider rejected the credential; the refresh then produced
+          // credentials the request could not be planned with, and that is a
+          // credential problem, not a request the client got wrong. A local
+          // 4xx here would also read as a local failure to the scan that
+          // holds the fact to the status, and it would hide the difference
+          // the fact is there to make.
+          return createErrorResult(upstream.status, `[${provider}] ${retry.planError}`);
+        }
         upstream = retry.response;
       } catch (error) {
         return createErrorResult(HTTP_STATUS.BAD_GATEWAY, sanitizeSecrets(`[${provider}] video retry after refresh failed: ${error.message}`, credentials));

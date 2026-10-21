@@ -92,10 +92,10 @@ async function readJsonOrText(res) {
  */
 export async function handleFetchCore({ url, format, maxCharacters, provider, providerConfig, credentials, log }) {
   if (!url || typeof url !== "string") {
-    return { success: false, status: 400, error: "url is required" };
+    return { success: false, status: 400, error: "url is required", upstreamContacted: false };
   }
   if (!provider) {
-    return { success: false, status: 400, error: "provider is required" };
+    return { success: false, status: 400, error: "provider is required", upstreamContacted: false };
   }
 
   const fmt = format || DEFAULT_FORMAT;
@@ -132,29 +132,29 @@ export async function handleFetchCore({ url, format, maxCharacters, provider, pr
     if (provider === "tinyfish") {
       return await runTinyfish({ url, fmt, timeoutMs, apiKey, maxCharacters, costPerQuery, startedAt, baseUrl: providerConfig?.baseUrl });
     }
-    return { success: false, status: 400, error: `Unsupported provider: ${provider}` };
+    return { success: false, status: 400, error: `Unsupported provider: ${provider}`, upstreamContacted: false };
   } catch (err) {
     log?.("fetch handler error:", err?.message || err);
-    return { success: false, status: 502, error: err?.message || "Internal fetch error" };
+    return { success: false, status: 502, error: err?.message || "Internal fetch error", upstreamContacted: true };
   }
 }
 
 async function runTinyfish({ url, fmt, timeoutMs, apiKey, maxCharacters, costPerQuery, startedAt, baseUrl }) {
-  if (!["markdown", "html"].includes(fmt)) return { success: false, status: 400, error: `Unsupported TinyFish format: ${fmt}` };
+  if (!["markdown", "html"].includes(fmt)) return { success: false, status: 400, error: `Unsupported TinyFish format: ${fmt}`, upstreamContacted: false };
   const upstreamStart = Date.now();
   const r = await tryFetch(baseUrl, {
     method: "POST",
     headers: { "content-type": "application/json", "X-API-Key": apiKey },
     body: JSON.stringify({ urls: [url], format: fmt }),
   }, timeoutMs);
-  if (!r.ok) return { success: false, status: r.timeout ? 504 : 502, error: r.error };
+  if (!r.ok) return { success: false, status: r.timeout ? 504 : 502, error: r.error, upstreamContacted: true };
   const upstreamMs = Date.now() - upstreamStart;
   const { json } = await readJsonOrText(r.res);
-  if (!r.res.ok) return { success: false, status: r.res.status, error: json?.error?.message || `TinyFish error: ${r.res.status}` };
+  if (!r.res.ok) return { success: false, status: r.res.status, error: json?.error?.message || `TinyFish error: ${r.res.status}`, upstreamContacted: true };
   const failure = json?.errors?.[0];
-  if (failure) return { success: false, status: failure.status || 502, error: `TinyFish fetch failed: ${failure.error || "unknown error"}` };
+  if (failure) return { success: false, status: failure.status || 502, error: `TinyFish fetch failed: ${failure.error || "unknown error"}`, upstreamContacted: true };
   const page = json?.results?.[0];
-  if (!page || typeof page.text !== "string") return { success: false, status: 502, error: "TinyFish returned no extractable content" };
+  if (!page || typeof page.text !== "string") return { success: false, status: 502, error: "TinyFish returned no extractable content", upstreamContacted: true };
   const text = truncate(page.text, maxCharacters);
   return {
     success: true,
@@ -178,12 +178,12 @@ async function runFirecrawl({ url, fmt, timeoutMs, apiKey, maxCharacters, costPe
   }, timeoutMs);
 
   if (!r.ok) {
-    return { success: false, status: r.timeout ? 504 : 502, error: r.error };
+    return { success: false, status: r.timeout ? 504 : 502, error: r.error, upstreamContacted: true };
   }
   const upstreamMs = Date.now() - upstreamStart;
   const { json } = await readJsonOrText(r.res);
   if (!r.res.ok) {
-    return { success: false, status: r.res.status, error: json?.error || `Firecrawl error: ${r.res.status}` };
+    return { success: false, status: r.res.status, error: json?.error || `Firecrawl error: ${r.res.status}`, upstreamContacted: true };
   }
   const d = json?.data || {};
   const text = truncate(d.markdown || d.html || d.text || "", maxCharacters);
@@ -209,12 +209,12 @@ async function runJina({ url, fmt, timeoutMs, apiKey, maxCharacters, costPerQuer
   }, timeoutMs);
 
   if (!r.ok) {
-    return { success: false, status: r.timeout ? 504 : 502, error: r.error };
+    return { success: false, status: r.timeout ? 504 : 502, error: r.error, upstreamContacted: true };
   }
   const upstreamMs = Date.now() - upstreamStart;
   const body = await r.res.text();
   if (!r.res.ok) {
-    return { success: false, status: r.res.status, error: body?.slice(0, 500) || `Jina error: ${r.res.status}` };
+    return { success: false, status: r.res.status, error: body?.slice(0, 500) || `Jina error: ${r.res.status}`, upstreamContacted: true };
   }
   const text = truncate(body, maxCharacters);
   return {
@@ -238,12 +238,12 @@ async function runTavily({ url, fmt, timeoutMs, apiKey, maxCharacters, costPerQu
   }, timeoutMs);
 
   if (!r.ok) {
-    return { success: false, status: r.timeout ? 504 : 502, error: r.error };
+    return { success: false, status: r.timeout ? 504 : 502, error: r.error, upstreamContacted: true };
   }
   const upstreamMs = Date.now() - upstreamStart;
   const { json } = await readJsonOrText(r.res);
   if (!r.res.ok) {
-    return { success: false, status: r.res.status, error: json?.error || `Tavily error: ${r.res.status}` };
+    return { success: false, status: r.res.status, error: json?.error || `Tavily error: ${r.res.status}`, upstreamContacted: true };
   }
   const first = json?.results?.[0] || {};
   const text = truncate(first.raw_content || "", maxCharacters);
@@ -268,12 +268,12 @@ async function runExa({ url, fmt, timeoutMs, apiKey, maxCharacters, costPerQuery
   }, timeoutMs);
 
   if (!r.ok) {
-    return { success: false, status: r.timeout ? 504 : 502, error: r.error };
+    return { success: false, status: r.timeout ? 504 : 502, error: r.error, upstreamContacted: true };
   }
   const upstreamMs = Date.now() - upstreamStart;
   const { json } = await readJsonOrText(r.res);
   if (!r.res.ok) {
-    return { success: false, status: r.res.status, error: json?.error || `Exa error: ${r.res.status}` };
+    return { success: false, status: r.res.status, error: json?.error || `Exa error: ${r.res.status}`, upstreamContacted: true };
   }
   const first = json?.results?.[0] || {};
   const text = truncate(first.text || "", maxCharacters);
@@ -307,7 +307,7 @@ async function runOllama({
   }, timeoutMs);
 
   if (!r.ok) {
-    return { success: false, status: r.timeout ? 504 : 502, error: r.error };
+    return { success: false, status: r.timeout ? 504 : 502, error: r.error, upstreamContacted: true };
   }
   const upstreamMs = Date.now() - upstreamStart;
   const { json, text: responseText } = await readJsonOrText(r.res);
@@ -316,10 +316,10 @@ async function runOllama({
       || json?.message
       || responseText?.slice(0, 500)
       || `Ollama error: ${r.res.status}`;
-    return { success: false, status: r.res.status, error };
+    return { success: false, status: r.res.status, error, upstreamContacted: true };
   }
   if (!json || typeof json.content !== "string") {
-    return { success: false, status: 502, error: "Ollama returned an empty or invalid web fetch response" };
+    return { success: false, status: 502, error: "Ollama returned an empty or invalid web fetch response", upstreamContacted: true };
   }
 
   const text = truncate(json.content, maxCharacters);

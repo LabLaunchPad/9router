@@ -4,6 +4,7 @@ import {
   getProviderCredentials,
   isValidApiKey,
   markAccountUnavailable,
+  releaseProviderProbe,
 } from "@/sse/services/auth.js";
 import { getSettings } from "@/lib/localDb";
 import { PROVIDER_MODELS } from "@/shared/constants/models";
@@ -266,6 +267,27 @@ async function forwardGeminiNativeRequest(request, body, model, action) {
 
     const authHeaders = buildGeminiNativeAuthHeaders(credentials);
     if (!authHeaders) {
+      // The credential was obtained, so the half-open probe it claimed has to
+      // be released: no upstream call is made, and the provider is not at
+      // fault — it is the key that is missing. Leaving the probe claimed
+      // would refuse this provider for the whole reset window, and every
+      // refusal is counted as an error against the error budget.
+      //
+      // The account side is a different question, and it has the same answer
+      // as the equivalent failure on the STT path (a credential with no
+      // token): a credential that can never work is put aside for a cooldown
+      // rather than re-selected on every request. `upstreamContacted: false`
+      // is what keeps that from being read as a provider failure — the
+      // breaker releases the probe and records nothing, and only the
+      // credential is put aside.
+      await markAccountUnavailable(
+        credentials.connectionId,
+        404,
+        "No Gemini API key configured",
+        "gemini",
+        modelId,
+        { upstreamContacted: false }
+      );
       return Response.json(
         { error: { message: "No Gemini API key configured" } },
         { status: 404 }
@@ -285,6 +307,12 @@ async function forwardGeminiNativeRequest(request, body, model, action) {
 
     if (request.signal?.aborted) {
       console.log(`[GEMINI_NATIVE] client aborted model=${modelId} ms=0 conn=${safeConnection}`);
+      // The probe the credential lookup claimed has to be released. A client
+      // that walked away is not a signal about the provider, and a request
+      // that was never sent says nothing at all — either way the probe is
+      // released and nothing is recorded. The fact is stated rather than
+      // left to the default: the request never left the building.
+      releaseProviderProbe("gemini", 499, { upstreamContacted: false });
       return Response.json({ error: { message: "Client closed request" } }, { status: 499 });
     }
 
@@ -306,6 +334,11 @@ async function forwardGeminiNativeRequest(request, body, model, action) {
       const durationMs = Date.now() - startedAt;
       if (request.signal?.aborted && !timedOut) {
         console.log(`[GEMINI_NATIVE] client aborted model=${modelId} ms=${durationMs} conn=${safeConnection}`);
+        // The client walked away mid-request. The provider may have received
+        // the request, so this is an abandoned request rather than a local
+        // failure — but it is not an answer either, so the probe is released
+        // and nothing is recorded.
+        releaseProviderProbe("gemini", 499, { upstreamContacted: true });
         return Response.json({ error: { message: "Client closed request" } }, { status: 499 });
       }
 
@@ -318,7 +351,12 @@ async function forwardGeminiNativeRequest(request, body, model, action) {
         status,
         errorText,
         "gemini",
-        modelId
+        modelId,
+        // The upstream call was made and it failed, so the provider WAS
+        // asked. The fact is stated rather than left to the default,
+        // because a reader of this call should not have to know what the
+        // default is.
+        { upstreamContacted: true }
       );
 
       if (shouldFallback) {
@@ -352,7 +390,10 @@ async function forwardGeminiNativeRequest(request, body, model, action) {
       upstreamResponse.status,
       errorText,
       "gemini",
-      modelId
+      modelId,
+      // The provider answered with an error status, so it was asked and it
+      // replied. The fact is stated rather than left to the default.
+      { upstreamContacted: true }
     );
 
     if (shouldFallback) {

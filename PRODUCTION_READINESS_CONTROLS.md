@@ -11,6 +11,44 @@ how to roll it back.
 
 ---
 
+## The controls in this document — an inventory
+
+Every control this branch adds, what it forbids, and the test that proves
+it. A control with no test is a comment, and a comment is what this work
+has been replacing; a control whose test cannot fail is a comment with
+extra steps. The "does the proof bite?" column is the one that matters: it
+is the answer to *"if I delete this, does anything notice?"*, and every row
+in it was answered by deleting the control and running the test — the exit
+code is the verdict, never a reading of the output.
+
+| control | what it forbids | where it lives | the test that proves it | does the proof bite? |
+|---|---|---|---|---|
+| the SLO validation gate | a deploy going out against an exhausted error budget, and a gate that measures the CI runner instead of the service | `scripts/ci/validate-slo.mjs` | `tests/unit/slo-gate.test.js` | yes — it fails closed on every path, and it never sends a request to a loopback address |
+| the SSE state persistence | a state file that leaks a secret, or a restart that loses the state | `src/sse/services/state-persistence.js` | `tests/unit/sse-state-persistence.test.js` | yes — the round trip, and the "never persisted" list |
+| the chaos suite | a failure mode that only shows up under load | `tests/chaos/` | the suite itself — `npm run test:chaos` | yes — the scenarios fail when the behaviour is broken |
+| the local-failure fact (`upstreamContacted`) | a request that never reached the provider being reported as a provider failure | `open-sse/utils/error.js` and every core | `tests/unit/local-failure-marking.test.js` | yes — the fact has to be RIGHT, not merely present |
+| the hand-built cores | a core that builds its result by hand and skips the fact | `open-sse/handlers/{fetch,search,chatSearch}` | `tests/unit/local-failure-hand-built-cores.test.js` | yes — it drives the three cores |
+| the handler-layer scan | a call to the breaker that does not state the fact | `tests/unit/local-failure-wiring.test.js` | the same file, and `tests/unit/fixtures/breaker-call-comment-fact.js` | yes — restore the text reading and the test fails |
+| the no-auth paths | a no-auth provider's failure reported as "the provider answered" | `src/sse/handlers/{stt,tts}.js` | `tests/unit/local-failure-no-auth-paths.test.js` | yes — the VALUE is asserted, not the presence |
+| the probe-resolution scans | a path that claims a probe and leaves it claimed | `tests/unit/breaker-probe-resolution.test.js` | the same file, and six fixtures | yes — the scope rule, the comment rule and the code-reading rule are each pinned by a mutation |
+| the shared source reader | three scans each carrying their own approximation of "is this code?" | `tests/unit/source-scan.js` | `tests/unit/source-scan.test.js` | yes — the reader's own shapes are pinned |
+| the account-lock option (`persistLock: false`) | a persisted `modelLock_*` outliving a quota reset | `src/sse/services/auth.js` | `tests/unit/breaker-persist-lock-option.test.js` | yes — delete the branch and the test fails |
+| the SSRF guard's codes | our own refusal being reported as an upstream failure | `src/shared/utils/ssrfGuard.js` | `tests/unit/search-core-ssrf-fact.test.js` | yes — the transport error reported as local fails the test |
+| the 499 branch | a client abort counting as a provider failure | `src/sse/services/auth.js` | `tests/unit/breaker-local-failure.test.js` | yes |
+| `recordProviderFailure`'s local branch | a local failure recording a provider failure | `src/sse/services/auth.js` | `tests/unit/breaker-local-failure.test.js` | yes — both directions are pinned |
+| the antigravity quota path | the quota path taking an account lock, or telling no one | `src/sse/handlers/chat.js` | `tests/unit/chat-antigravity-probe-fact.test.js` | yes — the handler side; the function side is the `persistLock` row |
+| the gemini native route | a path that returns to the client without releasing the probe | `src/app/api/v1beta/models/[...path]/route.js` | `tests/unit/gemini-native-probe-release.test.js` | yes |
+| the video core's retry fact | a retried request losing the fact | `open-sse/handlers/videoCore.js` | `tests/unit/video-core-retry-fact.test.js` | yes |
+| the drift gate | a change to the failing-test set against the base | `.github/workflows/drift-prevention.yml` | the gate itself | yes — it compares the set test-by-test and re-runs each candidate file, so a flake does not fail the build |
+
+The controls' **reach** is stated where it is easy to get wrong: the
+breaker controls reach every path that claims a probe and every path that
+hands a failure to the breaker, and the two paths that do neither are
+declared rather than left as a hole — see *The reach has a declared
+boundary* below.
+
+---
+
 ## 1. SLO Validation Gate
 
 ### What it does
@@ -945,8 +983,10 @@ The breaker is a **provider-level** control, and the distinction matters:
 |---|---|---|
 | `5xx`, transport error (no status) | **Yes** | The provider is failing; every account will fail the same way. |
 | `401`, `402`, `403`, `429` | **No** | About one credential. The provider itself is healthy. |
+| `499` — the client abandoned the request | **No** | Not an answer: the client went away, and the provider may never have been reached. The probe is released, not resolved. |
 | "no credentials configured" | **No** | A local configuration problem, and no upstream call is made. |
 | "every account locked or rate-limited" | **No** | Same: the provider is healthy and no upstream call is made. |
+| A request that never reached the provider | **No** | Same: a purely local problem — the provider was never asked anything, so nothing was learned about it. |
 | A successful upstream response | Closes the circuit | The provider demonstrably answered. |
 
 Two details that are easy to get wrong, and that this implementation gets
@@ -996,6 +1036,344 @@ provider that hangs is the failure the breaker exists for, and `408` would
 have been invisible to both the circuit and the error budget, because the
 budget counts 5xx.
 
+A request that never reached the provider is not an answer either, and it is
+not the same fact as a provider that answered. A `400` raised by a core
+*before* the upstream call — a missing field, an adapter that cannot assemble
+a body, a translation that failed — means the provider was never asked
+anything, so the probe is released and nothing is recorded. The provider's
+own `400` is the opposite case: there the provider did answer, it is alive,
+and the probe was answered, so the circuit closes. The two are the same
+number and different facts, so the core says which one it is
+(`upstreamContacted: false` on a local failure) and the handler passes that
+on. Without the distinction, a single malformed client request could close
+the half-open circuit of a provider that was still down — declaring it
+healthy and sending traffic back to it.
+
+That distinction is **checked, not trusted**, because the default is
+"contacted" and an unmarked local failure is silent: no test fails, no log
+line appears, the circuit closes.
+
+The check that enforces it is behavioural:
+`tests/unit/local-failure-hand-built-cores.test.js` calls the cores' public
+entry points and asserts on the result that comes back. That layer matters —
+the search core does not return the result it is given, it wraps it, and a
+wrapper that rebuilds the result without carrying the fact turns every local
+failure back into "the provider ANSWERED". A test asserted one layer below
+the wrapper passes while the path is still broken: the fact is right at the
+producer and gone at the consumer.
+
+The behavioural check asserts **both** directions, and the second one was
+the one that was missing. A local failure has to say the provider was never
+asked; a failure the provider ANSWERED has to say it was asked. A core that
+marked its upstream failures as ones that never left the building would take
+the local branch in the breaker: the probe is released, nothing is recorded
+against the provider, and the circuit never opens for a provider that is
+down. Nothing caught that, so the two directions are asserted here, on the
+three cores that build their results by hand — the fetch core, the
+chat-search core, and the search core, whose result is wrapped on the way
+out.
+
+The search core has two ways in, and they are two different files. A test
+that drives the chat-search path never reaches the dedicated search API's
+own result — a fact of its own, in a file of its own — so the dedicated
+path is driven as well, in both directions: the request that could not be
+built says the provider was never asked, and the provider's own answer says
+it was.
+
+The fact has three legs: the core marks it, the handler passes it on, the
+breaker reads it. The first leg is guarded by the behavioural core tests and
+the scan below; the third by the breaker's own rules. The middle leg is the
+one that had a single handler covered out of ten, and it is now guarded
+twice. `tests/unit/local-failure-wiring.test.js` drives the embeddings
+handler and the search handler — the search path is the one that broke in
+round 14 — and asserts that the value reaches the account-failure path.
+The same file scans the handler layer: every call to `markAccountUnavailable`
+in `src/sse/` has to state the fact, so a handler cannot drop it by
+accident. The scan cannot tell a hard-coded `true` from the fact read off
+the result — the behavioural tests are what prove the value — but it proves
+that no call site is left to the default at all.
+
+`tests/unit/local-failure-marking.test.js` is the cheap second net: a scan
+of the cores for the places where a local failure is produced, whether it
+comes from the error constructor or from a hand-built object. It is not the
+control — a scan of the source cannot see what a core *returns* after it has
+wrapped a result — but it sees the constructor-based cores, which are
+awkward to drive, and it sees a local failure the moment it is written,
+wherever it is written.
+
+The scan has three rules, and all three are about the fact's VALUE, not
+only about whether it is there.
+
+The second rule is the one that closes the shape that round 14 found: **every
+failure result a core builds carries the fact**, whatever its status. The
+call-site rule sees the arguments; it cannot see the return value of the
+function they were passed to, and that is where the fact was lost.
+
+That rule is a property of the *result*, not of the function that made it,
+and that is the whole point. A rule that recognises a shape — a function
+declaration at the top level of a file, with a parameter named after a
+failure — is a rule a refactor can walk out of: a nested helper, an arrow
+function and a one-line object literal all escape it. The per-site rule
+sees all of them, because it asks what the result carries rather than how
+the code that built it is spelled, and
+`tests/unit/fixtures/wrapper-shapes.js` holds one wrapper per shape so that
+the claim is checkable rather than asserted: the scan has to find all four.
+The shared constructors state the fact once — the one for a failure where
+the provider was asked, and the one for a failure where it was not — and the
+hand-built results say it at the site.
+
+The first rule is the local direction of the same question: **a local
+failure — one raised on the core's own account, before anything was sent —
+has to say `upstreamContacted: false`**. A local failure that says the
+provider WAS asked is read by the breaker as "the provider ANSWERED": it
+closes the half-open circuit, so one malformed client request can declare a
+provider that is still down healthy.
+
+Asking for the VALUE rather than for the presence of the word is what makes
+that rule work, and the difference is not academic. A scan that asks whether
+the fact is THERE accepts the constructor that says the provider was asked as
+evidence that a local failure says it was not — and that constructor is the
+opposite of the evidence. A local failure written through it was invisible,
+and the tree had exactly one: the video core's retry. So the rule is a
+statement about the whole tree and not about a constructor: **a literal 4xx
+in a core is a failure the core raised on its own account**, and the status
+of a provider's answer is never a literal — it is a variable. A failure that
+names a local 4xx has to say the provider was never asked; the video core's
+retry failure names the provider's own status instead, and says the provider
+was asked.
+
+The third rule is the other end of the same question: **a failure that says
+`upstreamContacted: false` has to BE a local failure — a 4xx raised on the
+core's own account, written out**. A failure that says otherwise takes the
+local branch in the breaker: the probe is released, nothing is recorded
+against the provider, and the circuit never opens for a provider that is
+down. A 5xx is never a local failure: the provider was asked, and it
+answered. The status has to be *written out* for the same reason: a failure
+that says the provider was never asked and states its status as a variable
+is the same defect wearing a different hat, and a scan that cannot read the
+value cannot check it.
+
+Between them the two rules pin the fact to the status: a failure that says
+"the provider was never asked" has to name a local 4xx, and a failure that
+names a local 4xx has to say "the provider was never asked".
+
+A local failure is not only a status: it is a request that never left the
+building. The search core's dedicated path can fail that way — our own SSRF
+guard refuses a URL it will not talk to, before anything is sent — and a
+catch-all that reports every throw as a 502 reports the guard's refusal as
+"the provider ANSWERED 502". 502 is a provider-level failure, so the
+breaker counts it, and the circuit can open for a provider that never
+received a request. The guard's rejections carry a code so the core can
+tell them from a transport error without matching on the message, and the
+core answers a rejection with a local failure: a 400 with
+`upstreamContacted: false`.
+
+The code has to say WHICH refusal it is, because the two are different
+facts. A URL that is internal before the request is sent was never asked
+anything. A URL that was fine and was requested, and answered with a
+redirect to an internal target, was asked and answered — the guard refused
+the second hop, not the first. So the guard reports three codes:
+`SSRF_BLOCKED_URL` (nothing was sent), `SSRF_BLOCKED_REDIRECT` (the
+provider answered) and `SSRF_TOO_MANY_REDIRECTS` (the provider answered, and
+the chain never ended). Only the first is a local failure.
+`tests/unit/search-core-ssrf-fact.test.js` pins all three.
+
+An object literal is only a failure result when it says so. A configuration
+object that happens to carry a `status:` property is not a failure, and
+judging it as one turns the control into something to work around: the only
+ways to satisfy the scan would be to write a false statement on an object
+that is not a failure, or to rename the property so the scan stops looking
+at it. The rules that judge a failure's *value* ask the record whether it is
+one — `success: false` is the marker — and
+`tests/unit/fixtures/not-a-failure.js` is the shape that must not be judged.
+
+The fact is a statement about the *provider*, not about the request that
+failed. The video core's 401/403 path is the case that makes the
+difference: the first attempt goes out and the provider answers, the token
+is refreshed, and the request is planned again. If the *retry's* plan fails,
+the provider was still asked — it answered a moment earlier — so the failure
+says so. Marking it as a local failure would release the probe as though
+the request had never left the building, and count an upstream answer in
+`sse_provider_local_failures_total`. Its status is the provider's own answer
+for the same reason: the provider rejected the credential, and the refresh
+then produced credentials the request could not be planned with. That is a
+credential problem, not a request the client got wrong, and a literal 4xx
+there would claim the latter — and would read as a local failure to the scan
+that holds the fact to the status.
+`tests/unit/video-core-retry-fact.test.js` pins both halves of it.
+
+The scan reads **statements**, not lines. A call written across four lines
+has its status on the second one, and a scan that matches the call against
+the line the status is on never sees the call at all — the pattern wants
+the `(` and the status together.
+`tests/unit/fixtures/multi-line-failure.js` is that shape, and the scan has
+to find it.
+
+A bracket inside a string is not a bracket. A message that holds an
+unbalanced "(" must not carry the count past the end of the call: the
+statement below it would then vouch for a failure that says nothing, and a
+later statement's fact would read as the failure's own.
+`tests/unit/fixtures/local-failure-defects.js` holds the shapes the scan has
+to catch — a local failure through the wrong constructor, a hand-built one
+that claims the provider was asked, a failure that says the provider was
+never asked and names no status, and a message with an unbalanced bracket in
+it — and the scan has to see every one of them.
+
+A path that returns to the client without going through the account-failure
+path has to release the probe itself, or the provider is blackholed for the
+whole reset window and every refusal is counted as an error against the
+error budget. The gemini native path is the one that returns directly, and
+it has three such exits: a client that walked away before the request was
+sent, a client that walked away during it, and a credential with no API key
+(so nothing was sent at all).
+
+The two client-abort exits use `releaseProviderProbe()`: it touches the
+breaker only and leaves the account alone, because a client that walked away
+is nobody's fault but the client's.
+
+The missing-key exit is a different question, and it has the same answer as
+the equivalent failure on the STT path (a credential with no token): a
+credential that can never work is put aside for a cooldown rather than
+re-selected on every request. So that one goes through
+`markAccountUnavailable(..., { upstreamContacted: false })` — the local
+failure releases the probe and records no *failure* against the provider, and
+the credential is locked. The counter is a separate thing: the exit is
+counted in `sse_provider_local_failures_total`, under the provider's label,
+because that counter exists to count exactly these exits. The two decisions are independent: the breaker asks
+"was the provider asked anything?" and the account asks "can this
+credential work?", and a failure can fail the first while passing the
+second.
+
+The reach of that rule is not "the handlers directory". It is every file in
+the tree that claims a probe — `tests/unit/breaker-probe-resolution.test.js`
+scans the whole of `src/` for files that call `getProviderCredentials`, and
+requires each of them to resolve the probe on its success path and to
+release it on the paths that produce no answer. The gemini native route is
+the file that leaked for twelve rounds precisely because it was outside the
+scope of the old scan: a control that depends on where the file that claims
+the probe happens to live is not a control.
+
+The "no answer" check is scoped to the *scope* that claims the probe — a
+path that returns an error after the credential lookup, in a scope that
+performs one, has to release the probe on the way out. It reads an error
+response whether it is built at the return site or handed back by a helper,
+and it looks at the whole chain of enclosing blocks, so a release made once
+above the branch counts. The branch where the lookup found *nothing* is
+excluded: the probe was never claimed there, so nothing is owed.
+
+A path whose status the check **cannot read** is a path it asks about as
+well. A core answers a local 400 for a request it could not build, and the
+handler hands that status on without writing it out — the statement says
+`result.status`, or passes the status on as a bare name — so a check that
+only reads written-out statuses never sees the path at all. The two no-auth
+speech paths are that shape, and they are the paths that claim a probe. A
+path the check cannot see is a path it cannot vouch for.
+
+The rule is exactly that: a status the check **cannot read**. A status is
+readable when it is written out — a number, or a named constant — and
+unreadable when it is a variable: a property of an object, an argument, or a
+local name. A variable may hold a local 4xx as well as an upstream status,
+so the check cannot tell which, and so it asks. The rule was measured
+rather than assumed, and the measurement is quoted here because it is a
+number about a tree that can change: across the ten files that obtain
+credentials the rule asks about 93 paths, of which 86 the narrower rule —
+a status read off an object — also asked about. The seven it adds are all
+accounted for. Six are in the branch where the lookup found *nothing*, so
+the probe was never claimed there and nothing is owed; the seventh has a
+resolver in its own scope. No path is newly reported, and none is newly
+hidden. The scan reports every path it asked about and what became of it, so
+the reach of the check can be read rather than taken on trust.
+
+The rule used to be narrower than this sentence. A rule that is narrower
+than the sentence above it is a rule the next person to write a handler will
+rely on wrongly, and the wider rule is the one this paragraph describes —
+the measurement above is what it costs.
+
+The check reads **code**, not prose — and so do the other two source scans
+this branch added, which is why they read it through **one** reader,
+`tests/unit/source-scan.js`. A comment that names a resolver is a mention, a
+trailing comment on a line that is not a call is a mention, and a string
+that mentions one is a mention. A return that was commented out is not a
+path the request can take. Before this was settled, all three counted, and
+the cost was the worst kind: a path that really did leak the probe was
+reported as *covered*, because the only thing covering it was a sentence. A
+control that can be satisfied by writing a sentence is not a control.
+`tests/unit/fixtures/probe-comment-resolver.js` holds the shapes, and the
+test pins all of them.
+
+The same reader serves the handler-layer scan and the marking scan, and it
+is a control in its own right: `tests/unit/source-scan.test.js` pins the
+shapes that have actually broken a scan on this branch — a mention in a
+comment, a mention in a string, a comment the line filter could not see, and
+a string that holds a bracket. The reader's contract is one-sided: where it
+cannot tell code from prose it says "not code", and the scan that uses it
+reports the path rather than hiding it. A control that hides a path costs an
+incident; a control that raises a false alarm costs an hour.
+
+The check has two kinds of path. A path that answers the client with a local
+4xx owes a resolution, and so does an **account rotation**: the `continue`
+that hands the request to the next account. The lookup that claimed the
+probe is in the same loop, and the next iteration's lookup finds the breaker
+refusing this provider while the probe is still held — so a rotation that
+does not resolve the probe blackholes the provider for the whole reset
+window. The antigravity quota path was that shape: it deliberately takes no
+account lock, and it used to give the breaker no answer either, so the
+probe stayed claimed.
+
+The path now goes through the same breaker entry point as every other
+failure, and says `persistLock: false` — the account is not locked, the
+breaker still hears. The two questions are independent, and the account
+question is the conditional one: the lock depends on whether the model is
+exhausted until the upstream reset, while the breaker's answer does not
+depend on that at all. A path that answers the account question does not
+have to leave the other one open.
+
+Both answers are proven, and proven on the **real** function with a real
+connection id: `tests/unit/breaker-persist-lock-option.test.js` asserts that
+no lock is written, that the breaker still heard the failure, and that the
+caller still gets the fallback answer it asked for — and, in the other
+direction, that a path which does not ask for no lock gets the lock it
+always got. The option used to be unproven, which meant it could be deleted
+without anything noticing: the behaviour was proven only in the opposite
+direction, and the one test that drove the real function with a fact passed a
+null connection id, which returns before the lock is ever reached.
+
+And a resolver has to be one that the path actually reaches. Two shapes do
+not count: a resolver that is the **arm of a conditional expression** — it
+runs on one branch only — and a resolver in a **block the path does not sit
+inside** — the other arm of an if/else, or a callback. The blocks the
+resolver is in have to be the path's blocks, compared from the outermost
+inward: the same rule a credential lookup is held to. Before that, a
+resolver anywhere in the enclosing blocks counted, which is how the
+antigravity path passed a check that was supposed to be about it.
+
+The scope is the chain of enclosing blocks, and a function body is a block —
+so the check does not have to recognise how a function is written to know
+what encloses a path. An arrow-function handler and a nested helper are in
+scope exactly like a `function` declaration. The earlier version matched
+function declarations instead, and a file written with an arrow function was
+outside the check without saying so: the paths were skipped, and the check
+still reported the tree as clean.
+
+The rule is **pinned by fixtures**, not by the tree. The real tree contains
+neither of the two shapes — no resolver sits in a sibling arm of a
+conditional on a checked path, and none sits in a callback — so a rule that
+had been weakened again would leave the tree just as clean as it was before.
+That is not theoretical: the rule was weakened once, the scan kept passing,
+and the hole survived the fix that followed. The shapes live in
+`tests/unit/fixtures/probe-sibling-branch.js` and
+`tests/unit/fixtures/probe-callback-resolver.js`, and the function that reads
+them is the same one that reads the tree — a fixture that proved something
+else would prove nothing. A third fixture holds the case that has to keep
+working: a resolver in the path's own scope covers it, because a control
+that rejects correct work is a control contributors learn to work around.
+
+A path whose scope the check cannot place is **reported**, not skipped. The
+case is a handler that obtains its credentials in a helper: whether the
+probe was claimed on that path is not something a scan of the source can
+tell, and a check that cannot tell has to say so — silence reads as
+coverage.
+
 The no-auth free providers take an early return that hands back a **synthetic
 credential**, and that credential carries its `provider` — like a real one
 does. It has to: the success path resolves the provider from the credential
@@ -1011,10 +1389,72 @@ upstream request at all.
 The no-auth request paths go through the credential lookup as well, and for
 the same reason: that lookup is where the breaker is consulted. `canRequest()`
 has one production call site — inside `getProviderCredentials` — and
-`recordProviderFailure` has one — inside `markAccountUnavailable`, which
-needs an account. A path that skips the lookup is a path the breaker cannot
-see: its provider is never taken out of service, and its failures never trip
-anything. The credential itself is not used on those paths; the *lookup* is.
+`recordProviderFailure` has three: inside `markAccountUnavailable`, which
+needs an account, and on the two no-auth speech paths, which have none. A
+path that skips the lookup is a path the breaker cannot see: its provider is
+never taken out of service, and its failures never trip anything. The
+credential itself is not used on those paths; the *lookup* is.
+
+The no-auth paths hand their failure to the breaker **directly** —
+`recordProviderFailure` — because there is no account to lock, and that call
+owes the fact like every other one. The failure on that path is very often
+local: the STT core answers `Missing required field: file` and the TTS core
+answers `Missing required field: input`, both with a 400 and
+`upstreamContacted: false`. Left to the default, a client that forgot to
+attach a file is reported to the breaker as a provider that answered 400 —
+and a 4xx on a half-open circuit resolves the probe as a SUCCESS, so one
+malformed request closes the circuit of a provider that is still down.
+
+That is why the handler-layer scan's reach is **every entry point that hands
+a failure to the breaker** — `markAccountUnavailable`, `recordProviderFailure`
+and `releaseProviderProbe` — and not only the one the account-fallback loop
+uses. The no-auth providers have no account, so they go to the breaker
+directly, and a scan that stopped at `markAccountUnavailable` would not see
+them at all. `tests/unit/local-failure-no-auth-paths.test.js` drives both
+paths and proves the VALUE; the scan proves that no call site is left to the
+default.
+
+The scan asks its question of the **code** of the statement, and that is
+what makes the answer worth having. The question is "does this call say
+whether the provider was contacted?", and a fact written in a comment is not
+something the call carries: the call falls back to the default, and the
+default is *contacted* — a provider that never received the request is
+recorded as one that answered, which closes the half-open circuit of a
+provider that is still down. Before this was settled the scan read the
+statement as text, and a sentence was enough to satisfy it. The shape is in
+`tests/unit/fixtures/breaker-call-comment-fact.js`, which holds both a call
+whose fact is only in a comment and a call that passes it, and the test
+asserts that the scan tells them apart.
+
+The marking scan reads the cores' source for failure results, and it reads
+it the same way. A failure result that has been **commented out** is a note
+about a failure, not a failure the core raises — and the block comment's
+body does not begin with a star, so a filter that decides "is this a
+comment?" by looking at the start of the line misses it. The cost runs the
+other way from the other findings: this is a control that blocks correct
+work. Commenting out a failure result is an ordinary thing to do while
+working on a core, and it broke the build with an error about a failure
+that no longer existed. The shape is in
+`tests/unit/fixtures/commented-out-failure.js`, which holds one failure
+result in code and one in a comment, and the test asserts that the scan sees
+the first and ignores the second.
+
+The reach has a **declared boundary**, and it is a boundary rather than a
+claim of coverage. The control reaches every path that **claims a probe** —
+every path that calls the credential lookup — and every path that **hands a
+failure to the breaker**. Two no-auth paths do neither: the image-generation
+path for `sdwebui` and `comfyui`, and the parity no-auth path in the fetch
+handler. They never call the credential lookup, so they claim no probe; and
+they never report a failure to the breaker, so a failing `sdwebui` does not
+trip anything and its provider is never taken out of service.
+
+That gap is not closed here, and the reason matters. The correct fix is for
+those paths to *consult* the breaker as well as report to it — a failure
+reported to a breaker that was never consulted makes the metrics lie, and
+can take a provider out of rotation for a path that never asks it. That is a
+behaviour change on a live path, and it belongs in its own pull request with
+its own review. Stating it here is what keeps it a boundary rather than a
+hole.
 
 ### The breaker's transitions are observable
 
@@ -1048,12 +1488,26 @@ Prometheus text exposition. Exports `sse_requests_total`,
 histogram, so memory is bounded regardless of traffic),
 `sse_error_budget_consumed`, `sse_circuit_breaker_state`,
 `sse_circuit_breaker_transitions_total`, `sse_circuit_breaker_rejections_total`,
+`sse_provider_local_failures_total`, `sse_provider_aborted_requests_total`,
 `sse_metrics_sample_age_seconds`, and `sse_metrics_dropped_series_total`.
 
 The `sse_error_budget_consumed` gauge is the signal the SLO gate reads. The
 sample-age gauge is what lets the gate tell whether the sample spans the SLO
 window — see the window note in section 1. The dropped-series gauge is
 non-zero when the registry had to refuse a series; it should always be zero.
+
+Two of the counters say what the others cannot. `sse_provider_local_failures_total`
+counts requests that **never reached the provider** — a request that could not
+be built, a missing field, a credential with no key. They are not provider
+failures, and they must not be read as such: a rising count is a problem in
+the request path, not an outage. `sse_provider_aborted_requests_total` counts
+requests the **client walked away** from. Neither series is counted by the
+error budget — neither is a provider failure — but both are the *early*
+signal for a condition whose *late* signal is a budget being burned: a
+provider left half-open with its probe claimed refuses every later request,
+and each refusal is a `sse_circuit_breaker_rejections_total`, which the
+budget does count as an error. A rising local-failure count is what an
+operator sees first; a rising rejection count is what it becomes.
 
 Both routes are in the dashboard guard's `PUBLIC_API_PATHS`: the SLO gate
 fetches `/api/metrics` unauthenticated (no cookies, no bearer token), so it

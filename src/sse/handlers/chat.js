@@ -336,11 +336,34 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
       if (quotaResetMs) resetsAtMs = quotaResetMs;
     }
 
-    // Exhausted Antigravity model is blocked only in RAM cache until upstream resetAt.
-    // Do not persist a modelLock_* for this path.
-    const shouldFallback = provider === "antigravity" && quotaResetMs
-      ? true
-      : (await markAccountUnavailable(credentials.connectionId, result.status, result.error, provider, model, resetsAtMs)).shouldFallback;
+    // The breaker has to hear about every failure on this path.
+    //
+    // The credential lookup claimed the breaker's half-open probe, and a
+    // probe that is never resolved refuses the provider for the whole reset
+    // window — fifteen minutes by default — and every refusal is counted
+    // as an error against the error budget.
+    //
+    // The account lock is a different question, and it is the conditional
+    // one. The exhausted Antigravity model is blocked only in the RAM cache
+    // until the upstream reset, and this path must not persist a
+    // modelLock_* for it — so the lock is skipped there, and the breaker is
+    // told either way. A path that answers the account question does not
+    // have to leave the other one open.
+    const antigravityModelExhausted = provider === "antigravity" && Boolean(quotaResetMs);
+
+    const { shouldFallback: accountShouldFallback } = await markAccountUnavailable(
+      credentials.connectionId, result.status, result.error, provider, model,
+      {
+        upstreamContacted: result.upstreamContacted ?? true,
+        resetsAtMs,
+        persistLock: !antigravityModelExhausted,
+      },
+    );
+
+    // The exhausted model always rotates: it is out of quota until the
+    // upstream reset, so the next account is the only way to serve the
+    // request.
+    const shouldFallback = antigravityModelExhausted ? true : accountShouldFallback;
 
     if (shouldFallback) {
       log.warn("FALLBACK", `⇄ ACC:${credentials.connectionName} UNAVAILABLE (${result.status}) → NEXT ACCOUNT`);

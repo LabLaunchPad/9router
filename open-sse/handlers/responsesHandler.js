@@ -73,6 +73,7 @@ export async function handleResponsesCore({ body, modelInfo, credentials, log, o
       console.error("[Responses API] Stream-to-JSON conversion failed:", error);
       return {
         success: false,
+        upstreamContacted: true,
         status: 500,
         error: "Failed to convert streaming response to JSON"
       };

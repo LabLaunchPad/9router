@@ -107,6 +107,9 @@ describe("Ollama Cloud web fetch provider", () => {
       success: false,
       status: 502,
       error: "Ollama returned an empty or invalid web fetch response",
+      // The request WAS sent and the provider answered with a body that is
+      // not a usable answer — the fact travels with the status.
+      upstreamContacted: true,
     });
   });
 });

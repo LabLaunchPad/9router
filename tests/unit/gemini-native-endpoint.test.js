@@ -7,6 +7,7 @@ const mocks = vi.hoisted(() => ({
   getProviderCredentials: vi.fn(),
   markAccountUnavailable: vi.fn(),
   clearAccountError: vi.fn(),
+  releaseProviderProbe: vi.fn(),
 }));
 
 vi.mock("@/sse/handlers/chat.js", () => ({
@@ -18,6 +19,7 @@ vi.mock("@/sse/services/auth.js", () => ({
   isValidApiKey: mocks.isValidApiKey,
   markAccountUnavailable: mocks.markAccountUnavailable,
   clearAccountError: mocks.clearAccountError,
+  releaseProviderProbe: mocks.releaseProviderProbe,
 }));
 
 vi.mock("@/lib/localDb", () => ({
@@ -188,7 +190,8 @@ describe("Gemini native v1beta endpoint", () => {
       504,
       expect.stringContaining("UND_ERR_HEADERS_TIMEOUT"),
       "gemini",
-      "gemini-3.1-flash-tts-preview"
+      "gemini-3.1-flash-tts-preview",
+      { upstreamContacted: true }
     );
     expect(mocks.clearAccountError).toHaveBeenCalledWith(
       "second-conn",
@@ -215,7 +218,8 @@ describe("Gemini native v1beta endpoint", () => {
       502,
       expect.stringContaining("ECONNRESET"),
       "gemini",
-      "gemini-3.1-flash-tts-preview"
+      "gemini-3.1-flash-tts-preview",
+      { upstreamContacted: true }
     );
   });
 

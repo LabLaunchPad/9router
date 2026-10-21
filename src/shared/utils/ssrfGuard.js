@@ -23,6 +23,35 @@ import dns from "node:dns";
 const BLOCKED_HOSTNAMES = new Set(["localhost", "ip6-localhost", "ip6-loopback"]);
 const BLOCKED_SUFFIXES = [".internal", ".local", ".localhost"];
 
+/**
+ * The codes the guard's rejections carry.
+ *
+ * A caller has to be able to tell a rejection from a transport error
+ * without matching on the message, because the two say different things
+ * about the provider: a rejected URL was never sent, so it is a local
+ * failure and says nothing about the provider at all, while a transport
+ * error is the provider failing to answer.
+ *
+ * The three codes are three different facts:
+ *
+ * - `SSRF_BLOCKED_URL` — the URL that was about to be requested is
+ *   internal, so nothing was sent. The provider was never asked.
+ * - `SSRF_BLOCKED_REDIRECT` — the URL was fine and WAS requested; it
+ *   answered with a redirect to an internal target, and that hop was
+ *   refused. The provider was asked and it answered.
+ * - `SSRF_TOO_MANY_REDIRECTS` — the redirect chain never ended. The
+ *   provider was asked.
+ */
+export const SSRF_BLOCKED_URL = "SSRF_BLOCKED_URL";
+export const SSRF_BLOCKED_REDIRECT = "SSRF_BLOCKED_REDIRECT";
+export const SSRF_TOO_MANY_REDIRECTS = "SSRF_TOO_MANY_REDIRECTS";
+
+function guardError(message, code) {
+  const error = new Error(message);
+  error.code = code;
+  return error;
+}
+
 // Parse dotted IPv4 to 32-bit integer, or null if not a valid IPv4 literal.
 function ipv4ToInt(host) {
   const parts = host.split(".");
@@ -162,7 +191,7 @@ function isBlockedHost(host) {
 export function assertPublicUrl(rawUrl) {
   const parsed = new URL(rawUrl);
   const host = normalizeHost(parsed.hostname);
-  if (isBlockedHost(host)) throw new Error("Blocked URL: internal host");
+  if (isBlockedHost(host)) throw guardError("Blocked URL: internal host", SSRF_BLOCKED_URL);
 }
 
 // Async: assertPublicUrl plus DNS resolution of non-literal hostnames, so a
@@ -172,7 +201,7 @@ export function assertPublicUrl(rawUrl) {
 export async function assertPublicUrlResolved(rawUrl) {
   const parsed = new URL(rawUrl);
   const host = normalizeHost(parsed.hostname);
-  if (isBlockedHost(host)) throw new Error("Blocked URL: internal host");
+  if (isBlockedHost(host)) throw guardError("Blocked URL: internal host", SSRF_BLOCKED_URL);
 
   // Already a literal IPv4/IPv6 address — isBlockedHost above already covered it,
   // no DNS lookup applies (and dns.lookup would just echo it back anyway).
@@ -189,7 +218,7 @@ export async function assertPublicUrlResolved(rawUrl) {
   }
   for (const { address, family } of addresses) {
     if (family === 4 ? isBlockedIpv4(address) : isBlockedIpv6Groups(parseIPv6ToGroups(address) || [])) {
-      throw new Error("Blocked URL: hostname resolves to an internal host");
+      throw guardError("Blocked URL: hostname resolves to an internal host", SSRF_BLOCKED_URL);
     }
   }
 }
@@ -207,9 +236,18 @@ export async function fetchPublic(url, init = {}, { maxRedirects = 5 } = {}) {
     const isRedirect = res.status >= 300 && res.status < 400;
     const location = isRedirect ? res.headers.get("location") : null;
     if (!location) return res;
-    if (hop >= maxRedirects) throw new Error("Blocked URL: too many redirects");
+    if (hop >= maxRedirects) throw guardError("Blocked URL: too many redirects", SSRF_TOO_MANY_REDIRECTS);
     const nextUrl = new URL(location, currentUrl).toString();
-    await assertPublicUrlResolved(nextUrl);
+    try {
+      await assertPublicUrlResolved(nextUrl);
+    } catch (err) {
+      // The hop that was about to be refused is not the hop that was sent:
+      // the first one went out and the provider answered with a redirect.
+      // So the provider WAS asked, and the caller has to be told so — a
+      // refusal here is the provider's answer, not a request that never
+      // left the building.
+      throw guardError(err.message, SSRF_BLOCKED_REDIRECT);
+    }
     currentUrl = nextUrl;
   }
 }

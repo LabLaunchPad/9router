@@ -103,8 +103,13 @@ async function handleSingleModelTts(body, modelStr, responseFormat, language, st
     }
 
     // A no-auth provider has no account to lock, so the failure is
-    // recorded on the breaker directly.
-    recordProviderFailure(provider, result.status);
+    // recorded on the breaker directly. The fact travels with it: a core
+    // that failed before the call was made says so, and a core that got an
+    // answer from the provider says that instead. Leaving it to the default
+    // would report a client that forgot to send the text as a provider that
+    // answered 400 — and a 400 on a half-open circuit resolves the probe as
+    // a success, which declares a provider that is still down healthy.
+    recordProviderFailure(provider, result.status, { upstreamContacted: result.upstreamContacted ?? true });
     return errorResponse(result.status || HTTP_STATUS.BAD_GATEWAY, result.error || "TTS failed");
   }
 
@@ -141,7 +146,10 @@ async function handleSingleModelTts(body, modelStr, responseFormat, language, st
       return result.response;
     }
 
-    const { shouldFallback } = await markAccountUnavailable(credentials.connectionId, result.status, result.error, provider, model);
+    const { shouldFallback } = await markAccountUnavailable(
+      credentials.connectionId, result.status, result.error, provider, model,
+      { upstreamContacted: result.upstreamContacted ?? true },
+    );
     if (shouldFallback) {
       excludeConnectionIds.add(credentials.connectionId);
       lastError = result.error;

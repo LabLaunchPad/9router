@@ -442,12 +442,13 @@ export async function handleChatSearch({
     return {
       success: false,
       status: 400,
-      error: `Unsupported chat-search provider: ${provider}`
+      error: `Unsupported chat-search provider: ${provider}`,
+      upstreamContacted: false,
     };
   }
 
   if (!query || typeof query !== "string") {
-    return { success: false, status: 400, error: "Missing query" };
+    return { success: false, status: 400, error: "Missing query", upstreamContacted: false };
   }
 
   const token = credentials?.apiKey || credentials?.accessToken;
@@ -455,13 +456,14 @@ export async function handleChatSearch({
     return {
       success: false,
       status: 401,
-      error: "Missing credentials (apiKey or accessToken)"
+      error: "Missing credentials (apiKey or accessToken)",
+      upstreamContacted: false,
     };
   }
 
   const credentialError = cfg.requireCredentials?.(credentials);
   if (credentialError) {
-    return { success: false, status: 401, error: credentialError };
+    return { success: false, status: 401, error: credentialError, upstreamContacted: false };
   }
 
   const limit =
@@ -489,11 +491,12 @@ export async function handleChatSearch({
     clearTimeout(timer);
     if (err?.name === "AbortError") {
       log?.warn?.(`[chatSearch] timeout provider=${provider}`);
-      return { success: false, status: 504, error: "Upstream timeout" };
+      return { success: false, status: 504, error: "Upstream timeout", upstreamContacted: true };
     }
     log?.error?.(`[chatSearch] network error provider=${provider}: ${err?.message}`);
     return {
       success: false,
+      upstreamContacted: true,
       status: 502,
       error: `Network error: ${err?.message || "unknown"}`
     };
@@ -507,6 +510,7 @@ export async function handleChatSearch({
   } catch {
     return {
       success: false,
+      upstreamContacted: true,
       status: 502,
       error: `Invalid upstream response (status ${resp.status})`
     };
@@ -521,6 +525,7 @@ export async function handleChatSearch({
     log?.warn?.(`[chatSearch] upstream error provider=${provider} status=${resp.status}`);
     return {
       success: false,
+      upstreamContacted: true,
       status: resp.status,
       error: typeof errMsg === "string" ? errMsg : JSON.stringify(errMsg)
     };

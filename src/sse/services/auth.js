@@ -7,7 +7,7 @@ import { getAntigravityQuotaCache, getAntigravityModelQuota } from "./antigravit
 import * as log from "../utils/logger.js";
 import { CIRCUIT_BREAKER_CONFIG } from "open-sse/config/runtimeConfig.js";
 import { getCircuitBreaker } from "open-sse/services/circuitBreaker.js";
-import { recordBreakerRejection } from "@/sse/services/metrics.js";
+import { recordBreakerRejection, incrementCounter } from "@/sse/services/metrics.js";
 import REGISTRY from "open-sse/providers/registry/index.js";
 
 // Helper: get per-provider circuit breaker config, merged with defaults
@@ -83,11 +83,15 @@ const lastProviderFailureAt = new Map();
  *
  * @param {string|null} provider
  * @param {number|string|null} status - upstream HTTP status, if any
+ * @param {{ upstreamContacted?: boolean }} [options]
+ *   `upstreamContacted: false` means no upstream call was made at all — the
+ *   request could not be built, or failed validation before it was sent.
  * @returns {boolean} true when a failure was recorded on the breaker
  */
-export function recordProviderFailure(provider, status) {
+export function recordProviderFailure(provider, status, options = {}) {
   if (!provider) return false;
 
+  const { upstreamContacted = true } = options;
   const providerId = resolveProviderId(provider);
   const cbConfig = getProviderCircuitBreakerConfig(providerId);
   const cb = getCircuitBreaker(providerId, cbConfig);
@@ -98,8 +102,41 @@ export function recordProviderFailure(provider, status) {
   // either - the branch below is for a provider that ANSWERED, and an
   // abandoned request is not an answer. The probe is released instead, so
   // the next request is the probe again.
+  //
+  // This is checked BEFORE the local-failure branch below: a request that
+  // was abandoned is an abandoned request, whether or not it had been sent,
+  // and it is counted as one.
   if (Number(status) === 499) {
     cb.releaseProbe();
+    // `info`, not `warn`: a client that walked away is ordinary — a
+    // cancelled request, a closed tab — and the chat and video paths both
+    // produce them. The counter is the durable signal and the one an alert
+    // would be built on; the log line matches the event, not the rate.
+    log.info(
+      "AUTH",
+      `${provider} | request abandoned by the client (499) — probe released, breaker ${cb.state}`,
+    );
+    incrementCounter("sse_provider_aborted_requests_total", { provider: providerId });
+    return false;
+  }
+
+  // A request that never reached the provider is not a signal about it: the
+  // provider was never asked anything, so nothing was learned. It must not
+  // trip the circuit, and it must not be recorded as a success either - the
+  // branch below is for a provider that ANSWERED, and a request that was
+  // never sent is not an answer. The probe is released instead, so the next
+  // request is the probe again.
+  //
+  // This is the same path the "no credentials" and "every account locked"
+  // paths take, and for the same reason: a purely local problem must not
+  // blackhole a provider for the whole reset window.
+  if (!upstreamContacted) {
+    cb.releaseProbe();
+    log.warn(
+      "AUTH",
+      `${provider} | request failed before the upstream call (${status ?? "local error"}) — probe released, breaker ${cb.state}`,
+    );
+    incrementCounter("sse_provider_local_failures_total", { provider: providerId });
     return false;
   }
 
@@ -132,6 +169,37 @@ export function recordProviderFailure(provider, status) {
     `${provider} | provider failure (${status ?? "transport error"}) — breaker ${cb.state} (${cb.failureCount}/${cb.failureThreshold})`,
   );
   return true;
+}
+
+/**
+ * Release the half-open probe for a request that produced no signal about
+ * the provider.
+ *
+ * The probe slot is claimed by `canRequest()` inside `getProviderCredentials`,
+ * and it has to be resolved by something. A path that returns to the client
+ * without going through `markAccountUnavailable` — a client that walked
+ * away, a request that turned out to need no upstream call at all — leaves
+ * the slot claimed, and the provider is then refused for the whole reset
+ * window: every later request to it is a "circuit open" refusal, and every
+ * refusal is counted as an error against the error budget.
+ *
+ * This is the narrow version of `markAccountUnavailable`: it touches the
+ * breaker only, and leaves the account alone. Use it where the account is
+ * demonstrably not at fault and the request produced no answer.
+ *
+ * @param {string|null} provider
+ * @param {number|string|null} [status] - the status being reported
+ * @param {{ upstreamContacted?: boolean }} [options]
+ *   `upstreamContacted: false` (the default) means no upstream call was
+ *   made. Pass `true` when the request was sent and the provider may have
+ *   received it — a `499` says the client walked away, not that nothing was
+ *   sent. A `499` is handled as an abandoned request either way: that branch
+ *   is checked first, and it releases the probe and records nothing.
+ * @returns {boolean} true when a failure was recorded on the breaker
+ */
+export function releaseProviderProbe(provider, status = null, options = {}) {
+  const { upstreamContacted = false } = options;
+  return recordProviderFailure(provider, status, { upstreamContacted });
 }
 
 /**
@@ -456,14 +524,34 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
  * @param {string} errorText
  * @param {string|null} provider
  * @param {string|null} model - The specific model that triggered the error
+ * @param {{ upstreamContacted?: boolean, resetsAtMs?: number|null, persistLock?: boolean }} [options]
+ *   `upstreamContacted: false` means the request never reached the provider:
+ *   the account is not at fault and the provider was never asked anything.
+ *   `resetsAtMs` is an optional precise cooldown expiry (ms epoch) for
+ *   provider-specific quota errors.
+ *   `persistLock: false` means the account is NOT locked. The breaker still
+ *   hears about the failure — that is a separate question and it is answered
+ *   on every path through this function — but no modelLock is written. It is
+ *   for the paths that block a model in RAM until the upstream reset and must
+ *   not leave a lock behind that would outlive it.
  * @returns {{ shouldFallback: boolean, cooldownMs: number }}
  */
-export async function markAccountUnavailable(connectionId, status, errorText, provider = null, model = null, resetsAtMs = null) {
+export async function markAccountUnavailable(connectionId, status, errorText, provider = null, model = null, options = {}) {
+  // An options object, not two positional parameters: the two are unrelated
+  // and a caller that put one where the other belonged would be silently
+  // wrong — a `resetsAtMs` read as a truthy `upstreamContacted` loses the
+  // precise cooldown, which is the opposite failure from the one this
+  // function exists to prevent.
+  const { upstreamContacted = true, resetsAtMs = null, persistLock = true } = options;
+
   // A provider-level failure (5xx, transport error) trips the circuit
   // breaker. This is the upstream error path, so a provider that is genuinely
   // down is skipped instead of being retried into the ground. Per-account
   // problems (401/403/402/429) are ignored here — see isProviderLevelFailure.
-  recordProviderFailure(provider, status);
+  // A request that never reached the provider is ignored too: it says
+  // nothing about the provider, and the half-open probe it claimed has to be
+  // released rather than resolved.
+  recordProviderFailure(provider, status, { upstreamContacted });
 
   if (!connectionId || connectionId === "noauth") return { shouldFallback: false, cooldownMs: 0 };
   const connections = await getProviderConnections({ provider });
@@ -492,6 +580,21 @@ export async function markAccountUnavailable(connectionId, status, errorText, pr
   if (!shouldFallback) return { shouldFallback: false, cooldownMs: 0 };
 
   const reason = typeof errorText === "string" ? errorText.slice(0, 200) : "Provider error";
+
+  if (provider && status && reason) {
+    console.error(`❌ ${provider} [${status}]: ${reason}`);
+  }
+
+  if (!persistLock) {
+    // The account is not locked on this path: the model is blocked in RAM
+    // until the upstream reset, and a persisted modelLock would outlive
+    // that. The breaker has already been told (above the lock, in
+    // `recordProviderFailure`) — the two questions are independent, and
+    // answering one of them is not a reason to leave the other open.
+    log.info("AUTH", `${provider} | failure recorded, account not locked (persistLock: false) [${status}]`);
+    return { shouldFallback: true, cooldownMs };
+  }
+
   const lockUpdate = buildModelLockUpdate(githubResetAtMs ? null : model, cooldownMs);
 
   await updateProviderConnection(connectionId, {
@@ -506,10 +609,6 @@ export async function markAccountUnavailable(connectionId, status, errorText, pr
   const lockKey = Object.keys(lockUpdate)[0];
   const connName = conn?.displayName || conn?.name || conn?.email || connectionId.slice(0, 8);
   log.warn("AUTH", `${connName} locked ${lockKey} for ${Math.round(cooldownMs / 1000)}s [${status}]`);
-
-  if (provider && status && reason) {
-    console.error(`❌ ${provider} [${status}]: ${reason}`);
-  }
 
   return { shouldFallback: true, cooldownMs };
 }

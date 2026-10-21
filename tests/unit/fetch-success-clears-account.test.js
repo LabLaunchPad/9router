@@ -119,6 +119,7 @@ describe("web fetch account state", () => {
       "quota exceeded",
       "jina-reader",
       "webfetch:jina-reader",
+      { upstreamContacted: true },
     );
   });
 });

@@ -10,7 +10,7 @@
 import { buildSearchRequest } from "./callers.js";
 import { normalizeSearchResponse } from "./normalizers.js";
 import { handleChatSearch } from "./chatSearch.js";
-import { fetchPublic } from "../../../src/shared/utils/ssrfGuard.js";
+import { fetchPublic, SSRF_BLOCKED_URL } from "../../../src/shared/utils/ssrfGuard.js";
 
 const GLOBAL_TIMEOUT_MS = 15000;
 const NON_RETRIABLE = new Set([400, 401, 403, 404]);
@@ -43,13 +43,25 @@ function jsonResponse(payload, status = 200) {
   });
 }
 
-/** Wrap an error result with a Response object so the auth wrapper can return it directly. */
-function errorResult(status, error) {
+/**
+ * Wrap an error result with a Response object so the auth wrapper can return it
+ * directly.
+ *
+ * `upstreamContacted` says whether the provider was asked anything. A failure
+ * that never reached the provider says `false`; a failure that came back from
+ * the provider says `true`. It has to travel WITH the status, because the
+ * breaker tells the two apart by that fact: a provider that answered a 400 is
+ * alive, and a request that was never sent says nothing about it. A failure
+ * that loses the fact on the way out is read as "the provider ANSWERED", and
+ * it closes the half-open circuit of a provider that is still down.
+ */
+function errorResult(status, error, { upstreamContacted = true } = {}) {
   return {
     success: false,
     status,
     error,
-    response: jsonResponse({ error: { message: error, code: status } }, status)
+    response: jsonResponse({ error: { message: error, code: status } }, status),
+    upstreamContacted
   };
 }
 
@@ -67,7 +79,7 @@ async function tryDedicatedProvider({ provider, providerConfig, body, credential
   const token = credentials?.apiKey || credentials?.accessToken || undefined;
 
   if (providerConfig.authType !== "none" && !token) {
-    return { success: false, status: 401, error: `No credentials for provider: ${provider.id}` };
+    return { success: false, status: 401, error: `No credentials for provider: ${provider.id}`, upstreamContacted: false };
   }
 
   const params = {
@@ -89,7 +101,12 @@ async function tryDedicatedProvider({ provider, providerConfig, body, credential
   try {
     ({ url, init } = buildSearchRequest({ id: provider.id, ...providerConfig }, params));
   } catch (err) {
-    return { success: false, status: 400, error: err?.message || `Invalid request for ${provider.id}` };
+    return {
+      success: false,
+      status: 400,
+      error: err?.message || `Invalid request for ${provider.id}`,
+      upstreamContacted: false,
+    };
   }
 
   // Timeout = min(provider timeout, remaining global)
@@ -106,7 +123,7 @@ async function tryDedicatedProvider({ provider, providerConfig, body, credential
     if (!resp.ok) {
       const errText = await resp.text().catch(() => "");
       log?.error?.("SEARCH", `${provider.id} ${resp.status}: ${errText.slice(0, 200)}`);
-      return { success: false, status: resp.status, error: `${provider.id} returned ${resp.status}: ${errText.slice(0, 200)}` };
+      return { success: false, status: resp.status, error: `${provider.id} returned ${resp.status}: ${errText.slice(0, 200)}`, upstreamContacted: true };
     }
     const data = await resp.json();
     const normalized = normalizeSearchResponse(provider.id, data, params.query, params.searchType);
@@ -138,10 +155,29 @@ async function tryDedicatedProvider({ provider, providerConfig, body, credential
     };
   } catch (err) {
     clearTimeout(timer);
+
+    // The SSRF guard refusing the URL is a LOCAL failure: the request was
+    // never sent, so it says nothing about the provider. Reporting it as an
+    // upstream 502 charges the provider for a request that never left the
+    // building — and 502 is provider-level, so the circuit can open for a
+    // provider that never received one.
+    if (err?.code === SSRF_BLOCKED_URL) {
+      log?.error?.("SEARCH", `${provider.id} blocked: ${err.message}`);
+      return {
+        success: false,
+        status: 400,
+        error: `${provider.id} blocked: ${err.message}`,
+        upstreamContacted: false,
+      };
+    }
+
+    // Everything else here is the provider's answer (or its failure to
+    // answer): the request went out, so the fact is "the provider was
+    // asked".
     const isTimeout = err.name === "AbortError";
     const status = isTimeout ? 504 : 502;
     log?.error?.("SEARCH", `${provider.id} ${isTimeout ? "timeout" : "error"}: ${err.message}`);
-    return { success: false, status, error: `${provider.id} ${isTimeout ? "timeout" : "error"}: ${err.message}` };
+    return { success: false, status, error: `${provider.id} ${isTimeout ? "timeout" : "error"}: ${err.message}`, upstreamContacted: true };
   }
 }
 
@@ -161,7 +197,7 @@ export async function handleSearchCore({ body, provider, providerConfig, credent
 
   // 1. Sanitize query
   const { clean, error: sanitizeError } = sanitizeQuery(body.query || "");
-  if (sanitizeError) return errorResult(400, sanitizeError);
+  if (sanitizeError) return errorResult(400, sanitizeError, { upstreamContacted: false });
   const normalizedBody = { ...body, query: clean };
 
   // 2. Route: dedicated search API takes priority over chat-based
@@ -185,7 +221,7 @@ export async function handleSearchCore({ body, provider, providerConfig, credent
       log
     });
   } else {
-    return errorResult(400, `Provider ${provider.id} does not support web search`);
+    return errorResult(400, `Provider ${provider.id} does not support web search`, { upstreamContacted: false });
   }
 
   if (result.success) return successResult(result.data);
@@ -209,5 +245,10 @@ export async function handleSearchCore({ body, provider, providerConfig, credent
     if (fallback.success) return successResult(fallback.data);
   }
 
-  return errorResult(result.status || 502, result.error || "Search failed");
+  // The fact has to travel with the failure: this wraps the result the
+  // provider attempt produced, and a wrapper that rebuilds the result
+  // without carrying the fact turns every local failure into "the provider
+  // ANSWERED" — which closes the half-open circuit of a provider that is
+  // still down.
+  return errorResult(result.status || 502, result.error || "Search failed", { upstreamContacted: result.upstreamContacted });
 }
