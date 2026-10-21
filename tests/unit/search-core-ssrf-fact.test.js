@@ -55,21 +55,46 @@ describe("the search core: the SSRF guard's rejection is a local failure", () =>
   });
 
   it("still reports a transport error as an upstream failure", async () => {
-    const result = await handleSearchCore({
-      body: { query: "hello" },
-      provider: { ...provider, id: "demo-public" },
-      providerConfig: {
-        ...provider.searchConfig,
-        baseUrl: "https://search.invalid.example/search",
-      },
-      credentials: {},
-      log,
-    });
+    // The request goes out and the transport fails. The case does not need
+    // the network to prove that: a literal address skips the resolver
+    // entirely, and a stubbed fetch that rejects IS the transport error
+    // the case is about.
+    //
+    // It used to be written against a hostname, and that made the result a
+    // property of the machine: the guard resolves a hostname before it
+    // fetches, and that lookup has no timeout of its own — so where the
+    // resolver failed fast the case passed in milliseconds, and where it
+    // was slow the case ran past the test runner's limit and failed. A
+    // test whose result depends on the resolver is a test about the
+    // machine, not about the code.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        throw new TypeError("fetch failed");
+      }),
+    );
 
-    expect(result.success).toBe(false);
-    // The request went out and the fetch failed: the provider was asked.
-    expect(result.upstreamContacted).toBe(true);
-    expect(result.status).toBe(502);
+    try {
+      const result = await handleSearchCore({
+        body: { query: "hello" },
+        provider: { ...provider, id: "demo-public" },
+        providerConfig: {
+          ...provider.searchConfig,
+          // A literal public address: no DNS lookup, so the test does not
+          // depend on a resolver.
+          baseUrl: "https://8.8.8.8/search",
+        },
+        credentials: {},
+        log,
+      });
+
+      expect(result.success).toBe(false);
+      // The request went out and the fetch failed: the provider was asked.
+      expect(result.upstreamContacted).toBe(true);
+      expect(result.status).toBe(502);
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it("reports a refused REDIRECT as an upstream failure — the first hop went out", async () => {

@@ -1223,6 +1223,33 @@ and it looks at the whole chain of enclosing blocks, so a release made once
 above the branch counts. The branch where the lookup found *nothing* is
 excluded: the probe was never claimed there, so nothing is owed.
 
+A path whose status the check **cannot read** is a path it asks about as
+well. A core answers a local 400 for a request it could not build, and the
+handler hands that status on without writing it out — the statement says
+`result.status` — so a check that only reads written-out statuses never sees
+the path at all. The two no-auth speech paths are that shape, and they are
+the paths that claim a probe. A path the check cannot see is a path it
+cannot vouch for.
+
+The rule is exactly that: a status **read off an object**. A status written
+out as a literal is read directly — a local one makes the path a path, and
+anything else does not. The rule was measured rather than assumed, and the
+measurement is quoted here because it is a number about a tree that can
+change: it adds nine candidate paths across the ten files that obtain
+credentials, three of which the check skips because no credential lookup
+precedes them — the image-generation and fetch no-auth paths, which claim
+nothing — and the six that remain are all covered.
+
+The check reads **code**, not prose. A resolver has to be *called*: a comment
+that names one is a mention, a trailing comment on a line that is not a call
+is a mention, and a string that mentions one is a mention. A return that was
+commented out is not a path the request can take. Before this was settled,
+all three counted, and the cost was the worst kind: a path that really did
+leak the probe was reported as *covered*, because the only thing covering it
+was a sentence. A control that can be satisfied by writing a sentence is not
+a control. `tests/unit/fixtures/probe-comment-resolver.js` holds the shapes,
+and the test pins all of them.
+
 The check has two kinds of path. A path that answers the client with a local
 4xx owes a resolution, and so does an **account rotation**: the `continue`
 that hands the request to the next account. The lookup that claimed the
@@ -1241,6 +1268,16 @@ exhausted until the upstream reset, while the breaker's answer does not
 depend on that at all. A path that answers the account question does not
 have to leave the other one open.
 
+Both answers are proven, and proven on the **real** function with a real
+connection id: `tests/unit/breaker-persist-lock-option.test.js` asserts that
+no lock is written, that the breaker still heard the failure, and that the
+caller still gets the fallback answer it asked for — and, in the other
+direction, that a path which does not ask for no lock gets the lock it
+always got. The option used to be unproven, which meant it could be deleted
+without anything noticing: the behaviour was proven only in the opposite
+direction, and the one test that drove the real function with a fact passed a
+null connection id, which returns before the lock is ever reached.
+
 And a resolver has to be one that the path actually reaches. Two shapes do
 not count: a resolver that is the **arm of a conditional expression** — it
 runs on one branch only — and a resolver in a **block the path does not sit
@@ -1257,6 +1294,19 @@ scope exactly like a `function` declaration. The earlier version matched
 function declarations instead, and a file written with an arrow function was
 outside the check without saying so: the paths were skipped, and the check
 still reported the tree as clean.
+
+The rule is **pinned by fixtures**, not by the tree. The real tree contains
+neither of the two shapes — no resolver sits in a sibling arm of a
+conditional on a checked path, and none sits in a callback — so a rule that
+had been weakened again would leave the tree just as clean as it was before.
+That is not theoretical: the rule was weakened once, the scan kept passing,
+and the hole survived the fix that followed. The shapes live in
+`tests/unit/fixtures/probe-sibling-branch.js` and
+`tests/unit/fixtures/probe-callback-resolver.js`, and the function that reads
+them is the same one that reads the tree — a fixture that proved something
+else would prove nothing. A third fixture holds the case that has to keep
+working: a resolver in the path's own scope covers it, because a control
+that rejects correct work is a control contributors learn to work around.
 
 A path whose scope the check cannot place is **reported**, not skipped. The
 case is a handler that obtains its credentials in a helper: whether the
@@ -1279,10 +1329,11 @@ upstream request at all.
 The no-auth request paths go through the credential lookup as well, and for
 the same reason: that lookup is where the breaker is consulted. `canRequest()`
 has one production call site — inside `getProviderCredentials` — and
-`recordProviderFailure` has one — inside `markAccountUnavailable`, which
-needs an account. A path that skips the lookup is a path the breaker cannot
-see: its provider is never taken out of service, and its failures never trip
-anything. The credential itself is not used on those paths; the *lookup* is.
+`recordProviderFailure` has three: inside `markAccountUnavailable`, which
+needs an account, and on the two no-auth speech paths, which have none. A
+path that skips the lookup is a path the breaker cannot see: its provider is
+never taken out of service, and its failures never trip anything. The
+credential itself is not used on those paths; the *lookup* is.
 
 The no-auth paths hand their failure to the breaker **directly** —
 `recordProviderFailure` — because there is no account to lock, and that call
@@ -1302,6 +1353,23 @@ directly, and a scan that stopped at `markAccountUnavailable` would not see
 them at all. `tests/unit/local-failure-no-auth-paths.test.js` drives both
 paths and proves the VALUE; the scan proves that no call site is left to the
 default.
+
+The reach has a **declared boundary**, and it is a boundary rather than a
+claim of coverage. The control reaches every path that **claims a probe** —
+every path that calls the credential lookup — and every path that **hands a
+failure to the breaker**. Two no-auth paths do neither: the image-generation
+path for `sdwebui` and `comfyui`, and the parity no-auth path in the fetch
+handler. They never call the credential lookup, so they claim no probe; and
+they never report a failure to the breaker, so a failing `sdwebui` does not
+trip anything and its provider is never taken out of service.
+
+That gap is not closed here, and the reason matters. The correct fix is for
+those paths to *consult* the breaker as well as report to it — a failure
+reported to a breaker that was never consulted makes the metrics lie, and
+can take a provider out of rotation for a path that never asks it. That is a
+behaviour change on a live path, and it belongs in its own pull request with
+its own review. Stating it here is what keeps it a boundary rather than a
+hole.
 
 ### The breaker's transitions are observable
 
