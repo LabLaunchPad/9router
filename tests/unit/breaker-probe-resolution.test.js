@@ -300,12 +300,38 @@ describe("circuit breaker: every file that claims the probe resolves it", () => 
   });
 
   /**
-   * Does this file resolve the probe on its SUCCESS path?
+   * The success resolver that settles each CLAIM's probe.
    *
    * A presence proxy is not enough: a file that NAMES a resolver but calls
    * it only on its failure path leaves exactly the defect this file is
    * about — a successful request whose probe stays claimed. So the
    * resolver is tied to the success path here.
+   *
+   * It used to be a question about the FILE: does this file settle the
+   * probe on its success path? A file with two claims and one resolver
+   * passed — and the other claim leaked its probe, for the whole reset
+   * window, for every handler that used the provider. So the question is
+   * now asked of each CLAIM.
+   *
+   * A resolver settles a claim when the claim's flow reaches it:
+   *
+   *   - directly: the resolver is inside the claim's own scope and comes
+   *     after it. A resolver ABOVE the claim cannot settle it — the claim
+   *     has not been made yet — and a resolver in a sibling arm never runs
+   *     on the claim's path.
+   *   - through the success callback the core is handed: the callback is
+   *     created after the claim, in a block that encloses it, and the core
+   *     calls it when the request succeeds. This is the shape the search
+   *     and image paths use, and the shape the FAILURE rule deliberately
+   *     refuses — a callback that settles the probe on success says
+   *     nothing about the failure path, which is the path that rule
+   *     examines.
+   *   - in a helper the claim's function calls: the helper settles the
+   *     probe when the request succeeds.
+   *
+   * A file where NO claim is settled is reported whole: the file does not
+   * settle the probe on its success path at all. That is the verdict the
+   * file-level rule gave, and it is unchanged.
    *
    * It is a function of the file's source, not of the tree it lives in, so
    * a FIXTURE can be pointed at it — the same reason the path scan can.
@@ -315,15 +341,132 @@ describe("circuit breaker: every file that claims the probe resolves it", () => 
     const lines = source.split(/\r?\n/);
     const isCode = codeLineFlags(lines);
 
-    let resolvedOnSuccess = false;
+    const claims = [];
     lines.forEach((line, i) => {
-      if (resolvedOnSuccess) return;
       if (!isCode[i]) return;
-      if (!callsResolver(line, SUCCESS_RESOLVERS)) return;
-      if (enclosingBlocks(lines, i).some(isSuccessBlock)) resolvedOnSuccess = true;
+      if (/getProviderCredentials\s*\(/.test(line)) {
+        claims.push({ index: i, scope: scopeOf(lines, i) });
+      }
     });
 
-    return resolvedOnSuccess ? [] : [file];
+    const resolvers = [];
+    lines.forEach((line, i) => {
+      if (!isCode[i]) return;
+      if (!callsResolver(line, SUCCESS_RESOLVERS)) return;
+      if (!enclosingBlocks(lines, i).some(isSuccessBlock)) return;
+      const scope = scopeOf(lines, i);
+      resolvers.push({ index: i, scope, block: scope[0] ?? null });
+    });
+
+    const settled = (claim) => resolvers.some((r) => settlesClaim(lines, claim, r, isCode));
+
+    if (!claims.some(settled)) return [file];
+
+    return claims.filter((c) => !settled(c)).map((c) => `${file}:${c.index + 1}`);
+  }
+
+  /**
+   * Does this resolver settle the probe this claim made?
+   *
+   * Three shapes settle it:
+   *
+   *   - directly: the resolver is inside the claim's own scope and comes
+   *     after it. A resolver ABOVE the claim cannot settle it — the claim
+   *     has not been made yet — and a resolver in a sibling arm never runs
+   *     on the claim's path.
+   *   - through the success callback the core is handed: the callback is
+   *     created after the claim, in a block that encloses it, and the core
+   *     calls it when the request succeeds. This is the shape the search
+   *     and image paths use, and the shape the FAILURE rule deliberately
+   *     refuses — a callback that settles the probe on success says
+   *     nothing about the failure path, which is the path that rule
+   *     examines.
+   *   - in a helper the claim's function calls: the helper settles the
+   *     probe when the request succeeds.
+   */
+  function settlesClaim(lines, claim, resolver, isCode) {
+    if (isInScope(claim.scope, resolver.scope)) {
+      return resolver.index > claim.index;
+    }
+
+    if (isCallbackBlock(resolver.block)) {
+      const carrier = carrierOf(lines, resolver.block);
+      if (!carrier) return false;
+      return carrier.index > claim.index && isInScope(carrier.scope, claim.scope);
+    }
+
+    return helperSettles(lines, claim, resolver, isCode);
+  }
+
+  /**
+   * Does a helper the claim's own function calls settle the claim?
+   *
+   * The resolver is in another function, so it is not in the claim's
+   * scope. It settles the claim when the claim's function calls that
+   * function, after the claim: the call reaches the helper, and the helper
+   * settles the probe when the request succeeds.
+   *
+   * A resolver in a function the claim's function never calls is not
+   * reachable, and does not settle anything.
+   */
+  function helperSettles(lines, claim, resolver, isCode) {
+    const name = functionNameAt(lines, resolver.index);
+    if (!name) return false; // the holder cannot be named → cannot tell
+    const call = new RegExp(`\\b${name}\\s*\\(`);
+    // `codeOnly` is called per line, and it cannot see a block comment that
+    // spans lines: a line inside a /* … */ is code to it. So a comment that
+    // mentions the helper by name could be read as a call, and a claim
+    // would be settled by a sentence. The file-level flags track the block
+    // state across the whole file, and they are what this reads.
+    for (let i = claim.index + 1; i < lines.length; i += 1) {
+      if (!isCode[i]) continue;
+      if (!call.test(codeOnly(lines[i]))) continue;
+      if (!isInScope(claim.scope, scopeOf(lines, i))) continue;
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Is this block the body of a callback the core is handed?
+   *
+   * The shape is a property whose value is a function:
+   * `onRequestSuccess: async () => { … }`. A function that is a statement
+   * of its own — `const onOk = async () => { … }` — is a callback too, but
+   * the call that uses it is somewhere else entirely, so it is handled
+   * apart.
+   */
+  const CALLBACK_BLOCK = /^[A-Za-z_$][\w$]*\s*:\s*(async\s*)?(\(|function\b)/;
+
+  function isCallbackBlock(block) {
+    return !!block && CALLBACK_BLOCK.test(block.header);
+  }
+
+  /**
+   * The statement that creates a callback: the call the callback is an
+   * argument of.
+   *
+   * The callback is a property of an object literal, so the statement that
+   * creates it is the line the object literal starts on — the first line
+   * above the property whose indentation is smaller.
+   *
+   * A callback handed over by name is created by a statement of its own,
+   * and the call that uses it cannot be found by walking up the source. The
+   * scan says so rather than guessing: a resolver it cannot place is a
+   * resolver it cannot count, and the claim is reported rather than passed
+   * quietly.
+   */
+  function carrierOf(lines, block) {
+    const header = block.headerLine;
+    if (/^\s*(?:const|let|var)\s/.test(lines[header])) return null;
+    const indent = lines[header].search(/\S/);
+    for (let j = header - 1; j >= 0; j -= 1) {
+      const ind = lines[j].search(/\S/);
+      if (ind < 0) continue; // blank
+      if (ind >= indent) continue; // still inside the property's line
+      return { index: j, scope: scopeOf(lines, j) };
+    }
+    return null;
   }
 
   it("resolves the probe on the success path, not merely somewhere in the file", () => {
@@ -338,7 +481,62 @@ describe("circuit breaker: every file that claims the probe resolves it", () => 
     // claimed, and it is the one that blackholes the provider.
     expect(
       offenders,
-      `these files obtain credentials but do not resolve the breaker's probe on the success path: ${offenders.join(", ")}`,
+      `these claims do not resolve the breaker's probe on the success path: ${offenders.join(", ")}`,
+    ).toEqual([]);
+  });
+
+  /**
+   * The success rule asks about each CLAIM, not about the file.
+   *
+   * It used to ask about the file: "does this file settle the probe on its
+   * success path?" A file with two claims and one resolver passed — and the
+   * claim the resolver did not reach leaked its probe, for the whole reset
+   * window, for every handler that used the provider.
+   *
+   * The rule is now asked of each claim, and each shape it has to tell
+   * apart lives in a fixture. The real tree contains none of them — the two
+   * claims in every handler are in different branches, and each branch has
+   * its own resolver — so nothing else would exercise the difference.
+   */
+  it("asks about each claim, and each shape of settlement", () => {
+    const FIXTURES = path.join(process.cwd(), "tests", "unit", "fixtures");
+
+    const scanFixture = (name) => {
+      const file = path.join(FIXTURES, name);
+      const source = fs.readFileSync(file, "utf8");
+      return successProbeLeaksIn(name, source);
+    };
+
+    // Two claims, one resolver: the claim the resolver does not reach leaks
+    // its probe. The file-level rule passed this file — the resolver is
+    // somewhere in it.
+    expect(
+      scanFixture("probe-success-two-claims.js"),
+      "a claim the resolver does not reach leaks the probe, even when another claim in the file is settled",
+    ).not.toEqual([]);
+
+    // A resolver ABOVE the claim settles nothing: the claim has not been
+    // made when the resolver runs. Exactly one claim is reported — the
+    // second one — and the first is not, because its resolver is above it.
+    expect(
+      scanFixture("probe-success-resolver-above-claim.js"),
+      "a resolver above the claim cannot settle it",
+    ).toEqual(["probe-success-resolver-above-claim.js:41"]);
+
+    // The claim inside a conditional, and the success callback that settles
+    // it created further down the same block: the claim IS settled. This is
+    // the shape that stopped the earlier attempt, and the search path is
+    // written exactly like this.
+    expect(
+      scanFixture("probe-success-claim-then-callback.js"),
+      "a claim reaches the success callback created after it",
+    ).toEqual([]);
+
+    // The resolver is in a helper the claim's function calls: the helper
+    // settles the claim.
+    expect(
+      scanFixture("probe-success-helper-settles.js"),
+      "a helper the claim's function calls settles the claim",
     ).toEqual([]);
   });
 

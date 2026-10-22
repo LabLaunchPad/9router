@@ -31,7 +31,7 @@ code is the verdict, never a reading of the output.
 | the handler-layer scan | a call to the breaker that does not state the fact | `tests/unit/local-failure-wiring.test.js` | the same file, and `tests/unit/fixtures/breaker-call-comment-fact.js` | yes — restore the text reading and the test fails |
 | the no-auth paths | a no-auth provider's failure reported as "the provider answered" | `src/sse/handlers/{stt,tts,imageGeneration}.js` | `tests/unit/local-failure-no-auth-paths.test.js` | yes — the VALUE is asserted, not the presence |
 | the no-credential gate | a provider that needs no credential being refused as though its circuit were open | `src/sse/services/auth.js` and `src/sse/handlers/{imageGeneration,stt,tts}.js` | `tests/unit/auth-no-credential-lookup.test.js` and `tests/unit/breaker-image-noauth-path.test.js` | yes — without the flag the lookup returns nothing, and the flag is what makes it a gate |
-| the probe-resolution scans | a path that claims a probe and leaves it claimed | `tests/unit/breaker-probe-resolution.test.js` | the same file, and six fixtures | yes — the scope rule, the comment rule and the code-reading rule are each pinned by a mutation |
+| the probe-resolution scans | a path that claims a probe and leaves it claimed | `tests/unit/breaker-probe-resolution.test.js` | the same file, and nine probe fixtures | yes — the scope rule, the comment rule, the code-reading rule and each branch of the per-claim success rule are each pinned by a mutation |
 | the shared source reader | three scans each carrying their own approximation of "is this code?" | `tests/unit/source-scan.js` | `tests/unit/source-scan.test.js` | yes — the reader's own shapes are pinned |
 | the account-lock option (`persistLock: false`) | a persisted `modelLock_*` outliving a quota reset | `src/sse/services/auth.js` | `tests/unit/breaker-persist-lock-option.test.js` | yes — delete the branch and the test fails |
 | the SSRF guard's codes | our own refusal being reported as an upstream failure | `src/shared/utils/ssrfGuard.js` | `tests/unit/search-core-ssrf-fact.test.js` | yes — the transport error reported as local fails the test |
@@ -1483,24 +1483,45 @@ answered `404 Provider temporarily unavailable` — for a provider whose
 circuit was closed and which was never in trouble. The flag is the same one,
 and the fix is the same one.
 
-The one limit is in the success-path check, and it is stated rather than
-papered over. That check asks whether a file resolves the probe on its
-success path, and it asks it of the FILE: a file with two claims — a no-auth
-branch and a credentialed loop — has one resolver in each, and a check that
-counted resolvers in the file would pass a file whose no-auth branch leaks
-its probe, because the credentialed branch resolves one. It is not a hole
-that this change opens, and the shape is older than it: `search.js` has
-claimed a probe in two places with one resolver since before this. It is
-covered here by the path's own test rather than by the scan, and the limit
-belongs in a pull request of its own — the scope model the scan reads the
-source with cannot say that a claim inside a conditional reaches a call
-further down the same block, and a rule that guesses is worse than a
-declared boundary.
+The one limit was in the success-path check, and it is now gone. That check
+asked whether a file resolves the probe on its success path, and it asked it
+of the FILE: a file with two claims — a no-auth branch and a credentialed
+loop — has one resolver in each, and a check that counted resolvers in the
+file would pass a file whose no-auth branch leaks its probe, because the
+credentialed branch resolves one.
 
-One no-auth path is still outside the reach: the parity no-auth path in the
-fetch handler. It does neither today, and it is dead code — no fetch
-provider sets `noAuth`, so the branch is never taken. Stating it here is
-what keeps the boundary a boundary rather than a hole.
+It now asks it of each CLAIM. A resolver settles a claim when the claim's
+flow reaches it: directly, when the resolver is inside the claim's own
+scope and comes after it; through the success callback the core is handed,
+when the callback is created after the claim, in a block that encloses it;
+or in a helper the claim's function calls. A claim with no resolver that
+settles it is reported, even when another claim in the same file is settled.
+
+The callback shape is the one that took the work. The failure-path rule
+deliberately refuses a resolver inside a callback — a callback that settles
+the probe when the request succeeds says nothing about the failure path,
+which is the path that rule examines — and the success rule has to count it,
+because it IS the success path. It also has to see that a claim inside a
+conditional reaches a callback created further down the same block, which
+the search path is written like. The rule reads the statement that creates
+the callback, the CARRIER, and checks that it comes after the claim and
+sits in a block that encloses it.
+
+Each of those shapes lives in a fixture, and the fixtures are scanned by the
+same function that scans the tree — a fixture that proved something else
+would prove nothing. The rule is a control, so it was proved by mutation:
+breaking its order, its scope, its per-claim comparison, its carrier or its
+helper makes a fixture fail, and none of the five survive.
+
+One limit is stated rather than papered over: a resolver handed over by
+name — `const onOk = async () => { … }` — is created by a statement of its
+own, and the call that uses it cannot be found by walking up the source.
+The scan reports the claim rather than counting a resolver it cannot place.
+
+The parity no-auth path in the fetch handler is still outside the reach, and
+it is dead code: no fetch provider sets `noAuth`, and the six that do set
+`fetchConfig` are not among them, so the branch is never taken. Stating it
+here is what keeps the boundary a boundary rather than a hole.
 
 ### The breaker's transitions are observable
 

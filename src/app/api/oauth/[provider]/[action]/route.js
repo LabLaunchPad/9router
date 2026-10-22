@@ -171,10 +171,24 @@ export async function GET(request, { params }) {
         ? await startXaiProxy(Number(appPort))
         : await startCodexProxy(Number(appPort));
       let serverSide = false;
-      if (result.success && state && codeVerifier && redirectUri) {
-        serverSide = provider === "xai"
-          ? registerXaiSession({ state, codeVerifier, redirectUri })
-          : registerCodexSession({ state, codeVerifier, redirectUri });
+      if (state && codeVerifier && redirectUri) {
+        if (provider === "xai") {
+          // The proxy and the session are two different things. The proxy
+          // LISTENS; the session CARRIES the verifier and the redirect that
+          // the exchange needs. So the session is registered even when the
+          // proxy could not start — that is the case the pasted-code
+          // fallback exists for, and without the session every pasted code
+          // is refused with "session not found".
+          //
+          // `serverSide` keeps its own meaning: it says the SERVER will do
+          // the exchange, which it will not if nothing is listening.
+          serverSide = registerXaiSession({ state, codeVerifier, redirectUri }) && result.success;
+        } else if (result.success) {
+          // Codex is unchanged: its session is registered only when the
+          // proxy started, because it has no pasted-code path that would
+          // need a session the proxy is not listening for.
+          serverSide = registerCodexSession({ state, codeVerifier, redirectUri });
+        }
       }
       return NextResponse.json({ ...result, serverSide });
     }

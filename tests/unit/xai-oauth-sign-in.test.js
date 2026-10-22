@@ -63,7 +63,7 @@ vi.mock("@/lib/oauth/utils/ideDetect", () => ({ detectIdeInstalled: vi.fn() }));
 // The session store, so the test can assert on real lifecycle transitions
 // rather than on call counts alone.
 const sessions = new Map();
-const proxy = { started: [], stopped: 0 };
+const proxy = { started: [], stopped: 0, startResult: { success: true } };
 
 vi.mock("@/lib/oauth/utils/server", () => {
   const notUsed = () => {
@@ -75,7 +75,7 @@ vi.mock("@/lib/oauth/utils/server", () => {
     getCodexSessionStatus: () => null, clearCodexSession: noop,
     startXaiProxy: async (appPort) => {
       proxy.started.push(appPort);
-      return { success: true };
+      return proxy.startResult;
     },
     stopXaiProxy: () => { proxy.stopped += 1; },
     registerXaiSession: ({ state, codeVerifier, redirectUri }) => {
@@ -127,6 +127,7 @@ describe("xAI sign-in", () => {
     sessions.clear();
     proxy.started = [];
     proxy.stopped = 0;
+    proxy.startResult = { success: true };
     exchangeTokens.mockClear();
     createProviderConnection.mockClear();
   });
@@ -190,5 +191,33 @@ describe("xAI sign-in", () => {
     expect(orphan.status).toBe(500);
     expect((await orphan.json()).error).toMatch(/session not found/i);
     expect(createProviderConnection).toHaveBeenCalledTimes(1);
+  });
+
+  it("the pasted-code fallback works when the local server could not start", async () => {
+    // The local callback server could not start — the exact case the
+    // pasted-code fallback exists for. The session carries the verifier and
+    // the redirect the exchange needs, and the session is NOT the server:
+    // one LISTENS, the other CARRIES.
+    proxy.startResult = { success: false, reason: "listen EACCES" };
+
+    const start = await startProxy();
+
+    expect(start.status).toBe(200);
+    expect(
+      sessions.get("st1"),
+      "the session has to be registered even when nothing is listening, or the pasted code is refused",
+    ).toMatchObject({ codeVerifier: "verifier-1", redirectUri: REDIRECT });
+    // Nothing is listening, so the server is not going to exchange by itself.
+    expect(await start.json()).toMatchObject({ success: false, serverSide: false });
+
+    const res = await manualCode("auth-code", "st1");
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({
+      success: true,
+      connection: { id: "conn-1", provider: "xai" },
+    });
+    expect(exchangeTokens).toHaveBeenCalledWith("xai", "auth-code", REDIRECT, "verifier-1", "st1");
+    expect(sessions.has("st1")).toBe(false);
   });
 });
