@@ -98,6 +98,14 @@ describe("the breaker: a request that never reached the provider", () => {
 
     recordProviderFailure(PROVIDER, 400, { upstreamContacted: false });
 
+    // The availability check a health probe reads has to agree: a provider
+    // whose probe was released is available. It is asked BEFORE the next
+    // request, because asking for the next request claims the probe again.
+    expect(
+      cb.isAvailable(),
+      "a released probe leaves the provider available",
+    ).toBe(true);
+
     // A claimed probe refuses every later request for the whole reset
     // window, so a provider that is actually recovering would be blackholed
     // by a purely local problem.

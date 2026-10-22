@@ -60,8 +60,14 @@ afterEach(() => {
  * version of this helper reset the burst window before every call, and that
  * is exactly why a sliding-window defect went unnoticed — the tests never
  * exercised two failures inside one window.
+ *
+ * There is deliberately NO default for `status`. A default parameter cannot
+ * express "no status at all": `recordDistinctFailures(3, undefined)` would be
+ * swallowed by `status = 500` and record a 500 instead, so the transport-error
+ * case was never actually exercised — it looked covered and was not. Every
+ * call site says what it means.
  */
-function recordDistinctFailures(n, status = 500) {
+function recordDistinctFailures(n, status) {
   const recorded = [];
   for (let i = 0; i < n; i++) {
     vi.advanceTimersByTime(BURST_MS + 100);
@@ -75,7 +81,7 @@ describe("circuit breaker: provider-level failures", () => {
     vi.useFakeTimers();
     const cb = breakerFor();
 
-    expect(recordDistinctFailures(3)).toEqual([true, true, true]);
+    expect(recordDistinctFailures(3, 500)).toEqual([true, true, true]);
 
     expect(cb.state).toBe("open");
     expect(cb.canRequest()).toBe(false);
@@ -85,6 +91,10 @@ describe("circuit breaker: provider-level failures", () => {
     vi.useFakeTimers();
     const cb = breakerFor();
 
+    // No status at all: the connection failed before there was a response —
+    // DNS, TCP, TLS, a timeout. The provider was asked and never answered,
+    // and every account will fail the same way, so it is the provider's
+    // failure rather than one account's.
     expect(recordDistinctFailures(3, undefined)).toEqual([true, true, true]);
 
     expect(cb.state).toBe("open");
@@ -164,7 +174,7 @@ describe("circuit breaker: provider-level failures", () => {
     vi.useFakeTimers();
     const cb = breakerFor();
 
-    recordDistinctFailures(3);
+    recordDistinctFailures(3, 500);
     expect(cb.state).toBe("open");
 
     expect(recordProviderSuccess(PROVIDER)).toBe(true);
@@ -176,7 +186,7 @@ describe("circuit breaker: provider-level failures", () => {
     vi.useFakeTimers();
     const cb = breakerFor();
 
-    recordDistinctFailures(2);
+    recordDistinctFailures(2, 500);
     expect(cb.failureCount).toBe(2);
 
     expect(recordProviderSuccess(PROVIDER)).toBe(true);

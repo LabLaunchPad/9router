@@ -30,12 +30,14 @@ import {
   recordProviderFailure,
   resetProviderFailureTracking,
 } from "../../src/sse/services/auth.js";
+import { getMetricsSnapshot, resetMetrics } from "../../src/sse/services/metrics.js";
 
 const PROVIDER = "9router-abort-provider";
 
 beforeEach(() => {
   resetAllCircuitBreakers();
   resetProviderFailureTracking();
+  resetMetrics();
 });
 
 /**
@@ -99,11 +101,38 @@ describe("the breaker: a request the client abandoned", () => {
 
     recordProviderFailure(PROVIDER, 499);
 
+    // The availability check a health probe reads has to agree: a provider
+    // whose probe was released is available. It is asked BEFORE the next
+    // request, because asking for the next request claims the probe again.
+    expect(
+      cb.isAvailable(),
+      "a released probe leaves the provider available",
+    ).toBe(true);
+
     // The probe must not stay claimed: a claimed probe refuses every
     // later request for the whole reset window.
     expect(
       cb.canRequest(),
       "the probe must be released, not held",
     ).toBe(true);
+  });
+
+  it("is counted, so it can be told apart from a provider failure", () => {
+    // An abandoned request says nothing about the provider, so it must not
+    // trip the circuit — but it IS a signal about the client, and without a
+    // counter the operator cannot tell a provider outage from a wave of
+    // cancelled requests. The counter is the durable signal an alert would
+    // be built on.
+    recordProviderFailure(PROVIDER, 499);
+
+    const counters = getMetricsSnapshot().counters;
+    const key = Object.keys(counters).find((k) =>
+      k.startsWith("sse_provider_aborted_requests_total"),
+    );
+    expect(
+      key,
+      "an abandoned request has to be counted somewhere an operator can query",
+    ).toBeDefined();
+    expect(counters[key]).toBe(1);
   });
 });

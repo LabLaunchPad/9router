@@ -144,3 +144,43 @@ describe("the circuit breaker announces its transitions", () => {
     expect(opens[1].reason).toBe("the half-open probe failed");
   });
 });
+
+/**
+ * The availability check is what a health probe and a metrics scrape read.
+ *
+ * It is a PURE check: it changes no state, so a scrape cannot half-open a
+ * circuit that is supposed to be failing fast. And it has to agree with the
+ * request path — a provider whose probe was released is available, and one
+ * whose probe is out is not, because the one probe is already spent.
+ */
+describe("the circuit breaker says whether the provider can be used", () => {
+  it("follows the state, and reading it changes nothing", () => {
+    const cb = breaker({ coolDownWindowMs: 60000, resetWindowMs: 120000 });
+
+    // Closed: available.
+    expect(cb.isAvailable()).toBe(true);
+
+    // Open: not available, and the cool-down has not elapsed.
+    cb.recordFailure();
+    cb.recordFailure();
+    expect(cb.state).toBe("open");
+    expect(cb.isAvailable()).toBe(false);
+
+    // The cool-down elapses: the circuit half-opens and the one probe goes
+    // out. The provider is not available while the probe is in flight.
+    cb.lastStateChangeTime = Date.now() - 60000;
+    expect(cb.canRequest()).toBe(true);
+    expect(cb.state).toBe("half-open");
+    expect(cb.isAvailable()).toBe(false);
+
+    // The probe is released without an answer: the provider is available
+    // again, and the next request is the probe.
+    expect(cb.releaseProbe()).toBe(true);
+    expect(cb.isAvailable()).toBe(true);
+
+    // Reading it changes nothing.
+    const state = cb.state;
+    cb.isAvailable();
+    expect(cb.state).toBe(state);
+  });
+});
