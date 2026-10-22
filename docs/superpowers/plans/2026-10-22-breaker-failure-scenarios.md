@@ -269,9 +269,13 @@ rather than a change to be made here.
 
 ## 4. The sweep result
 
-Eighteen branches of the breaker's decision table were broken in turn, and
-the suite was run after each one. The exit code is the verdict: a branch
-that no test catches is a rule that nothing enforces.
+Eighteen checks were broken on purpose, one at a time, and the suite run
+after each. The exit code is the verdict: a branch that no test catches is
+a rule that nothing enforces. Seventeen of them are branches of the breaker
+itself — ten in `recordProviderFailure`, two in the credential lookup, one
+in the no-credential gate, two in the circuit, two in the status test — and
+the eighteenth is the probe scan's own success rule, swept separately with
+five of its branches.
 
 | # | the branch | first run | after the work |
 |---|---|---|---|

@@ -358,7 +358,7 @@ describe("circuit breaker: every file that claims the probe resolves it", () => 
       resolvers.push({ index: i, scope, block: scope[0] ?? null });
     });
 
-    const settled = (claim) => resolvers.some((r) => settlesClaim(lines, claim, r));
+    const settled = (claim) => resolvers.some((r) => settlesClaim(lines, claim, r, isCode));
 
     if (!claims.some(settled)) return [file];
 
@@ -384,7 +384,7 @@ describe("circuit breaker: every file that claims the probe resolves it", () => 
    *   - in a helper the claim's function calls: the helper settles the
    *     probe when the request succeeds.
    */
-  function settlesClaim(lines, claim, resolver) {
+  function settlesClaim(lines, claim, resolver, isCode) {
     if (isInScope(claim.scope, resolver.scope)) {
       return resolver.index > claim.index;
     }
@@ -395,7 +395,7 @@ describe("circuit breaker: every file that claims the probe resolves it", () => 
       return carrier.index > claim.index && isInScope(carrier.scope, claim.scope);
     }
 
-    return helperSettles(lines, claim, resolver);
+    return helperSettles(lines, claim, resolver, isCode);
   }
 
   /**
@@ -409,11 +409,17 @@ describe("circuit breaker: every file that claims the probe resolves it", () => 
    * A resolver in a function the claim's function never calls is not
    * reachable, and does not settle anything.
    */
-  function helperSettles(lines, claim, resolver) {
+  function helperSettles(lines, claim, resolver, isCode) {
     const name = functionNameAt(lines, resolver.index);
     if (!name) return false; // the holder cannot be named → cannot tell
     const call = new RegExp(`\\b${name}\\s*\\(`);
+    // `codeOnly` is called per line, and it cannot see a block comment that
+    // spans lines: a line inside a /* … */ is code to it. So a comment that
+    // mentions the helper by name could be read as a call, and a claim
+    // would be settled by a sentence. The file-level flags track the block
+    // state across the whole file, and they are what this reads.
     for (let i = claim.index + 1; i < lines.length; i += 1) {
+      if (!isCode[i]) continue;
       if (!call.test(codeOnly(lines[i]))) continue;
       if (!isInScope(claim.scope, scopeOf(lines, i))) continue;
       return true;
@@ -510,11 +516,12 @@ describe("circuit breaker: every file that claims the probe resolves it", () => 
     ).not.toEqual([]);
 
     // A resolver ABOVE the claim settles nothing: the claim has not been
-    // made when the resolver runs.
+    // made when the resolver runs. Exactly one claim is reported — the
+    // second one — and the first is not, because its resolver is above it.
     expect(
       scanFixture("probe-success-resolver-above-claim.js"),
       "a resolver above the claim cannot settle it",
-    ).not.toEqual([]);
+    ).toEqual(["probe-success-resolver-above-claim.js:41"]);
 
     // The claim inside a conditional, and the success callback that settles
     // it created further down the same block: the claim IS settled. This is

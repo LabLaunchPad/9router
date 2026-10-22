@@ -17,10 +17,15 @@
  * pinned by a test rather than by a claim.
  */
 
-export async function firstHandler(provider) {
+export async function firstHandler(provider, result) {
   const credentials = await getProviderCredentials(provider, null, null);
   if (credentials) {
-    await clearAccountError(credentials.connectionId, credentials);
+    if (result.success) {
+      // The resolver is in a success block, so it counts as a success
+      // resolver. It settles the claim below only if the claim comes
+      // AFTER it — and it does not.
+      await clearAccountError(credentials.connectionId, credentials);
+    }
     return new Response("first");
   }
   return errorResponse(400, "No credentials for provider");
