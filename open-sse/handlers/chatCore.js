@@ -50,11 +50,14 @@ import { resolveSessionId } from "../utils/sessionManager.js";
  * (observed with multi-turn Codex sessions via OpenAI-compatible nodes).
  */
 export function stripContinuityFields(body) {
-  if (!body || !Array.isArray(body.messages)) return body;
-  for (const msg of body.messages) {
-    if (msg && typeof msg === "object") {
-      delete msg.encrypted_content;
-      delete msg.reasoning_encrypted_content;
+  if (!body || typeof body !== "object") return body;
+  const lists = [body.messages, body.input, body.contents].filter(Array.isArray);
+  for (const list of lists) {
+    for (const msg of list) {
+      if (msg && typeof msg === "object") {
+        delete msg.encrypted_content;
+        delete msg.reasoning_encrypted_content;
+      }
     }
   }
   return body;
