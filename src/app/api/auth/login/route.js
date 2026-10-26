@@ -29,7 +29,18 @@ export async function POST(request) {
       );
     }
 
-    const { password } = await request.json();
+    let body;
+    try {
+      body = await request.json();
+    } catch {
+      body = null;
+    }
+
+    // Security: Validate payload and password type to prevent type confusion,
+    // unhandled exceptions in bcrypt.compare, and lockout counter bypasses.
+    const password = body?.password;
+    const isPasswordValidType = typeof password === "string" && password.length > 0;
+
     const settings = await getSettings();
 
     // Block login via tunnel/tailscale if dashboard access is disabled
@@ -51,12 +62,14 @@ export async function POST(request) {
     }
 
     let isValid = false;
-    if (storedHash) {
-      isValid = await bcrypt.compare(password, storedHash);
-    } else {
-      // Use env var or default
-      const initialPassword = process.env.INITIAL_PASSWORD || "123456";
-      isValid = password === initialPassword;
+    if (isPasswordValidType) {
+      if (storedHash) {
+        isValid = await bcrypt.compare(password, storedHash);
+      } else {
+        // Use env var or default
+        const initialPassword = process.env.INITIAL_PASSWORD || "123456";
+        isValid = password === initialPassword;
+      }
     }
 
     if (isValid) {
