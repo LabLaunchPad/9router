@@ -26,6 +26,8 @@ if (!global._statsEmitter) {
 if (!global._pendingTimers) global._pendingTimers = {};
 if (!global._recentRing) global._recentRing = { items: [], initialized: false };
 if (!global._connectionMapCache) global._connectionMapCache = { map: {}, ts: 0 };
+if (!global._nodeNameMapCache) global._nodeNameMapCache = { map: {}, ts: 0 };
+if (!global._apiKeyMapCache) global._apiKeyMapCache = { map: {}, ts: 0 };
 if (!global._statsEmitTimers) global._statsEmitTimers = { pending: null, update: null };
 
 const pendingRequests = global._pendingRequests;
@@ -33,6 +35,8 @@ const lastErrorProvider = global._lastErrorProvider;
 const pendingTimers = global._pendingTimers;
 const recentRing = global._recentRing;
 const connCache = global._connectionMapCache;
+const nodeCache = global._nodeNameMapCache;
+const apiKeyCache = global._apiKeyMapCache;
 const statsEmitTimers = global._statsEmitTimers;
 
 export const statsEmitter = global._statsEmitter;
@@ -106,6 +110,8 @@ function pushToRing(entry) {
   }
 }
 
+// Helper: Short-lived TTL in-memory caching for metadata lookups (connections, node names, API keys).
+// This prevents redundant dynamic module imports and DB reads on high-frequency /api/usage stats calls.
 async function getConnectionMapCached() {
   if (Date.now() - connCache.ts < CONN_CACHE_TTL_MS) return connCache.map;
   try {
@@ -117,6 +123,34 @@ async function getConnectionMapCached() {
     connCache.ts = Date.now();
   } catch {}
   return connCache.map;
+}
+
+async function getNodeNameMapCached() {
+  if (Date.now() - nodeCache.ts < CONN_CACHE_TTL_MS) return nodeCache.map;
+  try {
+    const { getProviderNodes } = await import("./nodesRepo.js");
+    const nodes = await getProviderNodes();
+    const map = {};
+    for (const n of nodes) if (n.id && n.name) map[n.id] = n.name;
+    nodeCache.map = map;
+    nodeCache.ts = Date.now();
+  } catch {}
+  return nodeCache.map;
+}
+
+async function getApiKeyMapCached() {
+  if (Date.now() - apiKeyCache.ts < CONN_CACHE_TTL_MS) return apiKeyCache.map;
+  try {
+    const { getApiKeys } = await import("./apiKeysRepo.js");
+    const allApiKeys = await getApiKeys();
+    const map = {};
+    for (const k of allApiKeys) {
+      if (k.key) map[k.key.trim()] = { name: k.name, id: k.id, createdAt: k.createdAt };
+    }
+    apiKeyCache.map = map;
+    apiKeyCache.ts = Date.now();
+  } catch {}
+  return apiKeyCache.map;
 }
 
 async function ensureRingInitialized() {
@@ -348,29 +382,13 @@ function loadDaysInRange(adapter, maxDays) {
 export async function getUsageStats(period = "all") {
   const db = await getAdapter();
 
-  const [{ getProviderConnections }, { getApiKeys }, { getProviderNodes }] = await Promise.all([
-    import("./connectionsRepo.js"),
-    import("./apiKeysRepo.js"),
-    import("./nodesRepo.js"),
+  // Fetch connections, node names, and API key maps in parallel using short-lived TTL caches
+  // to minimize dynamic import overhead and DB queries during dashboard polling.
+  const [connectionMap, providerNodeNameMap, apiKeyMap] = await Promise.all([
+    getConnectionMapCached(),
+    getNodeNameMapCached(),
+    getApiKeyMapCached(),
   ]);
-
-  let allConnections = [];
-  try { allConnections = await getProviderConnections(); } catch {}
-  const connectionMap = {};
-  for (const c of allConnections) connectionMap[c.id] = c.name || c.email || c.id;
-
-  const providerNodeNameMap = {};
-  try {
-    const nodes = await getProviderNodes();
-    for (const n of nodes) if (n.id && n.name) providerNodeNameMap[n.id] = n.name;
-  } catch {}
-
-  let allApiKeys = [];
-  try { allApiKeys = await getApiKeys(); } catch {}
-  const apiKeyMap = {};
-  for (const k of allApiKeys) {
-    if (k.key) apiKeyMap[k.key.trim()] = { name: k.name, id: k.id, createdAt: k.createdAt };
-  }
 
   // recentRequests from live history (last 100 entries enough for 20 deduped)
   const recentRows = db.all(`SELECT timestamp, provider, model, tokens, status FROM usageHistory ORDER BY id DESC LIMIT 100`);
