@@ -51,6 +51,8 @@ source/*
 .cursor/*
 docs/*
 !docs/ARCHITECTURE.md
+!docs/performance
+!docs/performance/*
 test/*
 open-sse/test/*
 RM.vn.md

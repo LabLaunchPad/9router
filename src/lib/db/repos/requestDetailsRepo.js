@@ -1,5 +1,6 @@
 import { getAdapter } from "../driver.js";
 import { parseJson, stringifyJson } from "../helpers/jsonCol.js";
+import { generateUniqueTimestamp } from "./usageRepo.js";
 
 const DEFAULT_MAX_RECORDS = 200;
 const DEFAULT_BATCH_SIZE = 20;
@@ -99,7 +100,7 @@ async function flushToDatabase() {
       db.transaction(() => {
         for (const item of items) {
           if (!item.id) item.id = generateDetailId(item.model);
-          if (!item.timestamp) item.timestamp = new Date().toISOString();
+          if (!item.timestamp) item.timestamp = generateUniqueTimestamp();
           if (item.request?.headers) item.request.headers = sanitizeHeaders(item.request.headers);
 
           const record = {

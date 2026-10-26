@@ -1,5 +1,6 @@
 services:
   9router:
+    build: .
     image: decolua/9router:latest
     container_name: 9router
     restart: always
@@ -23,7 +24,7 @@ services:
     container_name: headroom
     restart: always
     ports:
-      - "8787:8787"
+      - "127.0.0.1:8787:8787"
 
 volumes:
   9router-data:
