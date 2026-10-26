@@ -117,11 +117,28 @@ export function matchesSearch(target, queryOrParsed) {
     return true;
   }
 
+  // Fast path for string targets (most common case in filtering) to avoid array allocations and iteration closures
+  if (typeof target === "string") {
+    if (parsed.isRegex && parsed.regex) {
+      return parsed.regex.test(target);
+    }
+    const lower = target.toLowerCase();
+    if (parsed.negativeTerms.length > 0) {
+      for (let i = 0; i < parsed.negativeTerms.length; i++) {
+        if (lower.includes(parsed.negativeTerms[i])) return false;
+      }
+    }
+    if (parsed.positiveTerms.length > 0) {
+      for (let i = 0; i < parsed.positiveTerms.length; i++) {
+        if (!lower.includes(parsed.positiveTerms[i])) return false;
+      }
+    }
+    return true;
+  }
+
   // Extract candidate strings from target
   let candidates = [];
-  if (typeof target === "string") {
-    candidates = [target];
-  } else if (Array.isArray(target)) {
+  if (Array.isArray(target)) {
     candidates = target.filter((t) => typeof t === "string");
   } else if (target && typeof target === "object") {
     candidates = [

@@ -8,6 +8,9 @@ import { ALIAS_TO_ID } from "@/shared/constants/providers";
 let cache = null; // { byFull, byId } | null
 let inflight = null;
 
+// Module cache for fallback resolution when a key is not present in byFull/byId
+const resolvedCapsMemo = new Map();
+
 function buildMaps(models) {
   const byFull = {};
   const byId = {};
@@ -28,6 +31,7 @@ function loadModelCaps() {
       if (!res.ok) throw new Error(`models ${res.status}`);
       const data = await res.json();
       cache = buildMaps(data.models);
+      resolvedCapsMemo.clear();
       return cache;
     })
     .catch(() => {
@@ -45,19 +49,31 @@ function loadModelCaps() {
 // (e.g. any *claude*haiku* id reads as 200k regardless of the provider entry).
 export function resolveCaps(byFull, byId, key) {
   if (!key) return null;
-  if (byFull[key]) return byFull[key];
+  if (byFull?.[key]) return byFull[key];
   const bare = key.includes("/") ? key.slice(key.indexOf("/") + 1) : key;
-  if (byId[bare]) return byId[bare];
+  if (byId?.[bare]) return byId[bare];
+
+  // Memoize fallback resolution to avoid repeating 60+ pattern regex matches on re-renders
+  if (resolvedCapsMemo.has(key)) {
+    return resolvedCapsMemo.get(key);
+  }
+
   const alias = key.includes("/") ? key.slice(0, key.indexOf("/")) : null;
   const provider = alias ? (ALIAS_TO_ID[alias] || alias) : null;
   const c = getCapabilitiesForModel(provider, bare);
-  return {
+  const result = {
     vision: c.vision,
     search: c.search,
     reasoning: c.reasoning,
     contextWindow: c.contextWindow,
     maxOutput: c.maxOutput,
   };
+
+  if (resolvedCapsMemo.size > 2000) {
+    resolvedCapsMemo.clear();
+  }
+  resolvedCapsMemo.set(key, result);
+  return result;
 }
 
 export function useModelCaps() {
@@ -77,6 +93,7 @@ export function useModelCaps() {
     // Custom models change at runtime — drop the shared cache and refetch
     const invalidate = () => {
       cache = null;
+      resolvedCapsMemo.clear();
       loadModelCaps().then(sync);
     };
     window.addEventListener("customModelChanged", invalidate);
