@@ -31,6 +31,9 @@ describe("AI Gateway Benchmark & Reliability Tests", () => {
           res.write("data: [DONE]\n\n");
           res.end();
         }, 20);
+      } else if (url.includes("html-error")) {
+        res.writeHead(200, { "Content-Type": "text/html" });
+        res.end("<html><head><title>502 Bad Gateway</title></head><body>Cloudflare Error</body></html>");
       } else if (url.includes("500-error")) {
         res.writeHead(500, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: { message: "Internal Upstream Error" } }));
@@ -126,6 +129,32 @@ describe("AI Gateway Benchmark & Reliability Tests", () => {
     expect(body.messages[0].encrypted_content).toBeUndefined();
     expect(body.input[0].reasoning_encrypted_content).toBeUndefined();
     expect(body.contents[0].encrypted_content).toBeUndefined();
+  });
+
+  it("handles non-SSE HTML error page from upstream safely without breaking stream pipeline", async () => {
+    const credentials = {
+      apiKey: "sk-mock-key",
+      providerSpecificData: { baseUrl: serverUrl + "/html-error" }
+    };
+    const body = {
+      model: "gpt-4o",
+      messages: [{ role: "user", content: "hello" }],
+      stream: true
+    };
+
+
+    const result = await handleChatCore({
+      body,
+      modelInfo: { provider: "openai-compatible-mock", model: "gpt-4o" },
+      credentials,
+      connectionId: "conn-html-err",
+      rtkEnabled: false
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.upstreamContacted).toBe(true);
+    const errJson = await result.response.json();
+    expect(errJson.error.message).toContain("502 Bad Gateway");
   });
 
   it("records circuit breaker metrics and states correctly on 500 errors", async () => {

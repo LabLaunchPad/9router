@@ -71,7 +71,15 @@ Client Request (/v1/chat/completions or /v1/messages)
 - **Fix**: Updated `stripContinuityFields` to inspect and clean `messages`, `input`, and `contents` arrays recursively. Added targeted unit tests in `tests/unit/gateway-benchmark.test.js`.
 - **Verification**: Unit test passed in `tests/unit/gateway-benchmark.test.js`.
 
-### Finding 4: Dashboard Heavy Dependencies Isolated via Dynamic Imports
+### Finding 4: Non-SSE HTML Error Response Stream Protection
+- **Severity**: P1
+- **Evidence Class**: `MEASURED` / `CODE-VERIFIED`
+- **Location**: `open-sse/handlers/chatCore/streamingHandler.js`
+- **Consequence**: When an upstream provider or proxy returns an HTML page (such as a 502 Bad Gateway error page or captive portal page) on a streaming request, attempting to pipe HTML text into the SSE transform stream broke the stream pipeline.
+- **Fix**: Updated `handleStreamingResponse` content-type guard to detect non-SSE HTML/text responses, extract title text, and safely abort stream controller while returning a clean JSON error response (`{ error: { message: "[200/502]: Bad Gateway" } }`).
+- **Verification**: Verified with targeted unit test in `tests/unit/gateway-benchmark.test.js`.
+
+### Finding 5: Dashboard Heavy Dependencies Isolated via Dynamic Imports
 - **Severity**: P2
 - **Evidence Class**: `CODE-VERIFIED` / `MEASURED`
 - **Location**: `src/app/(dashboard)/dashboard/translator/page.js`, `src/shared/components/UsageStats.js`
