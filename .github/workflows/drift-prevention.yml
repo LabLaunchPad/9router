@@ -7,43 +7,31 @@ name: 🛡️ Drift Prevention Check
 # require `github.ref == 'refs/heads/main'`, so it never ran once. Both
 # names are listed below so the gate works whichever branch is the default;
 # the job condition is kept in sync with the trigger.
+concurrency:
+  group: drift-prevention-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
 on:
   pull_request:
     paths:
       - '**.test.js'
       - '**.config.*'
       - 'next.config*'
+      - 'postcss.config*'
       - 'tailwind*'
-      # The control plane itself must be covered, or a pull request that
-      # changes only the gate logic, the metric producer, the request path
-      # or the breaker wiring runs no CI at all.
-      #
-      # This is deliberately the whole source tree rather than an
-      # enumeration of the files the controls happen to touch today. An
-      # earlier version of this list missed `src/shared/constants/providers.js`
-      # — which keys the breaker and the failure-burst map — and
-      # `src/lib/localDb.js`, and a pull request touching either ran no CI.
-      # The list cannot stay correct if it is maintained by hand.
+      - 'jsconfig.json'
+      - 'custom-server.js'
+      - 'Dockerfile'
+      - 'docker-compose.yml'
+      - 'start.sh'
+      - 'cli/**'
       - 'scripts/**'
       - 'src/**'
       - 'open-sse/**'
       - 'tests/**'
-      # The control plane's own configuration and documentation. A change to
-      # any of these can change what the controls DO, or what they are
-      # CONTRACTED to do, without a single test failing.
-      #
-      #   .github/workflows/**  another workflow can change this one — or be
-      #                        changed to disable it
-      #   package.json          the test script and the vitest dependency set
-      #   .gitattributes        pins `scripts/ci/validate-slo.mjs text eol=lf`;
-      #                        without it a Windows checkout gives the gate
-      #                        script CRLF and its own test cannot import it
-      #   the two ADRs           the documented contract of every control
-      #   docs/**               the repository's documentation directory
-      #
-      # A pull request that touches ONLY one of these used to run no CI at
-      # all: this is the only workflow in the repository with a
-      # `pull_request:` trigger.
       - '.github/workflows/**'
       - 'package.json'
       - '.gitattributes'
@@ -106,6 +94,15 @@ jobs:
       # lockfile) is a maintainer decision, not a side effect of this branch.
       - name: ✅ Install dependencies
         run: npm install --legacy-peer-deps --no-audit --no-fund
+
+      - name: 🔍 Code Quality & Lint Check
+        run: npm run lint
+
+      - name: 🏗️ Verify Next.js Application Build
+        run: npm run build
+
+      - name: 📦 Verify CLI Package Build
+        run: npm run cli:pack
 
       - name: 🏁 Record baseline test results
         id: baseline

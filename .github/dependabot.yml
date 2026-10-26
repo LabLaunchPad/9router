@@ -1,2 +1,24 @@
 version: 2
-updates: []
+updates:
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "dependencies"
+
+  - package-ecosystem: "npm"
+    directory: "/cli"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "dependencies"
+      - "cli"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "ci"
+      - "actions"
