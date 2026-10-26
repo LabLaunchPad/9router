@@ -432,9 +432,20 @@ export async function POST(request) {
             "ollama-local": `${resolveOllamaLocalHost({ providerSpecificData })}/api/tags`,
             "xiaomi-tokenplan": `${resolveXiaomiTokenplanBaseUrl({ providerSpecificData })}/models`,
           };
+          const targetEndpoint = endpoints[provider];
+          if (!targetEndpoint) {
+            return NextResponse.json({ valid: false, error: "Provider validation endpoint not found" });
+          }
+          if (!isLocalRequest(request)) {
+            try {
+              await assertPublicUrlResolved(targetEndpoint);
+            } catch {
+              return NextResponse.json({ valid: false, error: "URL not allowed" });
+            }
+          }
           const headers = {};
           if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
-          const res = await fetch(endpoints[provider], { headers, signal: AbortSignal.timeout(8000) });
+          const res = await fetch(targetEndpoint, { headers, signal: AbortSignal.timeout(8000) });
           // xai returns 400 for bad key, 403 for valid-but-no-credit. Other providers use 401.
           if (provider === "xai") {
             isValid = res.status === 200 || res.status === 403;
