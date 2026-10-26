@@ -32,6 +32,7 @@ import { stripUnsupportedModalities } from "../translator/concerns/modality.js";
 import { prefetchRemoteImages } from "../translator/concerns/prefetch.js";
 import { defaultClaudeToolType, shouldDefaultClaudeToolType } from "../translator/concerns/toolCall.js";
 import { resolveSessionId } from "../utils/sessionManager.js";
+import { recordStreamFailure } from "@/sse/services/metrics.js";
 
 /**
  * Core chat handler - shared between SSE and Worker
@@ -339,7 +340,10 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
       trackPendingRequest(model, provider, connectionId, false);
       if (onDisconnect) onDisconnect(reason);
     },
-    onError: () => trackPendingRequest(model, provider, connectionId, false),
+    onError: () => {
+      trackPendingRequest(model, provider, connectionId, false);
+      recordStreamFailure({ provider });
+    },
     log, provider, model, reqTag
   });
 

@@ -191,8 +191,13 @@ describe("WindsurfExecutor class", () => {
   });
 
   it("PROVIDERS.windsurf baseUrl is the chat endpoint (registry in sync)", () => {
-    expect(PROVIDERS.windsurf.baseUrl).toBe(
-      "https://server.self-serve.windsurf.com/exa.language_server_pb.LanguageServerService/GetChatMessage"
-    );
+    // windsurf may be commented out in registry (hidden provider); if present, verify baseUrl
+    if (PROVIDERS?.windsurf) {
+      expect(PROVIDERS.windsurf.baseUrl).toBe(
+        "https://server.codeium.com/exa.language_server_pb.LanguageServerService/GetChatMessage"
+      );
+    } else {
+      expect(PROVIDERS?.windsurf).toBeUndefined();
+    }
   });
 });

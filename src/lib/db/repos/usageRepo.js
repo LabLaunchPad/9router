@@ -240,11 +240,28 @@ export async function getActiveRequests() {
   return { activeRequests, recentRequests, errorProvider };
 }
 
+let lastIsoMs = 0;
+let isoMicroCounter = 0;
+
+function generateUniqueTimestamp() {
+  const now = Date.now();
+  if (now === lastIsoMs) {
+    isoMicroCounter = (isoMicroCounter + 1) % 1000;
+  } else {
+    lastIsoMs = now;
+    isoMicroCounter = 0;
+  }
+  const iso = new Date(now).toISOString();
+  if (isoMicroCounter === 0) return iso;
+  const pad = String(isoMicroCounter).padStart(3, "0");
+  return iso.replace("Z", `${pad}Z`);
+}
+
 export async function saveRequestUsage(entry) {
   try {
     const db = await getAdapter();
 
-    if (!entry.timestamp) entry.timestamp = new Date().toISOString();
+    if (!entry.timestamp) entry.timestamp = generateUniqueTimestamp();
     entry.cost = await calculateCost(entry.provider, entry.model, entry.tokens);
 
     const tokens = entry.tokens || {};
