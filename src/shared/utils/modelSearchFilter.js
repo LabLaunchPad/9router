@@ -117,51 +117,92 @@ export function matchesSearch(target, queryOrParsed) {
     return true;
   }
 
-  // Extract candidate strings from target
-  let candidates = [];
+  // Bolt Optimization: Extract candidates and convert to lowerCase directly to avoid
+  // intermediate array allocation, .filter() calls, and subsequent .map() calls.
+  let rawCandidates = null;
+  const lowerCandidates = [];
+
   if (typeof target === "string") {
-    candidates = [target];
+    if (parsed.isRegex) rawCandidates = [target];
+    lowerCandidates.push(target.toLowerCase());
   } else if (Array.isArray(target)) {
-    candidates = target.filter((t) => typeof t === "string");
+    for (let i = 0; i < target.length; i++) {
+      const item = target[i];
+      if (typeof item === "string") {
+        if (parsed.isRegex) (rawCandidates || (rawCandidates = [])).push(item);
+        lowerCandidates.push(item.toLowerCase());
+      }
+    }
   } else if (target && typeof target === "object") {
-    candidates = [
-      target.name,
-      target.id,
-      target.value,
-      target.alias,
-      target.provider,
-    ].filter((t) => typeof t === "string");
+    const { name, id, value, alias, provider } = target;
+    if (typeof name === "string") {
+      if (parsed.isRegex) (rawCandidates || (rawCandidates = [])).push(name);
+      lowerCandidates.push(name.toLowerCase());
+    }
+    if (typeof id === "string") {
+      if (parsed.isRegex) (rawCandidates || (rawCandidates = [])).push(id);
+      lowerCandidates.push(id.toLowerCase());
+    }
+    if (typeof value === "string") {
+      if (parsed.isRegex) (rawCandidates || (rawCandidates = [])).push(value);
+      lowerCandidates.push(value.toLowerCase());
+    }
+    if (typeof alias === "string") {
+      if (parsed.isRegex) (rawCandidates || (rawCandidates = [])).push(alias);
+      lowerCandidates.push(alias.toLowerCase());
+    }
+    if (typeof provider === "string") {
+      if (parsed.isRegex) (rawCandidates || (rawCandidates = [])).push(provider);
+      lowerCandidates.push(provider.toLowerCase());
+    }
   }
 
-  if (candidates.length === 0) {
+  if (lowerCandidates.length === 0) {
     return false;
   }
 
   // Handle Regex
   if (parsed.isRegex && parsed.regex) {
+    const candidates = rawCandidates || lowerCandidates;
     const fullText = candidates.join(" ");
     const hasNegativeAssertion = /\(\?!|\(\?<!/.test(parsed.raw);
     if (hasNegativeAssertion) {
       return parsed.regex.test(fullText);
     }
-    return candidates.some((text) => parsed.regex.test(text)) || parsed.regex.test(fullText);
+    for (let i = 0; i < candidates.length; i++) {
+      if (parsed.regex.test(candidates[i])) return true;
+    }
+    return parsed.regex.test(fullText);
   }
 
-  const lowerCandidates = candidates.map((c) => c.toLowerCase());
-
   // Handle Negations: reject if ANY candidate contains ANY negative term
-  if (parsed.negativeTerms.length > 0) {
-    for (const neg of parsed.negativeTerms) {
-      if (lowerCandidates.some((c) => c.includes(neg))) {
-        return false;
+  const negLen = parsed.negativeTerms.length;
+  if (negLen > 0) {
+    const candLen = lowerCandidates.length;
+    for (let i = 0; i < negLen; i++) {
+      const neg = parsed.negativeTerms[i];
+      for (let j = 0; j < candLen; j++) {
+        if (lowerCandidates[j].includes(neg)) {
+          return false;
+        }
       }
     }
   }
 
   // Handle Positive Terms: ALL positive terms must match at least one candidate
-  if (parsed.positiveTerms.length > 0) {
-    for (const pos of parsed.positiveTerms) {
-      if (!lowerCandidates.some((c) => c.includes(pos))) {
+  const posLen = parsed.positiveTerms.length;
+  if (posLen > 0) {
+    const candLen = lowerCandidates.length;
+    for (let i = 0; i < posLen; i++) {
+      const pos = parsed.positiveTerms[i];
+      let found = false;
+      for (let j = 0; j < candLen; j++) {
+        if (lowerCandidates[j].includes(pos)) {
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
         return false;
       }
     }
