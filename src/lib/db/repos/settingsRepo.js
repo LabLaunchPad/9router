@@ -66,10 +66,21 @@ const DEFAULT_SETTINGS = {
   providerOverrides: {},
 };
 
+let cachedSettings = null;
+let lastFetchTime = 0;
+const CACHE_TTL_MS = 2000;
+
 async function readRaw() {
+  const now = Date.now();
+  if (cachedSettings && now - lastFetchTime < CACHE_TTL_MS) {
+    return cachedSettings;
+  }
   const db = await getAdapter();
   const row = db.get(`SELECT data FROM settings WHERE id = 1`);
-  return row ? parseJson(row.data, {}) : {};
+  const data = row ? parseJson(row.data, {}) : {};
+  cachedSettings = data;
+  lastFetchTime = now;
+  return data;
 }
 
 // Merge raw settings with defaults; backward-compat for missing keys
@@ -119,6 +130,8 @@ export async function updateSettings(updates) {
       [stringifyJson(next)],
     );
   });
+  cachedSettings = next;
+  lastFetchTime = Date.now();
   return mergeWithDefaults(next);
 }
 
