@@ -32,7 +32,7 @@ import { stripUnsupportedModalities } from "../translator/concerns/modality.js";
 import { prefetchRemoteImages } from "../translator/concerns/prefetch.js";
 import { defaultClaudeToolType, shouldDefaultClaudeToolType } from "../translator/concerns/toolCall.js";
 import { resolveSessionId } from "../utils/sessionManager.js";
-import { recordStreamFailure } from "@/sse/services/metrics.js";
+import { recordStreamFailure, endpointTemplate } from "@/sse/services/metrics.js";
 
 /**
  * Core chat handler - shared between SSE and Worker
@@ -335,6 +335,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   const msgCount = translatedBody.messages?.length || translatedBody.input?.length || translatedBody.contents?.length || translatedBody.request?.contents?.length || 0;
   log?.debug?.("REQUEST", `${provider.toUpperCase()} | ${model} | ${msgCount} msgs`);
 
+  const endpointLabel = clientRawRequest?.endpoint ? endpointTemplate(clientRawRequest.endpoint) : undefined;
   const streamController = createStreamController({
     onDisconnect: (reason) => {
       trackPendingRequest(model, provider, connectionId, false);
@@ -342,7 +343,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
     },
     onError: () => {
       trackPendingRequest(model, provider, connectionId, false);
-      recordStreamFailure({ provider });
+      recordStreamFailure({ provider, endpoint: endpointLabel });
     },
     log, provider, model, reqTag
   });

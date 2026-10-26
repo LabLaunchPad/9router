@@ -243,17 +243,25 @@ export async function getActiveRequests() {
 let lastIsoMs = 0;
 let isoMicroCounter = 0;
 
-function generateUniqueTimestamp() {
-  const now = Date.now();
+export function generateUniqueTimestamp() {
+  let now = Date.now();
   if (now === lastIsoMs) {
-    isoMicroCounter = (isoMicroCounter + 1) % 1000;
-  } else {
+    isoMicroCounter++;
+    if (isoMicroCounter >= 1000000) {
+      now = lastIsoMs + 1;
+      lastIsoMs = now;
+      isoMicroCounter = 0;
+    }
+  } else if (now > lastIsoMs) {
     lastIsoMs = now;
     isoMicroCounter = 0;
+  } else {
+    now = lastIsoMs;
+    isoMicroCounter++;
   }
   const iso = new Date(now).toISOString();
   if (isoMicroCounter === 0) return iso;
-  const pad = String(isoMicroCounter).padStart(3, "0");
+  const pad = String(isoMicroCounter).padStart(6, "0");
   return iso.replace("Z", `${pad}Z`);
 }
 
