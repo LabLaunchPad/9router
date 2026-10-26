@@ -782,6 +782,19 @@ function formatLogDate(date = new Date()) {
 // No-op: request log is now derived from usageHistory table on read.
 export async function appendRequestLog() {}
 
+export async function pruneUsageHistory(days = 90) {
+  if (!days || days <= 0) return { deleted: 0 };
+  try {
+    const db = await getAdapter();
+    const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+    const result = db.run(`DELETE FROM usageHistory WHERE timestamp < ?`, [cutoff]);
+    return { deleted: result?.changes || 0 };
+  } catch (e) {
+    console.error("Failed to prune usage history:", e);
+    return { deleted: 0 };
+  }
+}
+
 export async function getRecentLogs(limit = 200) {
   try {
     const db = await getAdapter();
