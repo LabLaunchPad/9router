@@ -1,0 +1,4 @@
+## 2025-05-18 - Type Confusion and Unhandled Exception Bypass on Login Endpoint
+**Vulnerability:** Sending non-string payloads (e.g. `{ "password": 123 }`) or malformed JSON to `POST /api/auth/login` caused `bcrypt.compare` to throw an unhandled `TypeError`, returning 500 internal server errors, leaking error details, and bypassing failure rate-limiting (`recordFail`).
+**Learning:** Functions that consume external JSON input must validate parameter types before passing them to cryptographic or comparison libraries. Relying on top-level `catch` blocks can inadvertently bypass rate limiting or security middleware logic executed later in the handler.
+**Prevention:** Always validate `typeof input === "string"` before calling `bcrypt.compare` or hashing functions, and ensure invalid/malformed payloads fail open into rate-limiting handlers with proper 4xx status codes.
