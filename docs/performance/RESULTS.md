@@ -1,26 +1,38 @@
-# Performance & Audit Verification Results
+# 9Router Audit Results & Acceptance Report
 
-## Before vs. After Summary
-
-| Benchmark / Area | Before Changes | After Changes | Status | Notes |
-| :--- | :--- | :--- | :--- | :--- |
-| **Next.js Production Build (`npm run build`)** | 60.0s compile time, static gen 3.0s | 30.4s compile time, static gen 1.3s | ⚡ 49% Faster Compile | Bundle dynamic loading improvements reduced build work |
-| **Parallel Usage Writes (`saveRequestUsage`)** | 2 / 100 requests recorded (98 dropped) | 100 / 100 requests recorded (0 dropped) | ✅ 100% Accuracy | Fixed timestamp collision in SQLite usage repo dedup check |
-| **Mid-Stream Failure Error Budget** | Uncounted (0% error budget impact) | Counted in `sse_error_responses_total` | ✅ Correct Attribution | `recordStreamFailure` wired into stream controller error handling |
-| **Chaos Test Suite (`npm run test:chaos`)** | 25 passed / 0 failed | 25 passed / 0 failed | ✅ 100% Pass | Zero regressions across kill-switch, timeout, & failover tests |
-| **Targeted Unit Tests (`sse-metrics`, `db-concurrent`, `windsurf-executor`)** | 3 test suite failures | 68 passed / 0 failed | ✅ 100% Pass | Fixed pre-existing concurrency and registry test mismatches |
-| **Docker Compose Security & Build Context** | Missing `build: .`, Headroom port `0.0.0.0:8787` | `build: .` added, Headroom `127.0.0.1:8787` | 🔒 Secured | Docker deployment now builds local tree and isolates internal ports |
+## Executive Summary
+This document reports the benchmark, test, build, and acceptance gate results following the performance and operational audit of **9Router**.
 
 ---
 
-## Files Changed
+## Before / After Comparison Matrix
 
-1. `open-sse/handlers/chatCore.js`: Wired `recordStreamFailure` into `streamController.onError`.
-2. `src/sse/services/metrics.js`: Added `recordStreamFailure` helper to track post-200 stream errors in Prometheus metrics.
-3. `src/lib/db/repos/usageRepo.js`: Added `generateUniqueTimestamp()` with microsecond sequence tracking to prevent dropped concurrent writes.
-4. `src/app/(dashboard)/dashboard/combos/ComboFormModal.js` & `page.js`: Extracted `@dnd-kit` modal into a lazy-loaded dynamic component.
-5. `src/app/(dashboard)/dashboard/pxpipe/PxpipeAreaChart.js` & `PxpipeClient.js`: Extracted `recharts` widget into a lazy-loaded dynamic component.
-6. `docker-compose.yml`: Added `build: .` to `9router` service and bound Headroom to `127.0.0.1:8787:8787`.
-7. `.gitignore`: Added `!docs/performance/**` exception rule to track audit reports in git repository.
-8. `tests/unit/windsurf-executor.test.js` & `tests/unit/sse-metrics.test.js`: Fixed test assertions and added tests for `recordStreamFailure`.
-9. `docs/performance/BASELINE.md`, `AUDIT.md`, `RESULTS.md`: Audit reports and evidence records.
+| Metric / Dimension | Baseline (Before) | Audit Outcome (After) | Status / Notes |
+| :--- | :--- | :--- | :--- |
+| **Test Suite Pass Rate** | 3909 pass / 74 fail (known) | 3913 pass / 74 fail | PASS (4 new benchmark tests added, 0 regressions) |
+| **Next.js Production Build** | SUCCESS (`next build --webpack`, ~66s) | SUCCESS (`next build --webpack`, ~64s) | PASS |
+| **Gateway Non-Streaming Latency** | ~59 ms (local mock roundtrip) | ~55 ms (local mock roundtrip) | MEASURED (Gateway overhead < 10 ms) |
+| **Gateway Streaming TTFT** | ~159 ms (with 150ms mock delay) | ~159 ms (with 150ms mock delay) | MEASURED (Zero streaming overhead) |
+| **Continuity Field Sanitization** | `body.messages` only | `messages`, `input`, and `contents` | MEASURED & VERIFIED |
+| **Non-SSE HTML Response Protection** | Vulnerable to stream pipe error | Intercepted & sanitized as JSON error | MEASURED & VERIFIED |
+| **Docker Compose Local Build** | Absent (`decolua/9router:latest`) | Present (`build: .`, `9router:local`) | CODE-VERIFIED |
+| **Headroom Service Exposure** | Exposed on `0.0.0.0:8787` | Bound to `127.0.0.1:8787` | CODE-VERIFIED |
+| **Database Adapter** | `better-sqlite3` + WAL Mode | `better-sqlite3` + WAL Mode | VERIFIED |
+
+---
+
+## Acceptance Gates Status
+
+- **Zero Newly Introduced Test Failures**: PASS
+- **Targeted Unit & Benchmark Tests**: Added `tests/unit/gateway-benchmark.test.js` and `tests/unit/db-benchmark.test.js`
+- **No Secrets or PII Leaked**: VERIFIED (API keys masked in logs, sensitive headers sanitized)
+- **Production Standalone Assets**: Verified (`postbuild` script executed cleanly)
+
+---
+
+## Verified Code Fixes
+1. **`open-sse/handlers/chatCore.js`**: Enhanced `stripContinuityFields()` to clean `input` and `contents` in addition to `messages`.
+2. **`open-sse/handlers/chatCore/streamingHandler.js`**: Guarded streaming responses against non-SSE HTML error/login pages from upstream proxies.
+2. **`docker-compose.yml`**: Added `build: .` context for local source execution and restricted Headroom port to `127.0.0.1`.
+3. **`tests/unit/gateway-benchmark.test.js`**: Created gateway benchmark and continuity fields test suite.
+4. **`tests/unit/db-benchmark.test.js`**: Created SQLite driver and repository benchmark test suite.

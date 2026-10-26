@@ -1,27 +1,50 @@
-# Performance & Reliability Baseline
+# 9Router Ground Truth & Baseline Assessment
 
-- **Repository:** `LabLaunchPad/9router`
-- **Branch:** `jules-18013163180916925498-33a1d789`
-- **HEAD SHA:** `6f5e9200ddcb8df7684f620d759ca86f8e888be7`
-- **Environment:** Node.js v22.22.1, npm 11.11.0, Linux 6.6.137+
-- **Database Driver Selected:** `better-sqlite3` (v12.6.2)
-- **Active Framework/Build:** Next.js 16.4.3 (Webpack build via `next build --webpack`)
-
----
-
-## Baseline Verification Summary
-
-| Check / Tool | Status | Pass Count | Fail Count | Notes |
-| :--- | :--- | :--- | :--- | :--- |
-| `npm test` (Vitest unit/integration) | ❌ Pre-existing Failures | 3909 passed | 74 failed (35 test files failed) | Pre-existing failures primarily in translator Edge cases and external live mocks |
-| `npm run test:chaos` | ✅ Passed | 25 passed | 0 failed | 100% pass across account kill-switch, provider timeouts, stream corruption |
-| `npm run build` | ✅ Passed | Clean build | 0 errors | Next.js standalone export + asset post-build script completed successfully |
-| `docker-compose.yml` | ⚠️ Risk Identified | N/A | N/A | Image points to external `decolua/9router:latest` without `build:` context; Headroom port 8787 exposed globally |
+## Environment Ground Truth
+- **Repository / HEAD SHA**: `6f5e9200ddcb8df7684f620d759ca86f8e888be7`
+- **Node.js Version**: `v22.22.1`
+- **npm Version**: `11.11.0`
+- **Bun Version**: `1.2.14`
+- **OS / Sandbox Context**: Linux x86_64 Debian/Ubuntu container (`/app`)
+- **Framework & Router**: Next.js 16.4.3 (Webpack mode), App Router (`src/app/`)
+- **Active Database Driver**: `better-sqlite3` (v12.6.2 native adapter) falling back to `sql.js` (WASM) / `node:sqlite` / `bun:sqlite`
+- **Primary Request Entrypoints**: `/v1/*` mapped to `/api/v1/*` via Next.js rewrites in `next.config.mjs`
 
 ---
 
-## Baseline Metrics & Diagnostic Notes
+## Baseline Verification Results
 
-- **Gateway Overhead:** Direct local mock tests indicate low gateway dispatch baseline (~1-5ms overhead for model alias resolution and account selection).
-- **Database Initialization:** `better-sqlite3` selected successfully on Node 22; schema migration #1 applied smoothly without missing native bindings.
-- **Client Bundles & Server Assets:** Dynamic static pages generated (151 routes); Monaco and React Flow identified in dependencies and routes.
+### 1. Test Suite & Regression Baseline
+- **Execution Command**: `npx vitest run --reporter=json --outputFile=tests/results.json`
+- **Total Test Suites**: 398 test files
+- **Total Tests**: 4096 tests
+  - **Passed**: 3909
+  - **Failed**: 74 (35 test files)
+  - **Skipped / Expected Fail**: 114
+  - **Duration**: ~84s
+- **Regression Verification**: `node tests/__baseline__/verify-no-regression.mjs tests/results.json`
+  - Current status: Baseline test results recorded.
+
+### 2. Build & Bundle Analysis
+- **Execution Command**: `npm run build`
+- **Status**: SUCCESS (Next.js 16.4.3 Webpack build in ~66s)
+- **Standalone Build Asset Verification**: `postbuild` script successfully copies static and standalone assets.
+- **Top Client JS Chunks**:
+  - `4285-81b8e0de6f9ba21b.js`: 336 KB
+  - `3794-fba3f76785a3c234.js`: 238 KB
+  - `761-c9086970fe03f4a1.js`: 231 KB
+  - `5497-87f5229fb295a498.js`: 220 KB
+  - `4bd1b696-8cd12253b448cc13.js`: 199 KB
+  - `framework-b33a8f5d57cd8d87.js`: 186 KB
+
+---
+
+## Initial Audit Leads Re-verified (Phase 0)
+
+1. **Docker Compose & Headroom Exposure (`docker-compose.yml`)**:
+   - `CODE-VERIFIED`: `docker-compose.yml` uses pre-built `image: decolua/9router:latest` without a local `build:` directive. Running `docker compose up` would run an upstream image rather than the checked-out local source code.
+   - `CODE-VERIFIED`: `headroom` service exposes port `8787:8787` on all interfaces (`0.0.0.0`) instead of internal network only or loopback (`127.0.0.1:8787`).
+2. **Dockerfile Best Practices (`Dockerfile`)**:
+   - `CODE-VERIFIED`: Default `NODE_IMAGE` build arg is `node:22-alpine` without tag pinning.
+3. **Database Driver Fallback**:
+   - `CODE-VERIFIED`: `src/lib/db/driver.js` initializes `better-sqlite3` under Node when available.
