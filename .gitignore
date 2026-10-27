@@ -116,3 +116,7 @@ debug.log
 /confirmed-regressions.txt
 /still-failing.txt
 /.drift-base/
+
+# Stryker mutation testing
+.stryker-tmp/
+reports/

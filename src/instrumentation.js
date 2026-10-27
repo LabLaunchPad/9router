@@ -1,5 +1,11 @@
 export async function register() {
   if (process.env.NEXT_RUNTIME === "nodejs") {
+    // Tracing starts before the other server modules load so the auto-
+    // instrumentations are in place for them. It is a no-op unless
+    // OTEL_ENABLED and an OTLP endpoint are configured, and it never throws.
+    const { startTracing } = await import("@/lib/telemetry/tracing.js");
+    await startTracing();
+
     const { initConsoleLogCapture } = await import("@/lib/consoleLogBuffer");
     initConsoleLogCapture();
 

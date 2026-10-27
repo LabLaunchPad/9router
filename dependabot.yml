@@ -1,0 +1,29 @@
+# dependabot.yml for 9router
+# See dependabot docs: https://docs.github.com/en/dependabot/dependabot-version-updates
+
+version: 2
+updates:
+  # Enable dependency updates for npm
+  - package-ecosystem: "npm"
+    directory: "/"
+    # schedule: "weekly"
+    open-pull-requests-limit: 5
+    # Comment on PRs
+    # commit-message:
+    #   "chore: update <package-name> to <version>"
+    # reviewable: true
+    # labels:
+    #   - dependencies
+    #   - auto-approved
+    # ignore existing PRs that propose the same updates
+    # ignore:
+    #   - dependency-name: "some-package"
+    #     update-type: "version-update:semver-patch"
+
+  # Enable dependency updates for GitHub Actions
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    # schedule: "weekly"
+    open-pull-requests-limit: 5
+    # commit-message:
+    #   "chore: update github-action to <version>"

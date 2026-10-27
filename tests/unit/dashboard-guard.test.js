@@ -53,6 +53,15 @@ function localRequest(pathname, headers = {}) {
   return request(pathname, { "x-9r-peer-token": PEER_TOKEN, "x-9r-real-ip": "127.0.0.1", ...headers });
 }
 
+// Same, but carrying one cookie — the shape `proxy()` reads for `auth_token`.
+function requestWithCookie(pathname, headers, name, value) {
+  const base = localRequest(pathname, headers);
+  return {
+    ...base,
+    cookies: { get: vi.fn((key) => (key === name ? { value } : undefined)) },
+  };
+}
+
 describe("dashboard guard public LLM API access", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -304,5 +313,230 @@ describe("dashboard guard helpers", () => {
     });
 
     expect(__test__.extractApiKey(apiRequest)).toBe("header-key");
+  });
+});
+
+// The surface below was previously untouched by this suite (it accounted for most
+// of the module's un-covered mutants). Each case pins a branch in `proxy()` that
+// decides whether a request is authenticated, redirected to /login, or waved
+// through — i.e. the branches an authorization bypass would live in.
+describe("dashboard guard deny-by-default API auth", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    process.env.NINEROUTER_PEER_TOKEN = PEER_TOKEN;
+    mocks.getSettings.mockResolvedValue({ requireLogin: true });
+    mocks.validateApiKey.mockResolvedValue(false);
+    mocks.getConsistentMachineId.mockResolvedValue("cli-token");
+    mocks.verifyDashboardAuthToken.mockResolvedValue(false);
+  });
+
+  it("rejects an unlisted /api/ route with no credentials", async () => {
+    const response = await proxy(request("/api/not-in-the-allow-list", {
+      host: "router.example.com",
+    }));
+
+    expect(response.status).toBe(401);
+    expect(response.body.error).toBe("Unauthorized");
+  });
+
+  it("allows an unlisted /api/ route with a valid dashboard JWT", async () => {
+    mocks.verifyDashboardAuthToken.mockResolvedValue(true);
+
+    const response = await proxy(requestWithCookie("/api/not-in-the-allow-list", {
+      host: "router.example.com",
+    }, "auth_token", "signed-jwt"));
+
+    expect(response).toBe(mocks.nextResponse);
+  });
+
+  it("allows an unlisted /api/ route on loopback when requireLogin=false", async () => {
+    mocks.getSettings.mockResolvedValue({ requireLogin: false });
+
+    const response = await proxy(localRequest("/api/not-in-the-allow-list", {
+      host: "localhost:20128",
+      origin: "http://localhost:20128",
+    }));
+
+    expect(response).toBe(mocks.nextResponse);
+  });
+
+  it("lets a public allow-listed /api/ path through without auth", async () => {
+    const response = await proxy(request("/api/health", { host: "router.example.com" }));
+
+    expect(response).toBe(mocks.nextResponse);
+  });
+
+  it("does not treat a look-alike public path as public", async () => {
+    // "/api/healthz" is not "/api/health"; the allow-list matches the exact
+    // path or a "path/" prefix, so this must fall through to auth.
+    const response = await proxy(request("/api/healthz", { host: "router.example.com" }));
+
+    expect(response.status).toBe(401);
+  });
+
+  it("rejects an ALWAYS_PROTECTED route with no credentials", async () => {
+    const response = await proxy(request("/api/shutdown", {
+      host: "localhost:20128",
+      origin: "http://localhost:20128",
+    }));
+
+    expect(response.status).toBe(401);
+    expect(response.body.error).toBe("Unauthorized");
+  });
+
+  it("allows an ALWAYS_PROTECTED route with a valid CLI token", async () => {
+    const response = await proxy(request("/api/shutdown", {
+      host: "localhost:20128",
+      "x-9r-cli-token": "cli-token",
+    }));
+
+    expect(response).toBe(mocks.nextResponse);
+  });
+
+  it("allows an ALWAYS_PROTECTED route with a valid dashboard JWT", async () => {
+    mocks.verifyDashboardAuthToken.mockResolvedValue(true);
+
+    const response = await proxy(requestWithCookie("/api/version/update", {
+      host: "localhost:20128",
+    }, "auth_token", "signed-jwt"));
+
+    expect(response).toBe(mocks.nextResponse);
+  });
+
+  it("ignores a mismatched CLI token", async () => {
+    const response = await proxy(request("/api/shutdown", {
+      host: "localhost:20128",
+      "x-9r-cli-token": "not-the-token",
+    }));
+
+    expect(response.status).toBe(401);
+  });
+});
+
+describe("dashboard guard dashboard route protection", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    process.env.NINEROUTER_PEER_TOKEN = PEER_TOKEN;
+    mocks.getSettings.mockResolvedValue({ requireLogin: true });
+    mocks.validateApiKey.mockResolvedValue(false);
+    mocks.getConsistentMachineId.mockResolvedValue("cli-token");
+    mocks.verifyDashboardAuthToken.mockResolvedValue(false);
+  });
+
+  it("redirects an unauthenticated dashboard visit to /login", async () => {
+    const response = await proxy(request("/dashboard/settings", { host: "localhost:20128" }));
+
+    expect(response.status).toBe(307);
+    expect(String(response.url)).toContain("/login");
+  });
+
+  it("allows a dashboard visit with a valid JWT", async () => {
+    mocks.verifyDashboardAuthToken.mockResolvedValue(true);
+
+    const response = await proxy(requestWithCookie("/dashboard", {
+      host: "localhost:20128",
+    }, "auth_token", "signed-jwt"));
+
+    expect(response).toBe(mocks.nextResponse);
+  });
+
+  it("redirects a dashboard visit carrying an invalid JWT", async () => {
+    mocks.verifyDashboardAuthToken.mockResolvedValue(false);
+
+    const response = await proxy(requestWithCookie("/dashboard", {
+      host: "localhost:20128",
+    }, "auth_token", "expired-jwt"));
+
+    expect(response.status).toBe(307);
+    expect(String(response.url)).toContain("/login");
+  });
+
+  it("allows a dashboard visit when requireLogin=false", async () => {
+    mocks.getSettings.mockResolvedValue({ requireLogin: false });
+
+    const response = await proxy(request("/dashboard", { host: "localhost:20128" }));
+
+    expect(response).toBe(mocks.nextResponse);
+  });
+
+  it("blocks the tunnel hostname on /dashboard when tunnel access is disabled", async () => {
+    mocks.getSettings.mockResolvedValue({
+      requireLogin: false,
+      tunnelDashboardAccess: false,
+      tunnelUrl: "https://abc.trycloudflare.com",
+    });
+
+    const response = await proxy(request("/dashboard", {
+      host: "abc.trycloudflare.com",
+    }));
+
+    // Redirected to /login even though requireLogin is off — the tunnel block
+    // wins, otherwise a public tunnel URL would expose the dashboard.
+    expect(response.status).toBe(307);
+    expect(String(response.url)).toContain("/login");
+  });
+
+  it("blocks the tailscale hostname on /dashboard when tunnel access is disabled", async () => {
+    mocks.getSettings.mockResolvedValue({
+      requireLogin: false,
+      tunnelDashboardAccess: false,
+      tailscaleUrl: "https://box.tailnet-abc.ts.net",
+    });
+
+    const response = await proxy(request("/dashboard", {
+      host: "box.tailnet-abc.ts.net",
+    }));
+
+    expect(response.status).toBe(307);
+    expect(String(response.url)).toContain("/login");
+  });
+
+  it("honours tunnelDashboardAccess=true for the tunnel hostname", async () => {
+    mocks.getSettings.mockResolvedValue({
+      requireLogin: false,
+      tunnelDashboardAccess: true,
+      tunnelUrl: "https://abc.trycloudflare.com",
+    });
+
+    const response = await proxy(request("/dashboard", {
+      host: "abc.trycloudflare.com",
+    }));
+
+    expect(response).toBe(mocks.nextResponse);
+  });
+
+  it("keeps the secure defaults when reading settings throws", async () => {
+    mocks.getSettings.mockRejectedValue(new Error("db unavailable"));
+
+    const response = await proxy(request("/dashboard", { host: "localhost:20128" }));
+
+    // loadSettings() swallows the error and returns null, so requireLogin stays
+    // true: a broken DB must lock the dashboard, not open it.
+    expect(response.status).toBe(307);
+    expect(String(response.url)).toContain("/login");
+  });
+});
+
+describe("dashboard guard routing fallthrough", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    process.env.NINEROUTER_PEER_TOKEN = PEER_TOKEN;
+    mocks.getSettings.mockResolvedValue({ requireLogin: true });
+    mocks.validateApiKey.mockResolvedValue(false);
+    mocks.getConsistentMachineId.mockResolvedValue("cli-token");
+    mocks.verifyDashboardAuthToken.mockResolvedValue(false);
+  });
+
+  it("redirects the root path to /dashboard", async () => {
+    const response = await proxy(request("/", { host: "localhost:20128" }));
+
+    expect(response.status).toBe(307);
+    expect(String(response.url)).toContain("/dashboard");
+  });
+
+  it("passes an unguarded path through untouched", async () => {
+    const response = await proxy(request("/assets/logo.png", { host: "router.example.com" }));
+
+    expect(response).toBe(mocks.nextResponse);
   });
 });

@@ -1,0 +1,83 @@
+name: 🧪 Test Matrix
+
+# Run test suites across multiple configurations to ensure compatibility
+# This matrix runs critical test suites against different Node.js versions
+# and configurations to catch version-specific issues.
+
+on:
+  pull_request:
+    paths:
+      - 'tests/**'
+      - 'src/**'
+      - 'vitest.config.js'
+      - 'package.json'
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+jobs:
+  test-dashboard-guard:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [20]
+        # Test configuration can be extended here
+    steps:
+      - name: 📦 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 🔧 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: 📦 Install dependencies
+        run: npm install --legacy-peer-deps --no-audit --no-fund
+
+      - name: 🧪 Run dashboard-guard tests
+        run: npx vitest run tests/unit/dashboard-guard.test.js --reporter=verbose
+
+  test-key-access:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [20]
+    steps:
+      - name: 📦 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 🔧 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: 📦 Install dependencies
+        run: npm install --legacy-peer-deps --no-audit --no-fund
+
+      - name: 🧪 Run key-access tests
+        run: npx vitest run tests/unit/key-access.test.js --reporter=verbose
+
+  test-unit:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [20]
+        test-suite: [dashboard-guard, key-access, koiro-terminal-integrity]
+    steps:
+      - name: 📦 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 🔧 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: 📦 Install dependencies
+        run: npm install --legacy-peer-deps --no-audit --no-fund
+
+      - name: 🧪 Run test suite
+        run: |
+          echo "Running: ${{ matrix.test-suite }}"
+          npx vitest run "tests/unit/${{ matrix.test-suite }}.test.js" --reporter=verbose
