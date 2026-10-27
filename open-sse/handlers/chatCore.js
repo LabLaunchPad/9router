@@ -32,6 +32,7 @@ import { stripUnsupportedModalities } from "../translator/concerns/modality.js";
 import { prefetchRemoteImages } from "../translator/concerns/prefetch.js";
 import { defaultClaudeToolType, shouldDefaultClaudeToolType } from "../translator/concerns/toolCall.js";
 import { resolveSessionId } from "../utils/sessionManager.js";
+import { recordStreamFailure, endpointTemplate } from "@/sse/services/metrics.js";
 
 /**
  * Core chat handler - shared between SSE and Worker
@@ -50,11 +51,14 @@ import { resolveSessionId } from "../utils/sessionManager.js";
  * (observed with multi-turn Codex sessions via OpenAI-compatible nodes).
  */
 export function stripContinuityFields(body) {
-  if (!body || !Array.isArray(body.messages)) return body;
-  for (const msg of body.messages) {
-    if (msg && typeof msg === "object") {
-      delete msg.encrypted_content;
-      delete msg.reasoning_encrypted_content;
+  if (!body || typeof body !== "object") return body;
+  const lists = [body.messages, body.input, body.contents].filter(Array.isArray);
+  for (const list of lists) {
+    for (const msg of list) {
+      if (msg && typeof msg === "object") {
+        delete msg.encrypted_content;
+        delete msg.reasoning_encrypted_content;
+      }
     }
   }
   return body;
@@ -334,12 +338,16 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   const msgCount = translatedBody.messages?.length || translatedBody.input?.length || translatedBody.contents?.length || translatedBody.request?.contents?.length || 0;
   log?.debug?.("REQUEST", `${provider.toUpperCase()} | ${model} | ${msgCount} msgs`);
 
+  const endpointLabel = clientRawRequest?.endpoint ? endpointTemplate(clientRawRequest.endpoint) : undefined;
   const streamController = createStreamController({
     onDisconnect: (reason) => {
       trackPendingRequest(model, provider, connectionId, false);
       if (onDisconnect) onDisconnect(reason);
     },
-    onError: () => trackPendingRequest(model, provider, connectionId, false),
+    onError: () => {
+      trackPendingRequest(model, provider, connectionId, false);
+      recordStreamFailure({ provider, endpoint: endpointLabel });
+    },
     log, provider, model, reqTag
   });
 

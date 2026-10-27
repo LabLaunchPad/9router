@@ -171,11 +171,17 @@ function buildCliPackage() {
   // Step 1: Build app with Next.js (workspace tracing root → traced node_modules in standalone).
   console.log("1️⃣  Building Next.js app...");
   try {
-    execSync("npm run build", {
+    const binDir = path.join(appDir, "node_modules", ".bin");
+    const currentPath = process.env.PATH || "";
+    const envPath = currentPath.includes(binDir) ? currentPath : `${binDir}${path.delimiter}${currentPath}`;
+
+    const nextBin = path.join(appDir, "node_modules", "next", "dist", "bin", "next");
+    execSync(`node "${nextBin}" build --webpack`, {
       stdio: "inherit",
       cwd: appDir,
       env: {
         ...process.env,
+        PATH: envPath,
         HOME: buildHomeDir,
         USERPROFILE: buildHomeDir,
         APPDATA: path.join(buildHomeDir, "AppData", "Roaming"),

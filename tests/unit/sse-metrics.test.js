@@ -7,6 +7,7 @@ import {
   observeLatency,
   recordRequest,
   recordBreakerRejection,
+  recordStreamFailure,
   renderPrometheus,
   getMetricsSnapshot,
   computeErrorBudgetConsumed,
@@ -331,6 +332,21 @@ describe("the metric registry cannot be grown by the caller", () => {
     const counters = getMetricsSnapshot().counters;
     expect(counters['sse_error_responses_total{endpoint="overflow"}']).toBe(1);
     expect(after).toBeGreaterThan(before);
+  });
+});
+
+// --- stream failure --------------------------------------------------------
+
+describe("recordStreamFailure", () => {
+  it("counts a mid-stream failure as an error in sse_error_responses_total", () => {
+    recordRequest({ status: 200, provider: "openai", endpoint: "/v1/chat/completions" });
+    expect(computeErrorBudgetConsumed()).toBe(0);
+
+    recordStreamFailure({ provider: "openai", endpoint: "/v1/chat/completions" });
+
+    const counters = getMetricsSnapshot().counters;
+    expect(counters['sse_error_responses_total{provider="openai",endpoint="/v1/chat/completions"}']).toBe(1);
+    expect(computeErrorBudgetConsumed()).toBe(1);
   });
 });
 

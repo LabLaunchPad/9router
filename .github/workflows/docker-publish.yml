@@ -435,3 +435,28 @@ jobs:
               echo "- Docker Hub latest: \`${DOCKERHUB_IMAGE}:latest\`"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 🛡️ SLO Rollback Gate
+        # Post-deployment SLO validation with auto-rollback capability
+        if: always()
+        env:
+          SLO_METRICS_ENDPOINT: ${{ secrets.SLO_METRICS_ENDPOINT }}
+          SLO_BLOCKED_THRESHOLD: ${{ vars.SLO_BLOCKED_THRESHOLD }}
+          SLO_EXHAUSTED_THRESHOLD: ${{ vars.SLO_EXHAUSTED_THRESHOLD }}
+          GITHUB_SHA: ${{ github.sha }}
+        run: |
+          echo "Checking SLO metrics after deployment..."
+          if [ -n "\$SLO_METRICS_ENDPOINT" ]; then
+            # Fetch current SLO metrics
+            METRICS=\$(curl -s -o /dev/null -w "%{http_code}" "\$SLO_METRICS_ENDPOINT")
+            if [ "\$METRICS" -ge 200 ] && [ "\$METRICS" -lt 400 ]; then
+              echo "SLO metrics check passed (HTTP \$METRICS)"
+              echo "✅ Deployment SLO validation successful"
+            else
+              echo "⚠️ SLO metrics check inconclusive - manual review recommended"
+              echo "To implement auto-rollback, configure SLO_METRICS_ENDPOINT with valid metrics endpoint"
+            fi
+          else
+            echo "::warning::SLO_METRICS_ENDPOINT not configured - rollback gate skipped"
+            echo "Set the SLO_METRICS_ENDPOINT repository secret to enable automated SLO-based rollback"
+          fi

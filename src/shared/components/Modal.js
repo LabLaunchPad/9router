@@ -49,10 +49,14 @@ export default function Modal({
       <div
         className="absolute inset-0 bg-black/50 backdrop-blur-[2px] fade-in"
         onClick={closeOnOverlay ? onClose : undefined}
+        aria-hidden="true"
       />
 
       {/* Modal content */}
       <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={title ? "modal-title" : undefined}
         className={cn(
           "relative w-full bg-surface",
           "border border-border-subtle",
@@ -84,7 +88,7 @@ export default function Modal({
                 </div>
               )}
               {title && (
-                <h2 className="text-lg font-semibold text-text-main">{title}</h2>
+                <h2 id="modal-title" className="text-lg font-semibold text-text-main">{title}</h2>
               )}
             </div>
             {/* X button — mobile only */}
