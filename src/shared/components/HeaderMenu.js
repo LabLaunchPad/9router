@@ -9,11 +9,12 @@ import { ConfirmModal } from "./Modal";
 function MenuItem({ icon, label, onClick, trailing, danger }) {
   return (
     <button
+      type="button"
       onClick={onClick}
-      className={`flex items-center gap-3 w-full px-4 py-2.5 text-sm transition-colors ${
+      className={`flex items-center gap-3 w-full px-4 py-2.5 text-sm transition-colors focus-visible:outline-none ${
         danger
-          ? "text-red-500 hover:bg-red-500/10"
-          : "text-text-main hover:bg-black/5 dark:hover:bg-white/5"
+          ? "text-red-500 hover:bg-red-500/10 focus-visible:bg-red-500/10"
+          : "text-text-main hover:bg-black/5 dark:hover:bg-white/5 focus-visible:bg-black/5 dark:focus-visible:bg-white/5"
       }`}
     >
       <span className={`material-symbols-outlined text-[20px] ${danger ? "" : "text-text-muted"}`}>
@@ -70,8 +71,12 @@ export default function HeaderMenu({ onLogout }) {
     <>
       <div className="relative" ref={menuRef}>
         <button
+          type="button"
           onClick={() => setIsOpen((v) => !v)}
-          className="flex items-center justify-center p-2 rounded-lg text-text-muted hover:text-text-main hover:bg-black/5 dark:hover:bg-white/5 transition-all"
+          aria-label="Open quick menu"
+          aria-expanded={isOpen}
+          aria-haspopup="menu"
+          className="flex items-center justify-center p-2 rounded-lg text-text-muted hover:text-text-main hover:bg-black/5 dark:hover:bg-white/5 transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
           title="Menu"
         >
           <span className="material-symbols-outlined">grid_view</span>
