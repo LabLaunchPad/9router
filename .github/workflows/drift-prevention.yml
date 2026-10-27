@@ -485,6 +485,86 @@ jobs:
       - name: 📝 Update drift prevention docs
         run: echo "Drift prevention framework documented in STATUS_UPDATE.md and FINAL_SUMMARY.md"
 
+  # ---------------------------------------------------------------------------
+  # Mutation testing gate — critical authorization paths.
+  #
+  # Why this is a separate job from test-drift: a mutation run is minutes of
+  # work, not seconds. Folding it into test-drift would put it on the critical
+  # path of every ordinary test failure and make the drift job's timeout the
+  # budget for both.
+  #
+  # The gate is Stryker's own exit code (thresholds.break in
+  # stryker.critical.conf.js), NOT a shell comparison written here. One place
+  # decides the floor, so the badge, the summary and the pass/fail verdict
+  # cannot disagree.
+  #
+  # It does not `needs: test-drift` on purpose: a PR that breaks an unrelated
+  # test still deserves a mutation verdict, and the reverse — a PR that passes
+  # tests but weakens an auth path — is exactly the case this job exists for.
+  mutation-testing:
+    name: 🧬 Mutation Testing (critical paths)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # The workflow's `on.pull_request.paths` already limits PR runs to relevant
+    # paths (src/**, tests/**, scripts/**, package.json, workflows). Nothing
+    # further is filtered here, so a manual run and a default-branch push both
+    # always execute the gate.
+
+    steps:
+      - name: 📦 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 🔧 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # Matches the install every other job in this workflow uses: this
+      # dependency tree needs --legacy-peer-deps, and `npm ci` refuses to run
+      # when package.json and the committed lockfile disagree.
+      - name: ✅ Install dependencies
+        run: npm install --legacy-peer-deps --no-audit --no-fund
+
+      - name: 🧬 Run mutation testing gate
+        id: mutation
+        # Exits non-zero when the score is below thresholds.break. Kept as its
+        # own step so the score and the verdict are one red line in the log,
+        # not a `set -e` abort halfway through a shell script.
+        run: npm run test:mutate:critical
+
+      - name: 📊 Summarise mutation score
+        # Runs even when the gate failed: the whole point of a red gate is the
+        # number that made it red. The job still fails, because the failed step
+        # above fails it.
+        if: always()
+        # GITHUB_STEP_SUMMARY is injected by the runner; the script appends to it
+        # directly. Overriding it here would clobber the real path.
+        run: node scripts/ci/mutation-summary.mjs reports/mutation/critical.json
+
+      - name: 📤 Upload mutation report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutation-report
+          path: |
+            reports/mutation/critical.html
+            reports/mutation/critical.json
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: 📢 Mutation gate decision
+        if: always()
+        run: |
+          if [ "${{ steps.mutation.outcome }}" = "success" ]; then
+            echo "✅ Mutation gate PASSED — score at or above the break threshold."
+          else
+            echo "::error::Mutation gate FAILED — the critical-path mutation score fell below the break threshold."
+            echo "Surviving mutants are listed in the mutation-report artifact."
+            echo "Add tests that pin the behaviour, or explain why the mutant is equivalent."
+            echo "Do NOT lower thresholds.break in stryker.critical.conf.js to make this pass."
+            exit 1
+          fi
+
   slo-validation-gate:
     runs-on: ubuntu-latest
     needs: test-drift
