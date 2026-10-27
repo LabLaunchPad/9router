@@ -1,7 +1,7 @@
 "use server";
 
 import { NextResponse } from "next/server";
-import { assertPublicUrl } from "@/shared/utils/ssrfGuard.js";
+import { assertPublicUrlResolved } from "@/shared/utils/ssrfGuard.js";
 import { isLocalRequest } from "@/dashboardGuard";
 
 const TIMEOUT_MS = 8000;
@@ -92,7 +92,7 @@ export async function POST(request) {
     // SSRF guard for remote callers; local host keeps self-hosted MCP servers.
     if (!isLocalRequest(request)) {
       try {
-        assertPublicUrl(url);
+        await assertPublicUrlResolved(url);
       } catch {
         return NextResponse.json({ error: "URL not allowed" }, { status: 400 });
       }

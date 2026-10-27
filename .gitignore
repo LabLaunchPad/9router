@@ -52,6 +52,7 @@ source/*
 docs/*
 !docs/ARCHITECTURE.md
 !docs/performance/
+!docs/performance/**
 test/*
 open-sse/test/*
 RM.vn.md
@@ -115,3 +116,7 @@ debug.log
 /confirmed-regressions.txt
 /still-failing.txt
 /.drift-base/
+
+# Stryker mutation testing
+.stryker-tmp/
+reports/

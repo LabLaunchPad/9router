@@ -4,10 +4,8 @@ import { useState, useEffect, useCallback } from "react";
 import dynamic from "next/dynamic";
 import { Card, Button } from "@/shared/components";
 
-const PxpipeChart = dynamic(
-  () => import("./PxpipeChart"),
-  { ssr: false }
-);
+// Lazy-load PxpipeAreaChart to keep recharts out of initial page JS bundle
+const PxpipeAreaChart = dynamic(() => import("./PxpipeAreaChart"), { ssr: false });
 
 const fmtTokens = (n) => {
   if (n >= 1000000) return `${(n / 1000000).toFixed(2)}M`;
@@ -177,7 +175,7 @@ export default function PxpipeClient() {
       <Card className="p-4">
         <h3 className="font-medium mb-3">Tokens saved — last 30 days</h3>
         {stats?.timeline?.some((d) => d.tokensSavedEst > 0) ? (
-          <PxpipeChart timeline={stats.timeline} />
+          <PxpipeAreaChart timeline={stats.timeline} />
         ) : (
           <div className="h-32 flex items-center justify-center text-text-muted text-sm">
             No savings recorded yet — enable PXPIPE in the Token Saver and route a large Claude-format request.

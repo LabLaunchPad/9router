@@ -240,11 +240,36 @@ export async function getActiveRequests() {
   return { activeRequests, recentRequests, errorProvider };
 }
 
+let lastIsoMs = 0;
+let isoMicroCounter = 0;
+
+export function generateUniqueTimestamp() {
+  let now = Date.now();
+  if (now === lastIsoMs) {
+    isoMicroCounter++;
+    if (isoMicroCounter >= 1000000) {
+      now = lastIsoMs + 1;
+      lastIsoMs = now;
+      isoMicroCounter = 0;
+    }
+  } else if (now > lastIsoMs) {
+    lastIsoMs = now;
+    isoMicroCounter = 0;
+  } else {
+    now = lastIsoMs;
+    isoMicroCounter++;
+  }
+  const iso = new Date(now).toISOString();
+  if (isoMicroCounter === 0) return iso;
+  const pad = String(isoMicroCounter).padStart(6, "0");
+  return iso.replace("Z", `${pad}Z`);
+}
+
 export async function saveRequestUsage(entry) {
   try {
     const db = await getAdapter();
 
-    if (!entry.timestamp) entry.timestamp = new Date().toISOString();
+    if (!entry.timestamp) entry.timestamp = generateUniqueTimestamp();
     entry.cost = await calculateCost(entry.provider, entry.model, entry.tokens);
 
     const tokens = entry.tokens || {};
@@ -781,6 +806,19 @@ function formatLogDate(date = new Date()) {
 
 // No-op: request log is now derived from usageHistory table on read.
 export async function appendRequestLog() {}
+
+export async function pruneUsageHistory(days = 90) {
+  if (!days || days <= 0) return { deleted: 0 };
+  try {
+    const db = await getAdapter();
+    const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+    const result = db.run(`DELETE FROM usageHistory WHERE timestamp < ?`, [cutoff]);
+    return { deleted: result?.changes || 0 };
+  } catch (e) {
+    console.error("Failed to prune usage history:", e);
+    return { deleted: 0 };
+  }
+}
 
 export async function getRecentLogs(limit = 200) {
   try {
