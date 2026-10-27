@@ -117,23 +117,45 @@ export function matchesSearch(target, queryOrParsed) {
     return true;
   }
 
-  // Handle Regex matching separately to preserve exact case matching if custom flags are passed
-  if (parsed.isRegex && parsed.regex) {
-    let candidates = [];
-    if (typeof target === "string") {
-      candidates = [target];
-    } else if (Array.isArray(target)) {
-      candidates = target.filter((t) => typeof t === "string");
-    } else if (target && typeof target === "object") {
-      candidates = [
-        target.name,
-        target.id,
-        target.value,
-        target.alias,
-        target.provider,
-      ].filter((t) => typeof t === "string");
+  // Fast path for string targets (most common case in filtering) to avoid array allocations and iteration closures
+  if (typeof target === "string") {
+    if (parsed.isRegex && parsed.regex) {
+      return parsed.regex.test(target);
     }
-    if (candidates.length === 0) return false;
+    const lower = target.toLowerCase();
+    if (parsed.negativeTerms.length > 0) {
+      for (let i = 0; i < parsed.negativeTerms.length; i++) {
+        if (lower.includes(parsed.negativeTerms[i])) return false;
+      }
+    }
+    if (parsed.positiveTerms.length > 0) {
+      for (let i = 0; i < parsed.positiveTerms.length; i++) {
+        if (!lower.includes(parsed.positiveTerms[i])) return false;
+      }
+    }
+    return true;
+  }
+
+  // Extract candidate strings from target
+  let candidates = [];
+  if (Array.isArray(target)) {
+    candidates = target.filter((t) => typeof t === "string");
+  } else if (target && typeof target === "object") {
+    candidates = [
+      target.name,
+      target.id,
+      target.value,
+      target.alias,
+      target.provider,
+    ].filter((t) => typeof t === "string");
+  }
+
+  if (candidates.length === 0) {
+    return false;
+  }
+
+  // Handle Regex
+  if (parsed.isRegex && parsed.regex) {
     const fullText = candidates.join(" ");
     const hasNegativeAssertion = /\(\?!|\(\?<!/.test(parsed.raw);
     if (hasNegativeAssertion) {
@@ -142,53 +164,21 @@ export function matchesSearch(target, queryOrParsed) {
     return candidates.some((text) => parsed.regex.test(text)) || parsed.regex.test(fullText);
   }
 
-  // Bolt: Single-pass lowercasing without intermediate array allocations (filter/map).
-  // This reduces object allocations per filter evaluation by ~75% and speeds up model list searches.
-  const lowerCandidates = [];
-  if (typeof target === "string") {
-    lowerCandidates.push(target.toLowerCase());
-  } else if (Array.isArray(target)) {
-    for (let i = 0; i < target.length; i++) {
-      const t = target[i];
-      if (typeof t === "string") lowerCandidates.push(t.toLowerCase());
-    }
-  } else if (target && typeof target === "object") {
-    if (typeof target.name === "string") lowerCandidates.push(target.name.toLowerCase());
-    if (typeof target.id === "string") lowerCandidates.push(target.id.toLowerCase());
-    if (typeof target.value === "string") lowerCandidates.push(target.value.toLowerCase());
-    if (typeof target.alias === "string") lowerCandidates.push(target.alias.toLowerCase());
-    if (typeof target.provider === "string") lowerCandidates.push(target.provider.toLowerCase());
-  }
-
-  const numCandidates = lowerCandidates.length;
-  if (numCandidates === 0) {
-    return false;
-  }
+  const lowerCandidates = candidates.map((c) => c.toLowerCase());
 
   // Handle Negations: reject if ANY candidate contains ANY negative term
   if (parsed.negativeTerms.length > 0) {
-    for (let i = 0; i < parsed.negativeTerms.length; i++) {
-      const neg = parsed.negativeTerms[i];
-      for (let j = 0; j < numCandidates; j++) {
-        if (lowerCandidates[j].includes(neg)) {
-          return false;
-        }
+    for (const neg of parsed.negativeTerms) {
+      if (lowerCandidates.some((c) => c.includes(neg))) {
+        return false;
       }
     }
   }
 
   // Handle Positive Terms: ALL positive terms must match at least one candidate
   if (parsed.positiveTerms.length > 0) {
-    for (let i = 0; i < parsed.positiveTerms.length; i++) {
-      const pos = parsed.positiveTerms[i];
-      let matched = false;
-      for (let j = 0; j < numCandidates; j++) {
-        if (lowerCandidates[j].includes(pos)) {
-          matched = true;
-          break;
-        }
-      }
-      if (!matched) {
+    for (const pos of parsed.positiveTerms) {
+      if (!lowerCandidates.some((c) => c.includes(pos))) {
         return false;
       }
     }
