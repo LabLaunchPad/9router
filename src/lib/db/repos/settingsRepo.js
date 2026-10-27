@@ -64,12 +64,25 @@ const DEFAULT_SETTINGS = {
   pxpipeTimeoutMs: 15000,
   // Per-provider user header overrides applied at dispatch: { [providerId]: { headers: {..} } }
   providerOverrides: {},
+  // Usage history retention in days (0 = never prune)
+  usageRetentionDays: 90,
 };
 
+let cachedSettings = null;
+let lastFetchTime = 0;
+const CACHE_TTL_MS = 2000;
+
 async function readRaw() {
+  const now = Date.now();
+  if (cachedSettings && now - lastFetchTime < CACHE_TTL_MS) {
+    return cachedSettings;
+  }
   const db = await getAdapter();
   const row = db.get(`SELECT data FROM settings WHERE id = 1`);
-  return row ? parseJson(row.data, {}) : {};
+  const data = row ? parseJson(row.data, {}) : {};
+  cachedSettings = data;
+  lastFetchTime = now;
+  return data;
 }
 
 // Merge raw settings with defaults; backward-compat for missing keys
@@ -119,6 +132,8 @@ export async function updateSettings(updates) {
       [stringifyJson(next)],
     );
   });
+  cachedSettings = next;
+  lastFetchTime = Date.now();
   return mergeWithDefaults(next);
 }
 

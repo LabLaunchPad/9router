@@ -304,6 +304,23 @@ export function recordBreakerRejection(provider) {
 }
 
 /**
+ * Record a stream failure that occurred after HTTP 200 headers were committed.
+ * Increments `sse_error_responses_total` so mid-stream errors are not hidden from the SLO error budget.
+ *
+ * @param {{ provider?: string, endpoint?: string }} [info]
+ */
+export function recordStreamFailure({ provider, endpoint } = {}) {
+  const errorLabels = { provider, endpoint: endpoint || "stream_failure" };
+  const errorKey = `sse_error_responses_total${counterKey(errorLabels)}`;
+  if (!counters.has(errorKey) && counters.size >= MAX_SERIES) {
+    incrementOverflowError();
+    noteDroppedSeries("sse_error_responses_total", errorLabels);
+  } else {
+    incrementCounter("sse_error_responses_total", errorLabels);
+  }
+}
+
+/**
  * Count one request in the overflow series.
  */
 function incrementOverflowRequest() {

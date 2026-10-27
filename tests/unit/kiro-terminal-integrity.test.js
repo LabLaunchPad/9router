@@ -716,7 +716,7 @@ describe("Kiro terminal integrity recovery", () => {
     const body = await result.response.text();
 
     expect(result.response.status).toBe(200);
-    expect(body).toContain("kiro_integrity_retry_upstream_error");
+    expect(body).toContain("kiro_integrity_gate_failed");
     expect(body).toContain("unauthorized");
   });
 

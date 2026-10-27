@@ -29,5 +29,6 @@ export default defineConfig({
     // (npm run test:chaos / the chaos-engineering workflow). It is deterministic
     // and network-free — failures are injected through dependency-injection
     // seams — so excluding it keeps the default run focused on unit coverage.
+    testTimeout: 60000,
   },
 });

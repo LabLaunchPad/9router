@@ -48,6 +48,16 @@ describe("cowork-mcp-tools SSRF guard", () => {
     }
   });
 
+  it("rejects wildcard-DNS hostnames resolving to internal IPs", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    for (const url of ["http://127.0.0.1.nip.io:18731/mcp", "http://127.0.0.1.sslip.io:3000/mcp"]) {
+      const res = await POST(remoteRequest(url));
+      expect(res.status, `should reject ${url}`).toBe(400);
+      expect(await res.json()).toEqual({ error: "URL not allowed" });
+    }
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
   it("still requires a url", async () => {
     const res = await POST(
       new Request("http://gateway.example.com/api/cli-tools/cowork-mcp-tools", {

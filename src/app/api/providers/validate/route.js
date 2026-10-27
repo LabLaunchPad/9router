@@ -1,5 +1,7 @@
 import { NextResponse } from "next/server";
 import { getProviderNodeById } from "@/models";
+import { assertPublicUrlResolved } from "@/shared/utils/ssrfGuard.js";
+import { isLocalRequest } from "@/dashboardGuard";
 import { isOpenAICompatibleProvider, isAnthropicCompatibleProvider, isCustomEmbeddingProvider, AI_PROVIDERS } from "@/shared/constants/providers";
 import { getDefaultModel } from "open-sse/config/providerModels.js";
 import { resolveOllamaLocalHost, resolveXiaomiTokenplanBaseUrl, PROVIDERS } from "open-sse/config/providers.js";
@@ -113,6 +115,13 @@ export async function POST(request) {
         if (!node) {
           return NextResponse.json({ error: "OpenAI Compatible node not found" }, { status: 404 });
         }
+        if (!isLocalRequest(request)) {
+          try {
+            await assertPublicUrlResolved(node.baseUrl);
+          } catch {
+            return NextResponse.json({ valid: false, error: "URL not allowed" });
+          }
+        }
         const modelsUrl = `${node.baseUrl?.replace(/\/$/, "")}/models`;
         const res = await fetch(modelsUrl, {
           headers: { "Authorization": `Bearer ${apiKey}` },
@@ -129,6 +138,13 @@ export async function POST(request) {
         const node = await getProviderNodeById(provider);
         if (!node) {
           return NextResponse.json({ error: "Custom Embedding node not found" }, { status: 404 });
+        }
+        if (!isLocalRequest(request)) {
+          try {
+            await assertPublicUrlResolved(node.baseUrl);
+          } catch {
+            return NextResponse.json({ valid: false, error: "URL not allowed" });
+          }
         }
         const baseUrl = node.baseUrl?.replace(/\/$/, "");
         const modelsRes = await fetch(`${baseUrl}/models`, {
@@ -159,6 +175,13 @@ export async function POST(request) {
         const node = await getProviderNodeById(provider);
         if (!node) {
           return NextResponse.json({ error: "Anthropic Compatible node not found" }, { status: 404 });
+        }
+        if (!isLocalRequest(request)) {
+          try {
+            await assertPublicUrlResolved(node.baseUrl);
+          } catch {
+            return NextResponse.json({ valid: false, error: "URL not allowed" });
+          }
         }
 
         let normalizedBase = node.baseUrl?.trim().replace(/\/$/, "") || "";
@@ -409,9 +432,20 @@ export async function POST(request) {
             "ollama-local": `${resolveOllamaLocalHost({ providerSpecificData })}/api/tags`,
             "xiaomi-tokenplan": `${resolveXiaomiTokenplanBaseUrl({ providerSpecificData })}/models`,
           };
+          const targetEndpoint = endpoints[provider];
+          if (!targetEndpoint) {
+            return NextResponse.json({ valid: false, error: "Provider validation endpoint not found" });
+          }
+          if (!isLocalRequest(request)) {
+            try {
+              await assertPublicUrlResolved(targetEndpoint);
+            } catch {
+              return NextResponse.json({ valid: false, error: "URL not allowed" });
+            }
+          }
           const headers = {};
           if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
-          const res = await fetch(endpoints[provider], { headers, signal: AbortSignal.timeout(8000) });
+          const res = await fetch(targetEndpoint, { headers, signal: AbortSignal.timeout(8000) });
           // xai returns 400 for bad key, 403 for valid-but-no-credit. Other providers use 401.
           if (provider === "xai") {
             isValid = res.status === 200 || res.status === 403;
