@@ -47,14 +47,22 @@ afterAll(async () => {
       global._dbAdapter.initPromise = null;
     }
   } catch {}
-  await new Promise(r => setTimeout(r, 200));
+  await new Promise(r => setTimeout(r, 500));
   try {
-    if (tempDir) fs.rmSync(tempDir, { recursive: true, force: true });
-  } catch {
-    try {
-      if (tempDir) fs.rmSync(tempDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
-    } catch {}
-  }
+    if (tempDir) {
+      try {
+        const dbPath = path.join(tempDir, "db");
+        if (fs.existsSync(dbPath)) {
+          for (const f of fs.readdirSync(dbPath)) {
+            try { fs.unlinkSync(path.join(dbPath, f)); } catch {}
+          }
+        }
+      } catch {}
+      try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
+      try { fs.rmSync(tempDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 150 }); } catch {}
+    }
+  } catch {}
+  await new Promise(r => setTimeout(r, 200));
   if (originalDataDir === undefined) delete process.env.DATA_DIR;
   else process.env.DATA_DIR = originalDataDir;
 });

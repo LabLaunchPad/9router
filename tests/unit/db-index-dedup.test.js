@@ -13,8 +13,48 @@ beforeAll(async () => {
   await db.initDb();
 });
 
-afterAll(() => {
-  if (tempDir) fs.rmSync(tempDir, { recursive: true, force: true });
+afterAll(async () => {
+  try {
+    const driverMod = await import("@/lib/db/driver.js");
+    if (typeof driverMod.getAdapterSync === "function") {
+      try {
+        const adapter = driverMod.getAdapterSync();
+        if (adapter && typeof adapter.close === "function") adapter.close();
+      } catch {}
+    }
+    if (typeof driverMod.getAdapter === "function") {
+      try {
+        const adapter = await driverMod.getAdapter();
+        if (adapter && typeof adapter.close === "function") adapter.close();
+      } catch {}
+    }
+  } catch {}
+  try {
+    if (global._dbAdapter) {
+      if (global._dbAdapter.instance && typeof global._dbAdapter.instance.close === "function") {
+        try { global._dbAdapter.instance.close(); } catch {}
+      }
+      global._dbAdapter.instance = null;
+      global._dbAdapter.initPromise = null;
+    }
+  } catch {}
+  await new Promise(r => setTimeout(r, 500));
+  try {
+    if (tempDir) {
+      try {
+        const dbPath = path.join(tempDir, "db");
+        if (fs.existsSync(dbPath)) {
+          for (const f of fs.readdirSync(dbPath)) {
+            try { fs.unlinkSync(path.join(dbPath, f)); } catch {}
+          }
+        }
+      } catch {}
+      try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
+      try { fs.rmSync(tempDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 150 }); } catch {}
+    }
+  } catch {}
+  await new Promise(r => setTimeout(r, 200));
+  if (process.env.DATA_DIR === tempDir) delete process.env.DATA_DIR;
 });
 
 describe("DB Schema & Dedup Index Test", () => {

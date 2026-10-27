@@ -65,20 +65,45 @@ function getBetterSqliteBinary() {
   ].find((file) => fs.existsSync(file));
 }
 
+// The N-API registration marker. The build pinned for Node >= 22 (better-sqlite3
+// 13.x) ships N-API prebuilds, which are ABI-independent: the loader resolves
+// `napi_register_module_v1` rather than the ABI-specific module registration.
+// A binary without that marker was compiled against another Node ABI; file magic
+// says nothing about that, so the old check passed it and the load segfaulted,
+// killing the process before the driver chain could fall back to
+// node:sqlite / sql.js. (#2493)
+const NAPI_MARKER = Buffer.from("napi_register_module_v1");
+// better_sqlite3.node is a few MB; refuse to buffer anything pathological.
+const NAPI_MARKER_SCAN_LIMIT = 16 * 1024 * 1024;
+
+function hasNapiMarker(binary) {
+  try {
+    if (fs.statSync(binary).size > NAPI_MARKER_SCAN_LIMIT) return false;
+    return fs.readFileSync(binary).includes(NAPI_MARKER);
+  } catch { return false; }
+}
+
 function isBetterSqliteBinaryValid() {
   const binary = getBetterSqliteBinary();
   if (!binary) return false;
+  let magicOk = false;
   try {
     const fd = fs.openSync(binary, "r");
     const buf = Buffer.alloc(4);
     fs.readSync(fd, buf, 0, 4, 0);
     fs.closeSync(fd);
     const magic = buf.toString("hex");
-    if (process.platform === "linux") return magic.startsWith("7f454c46");
-    if (process.platform === "darwin") return magic.startsWith("cffaedfe") || magic.startsWith("cefaedfe");
-    if (process.platform === "win32") return magic.startsWith("4d5a");
-    return true;
+    if (process.platform === "linux") magicOk = magic.startsWith("7f454c46");
+    else if (process.platform === "darwin") magicOk = magic.startsWith("cffaedfe") || magic.startsWith("cefaedfe");
+    else if (process.platform === "win32") magicOk = magic.startsWith("4d5a");
+    else magicOk = true;
   } catch { return false; }
+  if (!magicOk) return false;
+  // ABI gate: Node < 22 pins an ABI-specific 12.6.2 build whose target ABI is not
+  // recorded in the file, so the magic gate stays and the driver fallback chain
+  // covers it. Node >= 22 must be the pinned N-API build.
+  if (!USE_NAPI_BUILD) return true;
+  return hasNapiMarker(binary);
 }
 
 // Extract a short, user-friendly reason from npm stderr.
@@ -175,6 +200,7 @@ module.exports = {
   buildEnvWithRuntime,
   getRuntimeDir,
   getRuntimeNodeModules,
+  isBetterSqliteBinaryValid,
   runNpmInstall,
   summarizeNpmError,
 };

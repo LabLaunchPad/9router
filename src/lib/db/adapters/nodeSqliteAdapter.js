@@ -38,15 +38,21 @@ export async function createNodeSqliteAdapter(filePath) {
   }, CHECKPOINT_INTERVAL_MS);
   if (typeof checkpointTimer.unref === "function") checkpointTimer.unref();
 
+  let closed = false;
   function gracefulClose() {
+    if (closed) return;
+    closed = true;
+    try { clearInterval(checkpointTimer); } catch {}
     try { db.exec("PRAGMA wal_checkpoint(TRUNCATE)"); } catch {}
     try { stmtCache.clear(); } catch {}
     try { db.close(); } catch {}
   }
   const onShutdown = () => gracefulClose();
+  const onSigInt = () => { gracefulClose(); process.exit(0); };
+  const onSigTerm = () => { gracefulClose(); process.exit(0); };
   process.once("beforeExit", onShutdown);
-  process.once("SIGINT", () => { onShutdown(); process.exit(0); });
-  process.once("SIGTERM", () => { onShutdown(); process.exit(0); });
+  process.once("SIGINT", onSigInt);
+  process.once("SIGTERM", onSigTerm);
 
   return {
     driver: "node:sqlite",
@@ -76,7 +82,9 @@ export async function createNodeSqliteAdapter(filePath) {
     },
     checkpoint() { try { db.exec("PRAGMA wal_checkpoint(TRUNCATE)"); } catch {} },
     close() {
-      clearInterval(checkpointTimer);
+      try { process.removeListener && process.removeListener("beforeExit", onShutdown); } catch {}
+      try { process.removeListener && process.removeListener("SIGINT", onSigInt); } catch {}
+      try { process.removeListener && process.removeListener("SIGTERM", onSigTerm); } catch {}
       gracefulClose();
     },
     raw: db,

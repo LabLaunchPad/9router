@@ -138,6 +138,18 @@ function openaiToGeminiBase(model, body, stream, signature = DEFAULT_THINKING_AG
   // matching functionResponse, so the pair always agrees. #4532
   const toolCallIdUniquifier = createToolCallIdUniquifier();
 
+  // Gemini accepts a single `systemInstruction`, so every system message has to
+  // be merged into it. Assigning it inside the message loop below kept only the
+  // last one and silently dropped the earlier instructions. #3972
+  const systemParts = [];
+  if (body.messages && Array.isArray(body.messages) && body.messages.length > 1) {
+    for (const msg of body.messages) {
+      if (msg.role !== ROLE.SYSTEM) continue;
+      const text = typeof msg.content === "string" ? msg.content : extractTextContent(msg.content);
+      if (text) systemParts.push({ text });
+    }
+  }
+
   // Convert messages
   if (body.messages && Array.isArray(body.messages)) {
     for (let i = 0; i < body.messages.length; i++) {
@@ -146,10 +158,10 @@ function openaiToGeminiBase(model, body, stream, signature = DEFAULT_THINKING_AG
       const content = msg.content;
 
       if (role === ROLE.SYSTEM && body.messages.length > 1) {
-        result.systemInstruction = {
-          role: GEMINI_ROLE.USER,
-          parts: [{ text: typeof content === "string" ? content : extractTextContent(content) }]
-        };
+        // Merged from every system message before the loop; assign once.
+        if (systemParts.length > 0 && !result.systemInstruction) {
+          result.systemInstruction = { role: GEMINI_ROLE.USER, parts: systemParts };
+        }
       } else if (role === ROLE.USER || (role === ROLE.SYSTEM && body.messages.length === 1)) {
         const parts = convertOpenAIContentToParts(content);
         if (parts.length > 0) {

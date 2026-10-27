@@ -9,9 +9,10 @@ const O2C = (body) => translateRequest(FORMATS.OPENAI, FORMATS.CURSOR, "m", body
 const O2CC = (body) => translateRequest(FORMATS.OPENAI, FORMATS.COMMANDCODE, "m", body, true, null, "commandcode");
 
 describe("OpenAI → Gemini", () => {
-  // openai-to-gemini.js:92-96 — each system message overwrites systemInstruction → only last kept
-  // KNOWN BUG
-  it.fails("multiple system messages are all kept", () => {
+  // openai-to-gemini.js:149 — systemInstruction is assigned inside the message
+  // loop, so each system message overwrote the previous one. Fixed: messages are
+  // merged before assignment. (was `it.fails` per AGENTS.md §6)
+  it("multiple system messages are all kept", () => {
     const out = O2G({
       messages: [
         { role: "system", content: "RULE_ONE" },
@@ -19,7 +20,9 @@ describe("OpenAI → Gemini", () => {
         { role: "user", content: "hi" },
       ],
     });
-    expect(JSON.stringify(out.systemInstruction), "earlier system lost").toContain("RULE_ONE");
+    const text = JSON.stringify(out.systemInstruction);
+    expect(text, "earlier system lost").toContain("RULE_ONE");
+    expect(text, "later system lost").toContain("RULE_TWO");
   });
 });
 
