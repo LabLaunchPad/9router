@@ -21,19 +21,20 @@ import { augmentModelsWithCapacityAdapter, withCapacityAdapterStripping, getActi
 import { handleBypassRequest } from "open-sse/utils/bypassHandler.js";
 import { HTTP_STATUS } from "open-sse/config/runtimeConfig.js";
 import { detectFormatByEndpoint } from "open-sse/translator/formats.js";
+import { resolveSessionIdentity } from "open-sse/utils/sessionManager.js";
 import * as log from "../utils/logger.js";
 import { updateProviderCredentials, checkAndRefreshToken } from "../services/tokenRefresh.js";
 import { getProjectIdForConnection } from "open-sse/services/projectId.js";
 import { stripModelContextMarker } from "open-sse/utils/modelMarkers.js";
 import { getKeyAccessContext, enforceKeyAccess, filterAdapterModels } from "../services/keyAccess.js";
-import { instrumentHandler } from "../services/metrics.js";
+import { resolveSmartChoice } from "../services/systemoneRouter.js";
 
 /**
  * Handle chat completion request
  * Supports: OpenAI, Claude, Gemini, OpenAI Responses API formats
  * Format detection and translation handled by translator
  */
-async function handleChatImpl(request, clientRawRequest = null) {
+export async function handleChat(request, clientRawRequest = null) {
   let body;
   try {
     body = await request.json();
@@ -56,6 +57,9 @@ async function handleChatImpl(request, clientRawRequest = null) {
   // The capability travels in the anthropic-beta header, forwarded as-is.
   const { model: modelStr, contextMarker } = stripModelContextMarker(body.model);
   if (contextMarker) body.model = modelStr;
+
+  const session = resolveSessionIdentity({ headers: clientRawRequest?.headers, body });
+  const sessionId = session?.sessionId || null;
 
   // Request summary is emitted as the unified "▶" line in chatCore (has fmt/thinking/account)
 
@@ -133,6 +137,7 @@ async function handleChatImpl(request, clientRawRequest = null) {
     }
 
     const comboStickyLimit = settings.comboStickyRoundRobinLimit;
+    const comboCfg = comboStrategies[modelStr] || {};
     log.info("CHAT", `Combo "${modelStr}" with ${augmentedModels.length} models (strategy: ${comboStrategy}, sticky: ${comboStickyLimit})`);
     return handleComboChat({
       body,
@@ -144,7 +149,19 @@ async function handleChatImpl(request, clientRawRequest = null) {
       log,
       comboName: modelStr,
       comboStrategy,
-      comboStickyLimit
+      comboStickyLimit,
+      sessionId,
+      smartPolicy: comboCfg.smartPolicy || "smart",
+      sessionSticky: comboCfg.sessionSticky !== false,
+      confidenceThreshold: typeof comboCfg.confidenceThreshold === "number" ? comboCfg.confidenceThreshold : 0.8,
+      resolveSmartChoice: comboStrategy === "smart"
+        ? (b, m) => resolveSmartChoice({
+            body: b,
+            models: m,
+            routerModel: comboCfg.routerModel,
+            log,
+          })
+        : null,
     });
   }
 
@@ -213,6 +230,9 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
       }
 
       const comboStickyLimit = chatSettings.comboStickyRoundRobinLimit;
+      const comboCfg = comboStrategies[modelStr] || {};
+      const nestedSession = resolveSessionIdentity({ headers: clientRawRequest?.headers, body });
+      const nestedSessionId = nestedSession?.sessionId || null;
       log.info("CHAT", `Combo "${modelStr}" with ${augmentedModels.length} models (strategy: ${comboStrategy}, sticky: ${comboStickyLimit})`);
       return handleComboChat({
         body,
@@ -224,7 +244,19 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
         log,
         comboName: modelStr,
         comboStrategy,
-        comboStickyLimit
+        comboStickyLimit,
+        sessionId: nestedSessionId,
+        smartPolicy: comboCfg.smartPolicy || "smart",
+        sessionSticky: comboCfg.sessionSticky !== false,
+        confidenceThreshold: typeof comboCfg.confidenceThreshold === "number" ? comboCfg.confidenceThreshold : 0.8,
+        resolveSmartChoice: comboStrategy === "smart"
+          ? (b, m) => resolveSmartChoice({
+              body: b,
+              models: m,
+              routerModel: comboCfg.routerModel,
+              log,
+            })
+          : null,
       });
     }
     log.warn("CHAT", "Invalid model format", { model: modelStr });
@@ -298,6 +330,8 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
       cavemanLevel: chatSettings.cavemanLevel || "full",
       ponytailEnabled: !!chatSettings.ponytailEnabled,
       ponytailLevel: chatSettings.ponytailLevel || "full",
+      customPromptEnabled: !!chatSettings.customPromptEnabled,
+      customPrompt: chatSettings.customPrompt || "",
       pxpipeEnabled: !!chatSettings.pxpipeEnabled,
       pxpipeMinChars: chatSettings.pxpipeMinChars,
       pxpipeTimeoutMs: chatSettings.pxpipeTimeoutMs,
@@ -336,34 +370,11 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
       if (quotaResetMs) resetsAtMs = quotaResetMs;
     }
 
-    // The breaker has to hear about every failure on this path.
-    //
-    // The credential lookup claimed the breaker's half-open probe, and a
-    // probe that is never resolved refuses the provider for the whole reset
-    // window — fifteen minutes by default — and every refusal is counted
-    // as an error against the error budget.
-    //
-    // The account lock is a different question, and it is the conditional
-    // one. The exhausted Antigravity model is blocked only in the RAM cache
-    // until the upstream reset, and this path must not persist a
-    // modelLock_* for it — so the lock is skipped there, and the breaker is
-    // told either way. A path that answers the account question does not
-    // have to leave the other one open.
-    const antigravityModelExhausted = provider === "antigravity" && Boolean(quotaResetMs);
-
-    const { shouldFallback: accountShouldFallback } = await markAccountUnavailable(
-      credentials.connectionId, result.status, result.error, provider, model,
-      {
-        upstreamContacted: result.upstreamContacted ?? true,
-        resetsAtMs,
-        persistLock: !antigravityModelExhausted,
-      },
-    );
-
-    // The exhausted model always rotates: it is out of quota until the
-    // upstream reset, so the next account is the only way to serve the
-    // request.
-    const shouldFallback = antigravityModelExhausted ? true : accountShouldFallback;
+    // Exhausted Antigravity model is blocked only in RAM cache until upstream resetAt.
+    // Do not persist a modelLock_* for this path.
+    const shouldFallback = provider === "antigravity" && quotaResetMs
+      ? true
+      : (await markAccountUnavailable(credentials.connectionId, result.status, result.error, provider, model, resetsAtMs)).shouldFallback;
 
     if (shouldFallback) {
       log.warn("FALLBACK", `⇄ ACC:${credentials.connectionName} UNAVAILABLE (${result.status}) → NEXT ACCOUNT`);
@@ -377,14 +388,3 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
     return result.response;
   }
 }
-
-/**
- * Instrumented entry point for chat-shaped requests.
- *
- * `/v1/chat/completions`, `/v1/messages` and `/v1/responses` all land here.
- * The wrapper records the outcome (status class + latency) in the metrics
- * registry that `GET /api/metrics` exposes and that the CI SLO gate reads.
- * The response is returned untouched and a thrown error is re-thrown after
- * being counted.
- */
-export const handleChat = instrumentHandler(handleChatImpl);

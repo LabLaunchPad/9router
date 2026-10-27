@@ -120,3 +120,4 @@ debug.log
 # Stryker mutation testing
 .stryker-tmp/
 reports/
+.scratch/

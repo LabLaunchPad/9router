@@ -1,6 +1,6 @@
 import {
   extractApiKey, isValidApiKey,
-  getProviderCredentials, markAccountUnavailable, clearAccountError, recordProviderFailure,
+  getProviderCredentials, markAccountUnavailable, clearAccountError,
 } from "../services/auth.js";
 import { getSettings, getCustomModels } from "@/lib/localDb";
 import { getModelInfo } from "../services/model.js";
@@ -10,6 +10,8 @@ import { errorResponse, unavailableResponse } from "open-sse/utils/error.js";
 import { HTTP_STATUS } from "open-sse/config/runtimeConfig.js";
 import { AI_PROVIDERS } from "@/shared/constants/providers";
 import * as log from "../utils/logger.js";
+import { checkAndRefreshToken } from "../services/tokenRefresh.js";
+import { resolveConnectionProxyConfig } from "@/lib/network/connectionProxy.js";
 
 // Providers requiring credentials for STT
 const CREDENTIALED_PROVIDERS = new Set(
@@ -61,6 +63,7 @@ export async function handleStt(request) {
   if (!modelInfo.provider) return errorResponse(HTTP_STATUS.BAD_REQUEST, "Invalid model format");
 
   const { provider, model } = modelInfo;
+  if (provider === "codex" && model !== "transcribe") return errorResponse(400, "Use model cx/transcribe for Codex STT");
 
   // Per-key access control: checked before any credential lookup.
   const keyAccessDenied = await enforceKeyAccessResolved(await getKeyAccessContext(request), modelStr, provider, model);
@@ -72,45 +75,8 @@ export async function handleStt(request) {
 
   // noAuth providers
   if (!CREDENTIALED_PROVIDERS.has(provider)) {
-    // The circuit breaker is a provider-level control, and this path does
-    // not go through getProviderCredentials - so it never consulted the
-    // breaker, and its failures never tripped it. The credential lookup is
-    // where the breaker is consulted (canRequest), so it is used here as
-    // the gate. The credential itself is not used: this path needs none.
-    //
-    // `noCredentialRequired` says what it says: this provider needs no
-    // credential, so the lookup does not go looking for one. Without it the
-    // lookup looks for a connection, finds none - a no-auth provider never
-    // has one - and returns null. A null that means "no connection
-    // configured" cannot be told apart from a null that means "the circuit
-    // is open", so the path refused EVERY request to a local speech server
-    // that was never in trouble.
-    const gate = await getProviderCredentials(provider, null, model, { noCredentialRequired: true });
-    if (!gate) {
-      // The provider needs no credential, so there is none that could be
-      // missing: the only reason the lookup returns nothing is an open
-      // circuit. The refusal is a 404, like every other circuit refusal, so
-      // it counts as a request and not as a 5xx error.
-      return errorResponse(HTTP_STATUS.NOT_FOUND, `Provider temporarily unavailable: ${provider}`);
-    }
-
     const result = await handleSttCore({ provider, model, formData, sttConfig: AI_PROVIDERS[provider]?.sttConfig, transport: modelTransport });
-
-    if (result.success) {
-      // The lookup claimed the breaker's half-open probe, and only a
-      // SUCCESS resolves it.
-      await clearAccountError(gate.connectionId, gate, model);
-      return result.response;
-    }
-
-    // A no-auth provider has no account to lock, so the failure is
-    // recorded on the breaker directly. The fact travels with it: a core
-    // that failed before the call was made says so, and a core that got an
-    // answer from the provider says that instead. Leaving it to the default
-    // would report a client that forgot to attach a file as a provider that
-    // answered 400 — and a 400 on a half-open circuit resolves the probe as
-    // a success, which declares a provider that is still down healthy.
-    recordProviderFailure(provider, result.status, { upstreamContacted: result.upstreamContacted ?? true });
+    if (result.success) return result.response;
     return errorResponse(result.status || HTTP_STATUS.BAD_GATEWAY, result.error || "STT failed");
   }
 
@@ -120,7 +86,7 @@ export async function handleStt(request) {
   let lastStatus = null;
 
   while (true) {
-    const credentials = await getProviderCredentials(provider, excludeConnectionIds, model);
+    let credentials = await getProviderCredentials(provider, excludeConnectionIds, model);
 
     if (!credentials || credentials.allRateLimited) {
       if (credentials?.allRateLimited) {
@@ -134,23 +100,35 @@ export async function handleStt(request) {
 
     log.info("AUTH", `\x1b[32mUsing ${provider} account: ${credentials.connectionName}\x1b[0m`);
 
-    const result = await handleSttCore({ provider, model, formData, credentials, sttConfig: AI_PROVIDERS[provider]?.sttConfig, transport: modelTransport });
-
-    if (result.success) {
-      // The credential lookup claimed the circuit breaker's half-open probe
-      // (auth.js, canRequest()), and only a SUCCESS resolves it: the probe
-      // asked "does this provider work now?", the provider answered, so the
-      // probe succeeded. Without this, a provider that had recovered was
-      // blackholed for the whole reset window - fifteen minutes by default -
-      // for EVERY handler, not only this one.
-      await clearAccountError(credentials.connectionId, credentials, model);
-      return result.response;
+    let result;
+    try {
+      const isCodex = provider === "codex";
+      if (isCodex) credentials = await checkAndRefreshToken(provider, credentials);
+      const proxyOptions = isCodex
+        ? await resolveConnectionProxyConfig(credentials._connection?.providerSpecificData || credentials.providerSpecificData)
+        : undefined;
+      const args = { provider, model, formData, credentials, sttConfig: AI_PROVIDERS[provider]?.sttConfig, transport: modelTransport, signal: request.signal, proxyOptions };
+      result = await handleSttCore(args);
+      if (isCodex && result.status === 401 && credentials.refreshToken && !request.signal.aborted) {
+        const previous = credentials.accessToken;
+        credentials = await checkAndRefreshToken(provider, credentials, { force: true });
+        if (credentials.accessToken !== previous) result = await handleSttCore({ ...args, credentials });
+      }
+      if (result.success) {
+        if (isCodex) await clearAccountError(credentials.connectionId, credentials, model);
+        return result.response;
+      }
+    } catch {
+      return errorResponse(HTTP_STATUS.BAD_GATEWAY, "STT credential or transport failure");
     }
 
-    const { shouldFallback } = await markAccountUnavailable(
-      credentials.connectionId, result.status, result.error, provider, model,
-      { upstreamContacted: result.upstreamContacted ?? true },
-    );
+    if (request.signal.aborted) return errorResponse(504, "Transcription cancelled");
+    // Bad audio / unsupported parameters are client errors, not broken accounts.
+    if (provider === "codex" && [400, 413, 504].includes(result.status)) {
+      return result.response || errorResponse(result.status, result.error);
+    }
+
+    const { shouldFallback } = await markAccountUnavailable(credentials.connectionId, result.status, result.error, provider, model);
     if (shouldFallback) {
       excludeConnectionIds.add(credentials.connectionId);
       lastError = result.error;
