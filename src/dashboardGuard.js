@@ -58,7 +58,6 @@ const ALWAYS_PROTECTED = [
 // Require auth, but allow through if requireLogin is disabled
 const PROTECTED_API_PATHS = [
   "/api/settings",
-  "/api/keys",
   "/api/providers",
   "/api/provider-nodes",
   "/api/proxy-pools",
@@ -78,6 +77,7 @@ const PROTECTED_API_PATHS = [
 
 // Routes that spawn child processes or read host secrets — restrict to localhost.
 const LOCAL_ONLY_PATHS = [
+  "/api/keys",
   "/api/cli-tools/cowork-settings",
   "/api/cli-tools/antigravity-mitm",
   "/api/mcp/",
@@ -190,6 +190,7 @@ async function loadSettings() {
 
 async function isAuthenticated(request) {
   if (await hasValidToken(request)) return true;
+  if (!isLocalRequest(request)) return false;
   const settings = await loadSettings();
   if (settings && settings.requireLogin === false) return true;
   return false;
