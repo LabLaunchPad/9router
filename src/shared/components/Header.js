@@ -232,8 +232,11 @@ export default function Header({ onMenuClick, showMenuButton = true }) {
       <div className="flex items-center gap-3 lg:hidden shrink-0">
         {showMenuButton && (
           <button
+            type="button"
             onClick={onMenuClick}
-            className="text-text-main hover:text-primary transition-colors"
+            aria-label="Open navigation menu"
+            title="Open navigation menu"
+            className="text-text-main hover:text-primary transition-colors p-1 rounded-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
           >
             <span className="material-symbols-outlined">menu</span>
           </button>
@@ -359,8 +362,9 @@ function HeaderSearch() {
         <button
           type="button"
           onClick={() => setQuery("")}
-          className="absolute right-1 top-1/2 -translate-y-1/2 text-text-muted hover:text-text-main p-0.5 rounded"
+          className="absolute right-1 top-1/2 -translate-y-1/2 text-text-muted hover:text-text-main p-0.5 rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
           aria-label="Clear search"
+          title="Clear search"
         >
           <span className="material-symbols-outlined text-[16px]">close</span>
         </button>
