@@ -89,3 +89,57 @@ jobs:
 
       - name: 🏗️ Test Production Build
         run: npm run build
+
+  e2e-tests:
+    name: 🧪 E2E Tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: 📦 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 🔧 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: 📥 Install dependencies
+        run: npm install --legacy-peer-deps --no-audit --no-fund
+
+      - name: 📥 Install Playwright browsers
+        run: npx playwright install --with-deps
+
+      - name: 🏗️ Start application server
+        run: npm run dev &
+        env:
+          BASE_URL: http://localhost:20127
+
+      - name: ⏳ Wait for application readiness
+        run: |
+          for i in $(seq 1 30); do
+            if curl -s -o /dev/null -w "%{http_code}" http://localhost:20127/health; then
+              echo "Application is ready"
+              break
+            fi
+            echo "Waiting for application... ($i/30)"
+            sleep 2
+          done
+
+      - name: ▶️ Run Playwright E2E suite
+        run: npm run test:e2e
+        env:
+          BASE_URL: http://localhost:20127
+
+      - name: 📂 Upload test artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-test-results-${{ github.run_id }}
+          path: |
+            tests/e2e/.playwright/
+            tests/e2e/screenshots/
+            tests/e2e/traces/
