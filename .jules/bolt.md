@@ -1,0 +1,3 @@
+## 2025-05-20 - Memoization of DB Connections and Provider Nodes in `getUsageStats`
+**Learning:** In hot database/analytics queries like `getUsageStats`, repeated async module imports (`import("./connectionsRepo.js")`, `import("./nodesRepo.js")`, etc.) during aggregation inside daily rollup loops or repeatedly fetching reference entities without short-lived TTL in-memory caching causes measurable overhead in request latency during dashboard/metrics updates.
+**Action:** Use short-lived TTL in-memory caching or optimized reference map fetching for static/semi-static metadata (e.g. connections, node names) when building aggregations.
