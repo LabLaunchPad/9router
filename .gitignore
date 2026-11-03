@@ -121,3 +121,11 @@ debug.log
 .stryker-tmp/
 reports/
 .scratch/
+
+# Playwright E2E output. These are regenerated on every run — traces, error
+# contexts and the last-run marker — so they must never reach a commit. The
+# E2E workflow uploads them as build artifacts instead.
+/test-results/
+/playwright-report/
+/blob-report/
+/playwright/.cache/
