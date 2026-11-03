@@ -1,23 +1,18 @@
 // Verify 3-tier driver fallback: better-sqlite3 → node:sqlite → sql.js
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { makeTempDataDir, cleanupTempDataDir } from "../helpers/tempDb.js";
 
 let tempDir;
 const originalDataDir = process.env.DATA_DIR;
 
 beforeEach(() => {
-  tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "9router-chain-"));
-  process.env.DATA_DIR = tempDir;
+  tempDir = makeTempDataDir("9router-chain-");
   delete global._dbAdapter;
   vi.resetModules();
 });
 
-afterEach(() => {
-  try { global._dbAdapter?.instance?.close?.(); } catch {}
-  delete global._dbAdapter;
-  if (tempDir) fs.rmSync(tempDir, { recursive: true, force: true });
+afterEach(async () => {
+  await cleanupTempDataDir(tempDir);
   if (originalDataDir === undefined) delete process.env.DATA_DIR;
   else process.env.DATA_DIR = originalDataDir;
 });

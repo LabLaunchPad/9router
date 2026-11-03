@@ -20,9 +20,7 @@
 // timeout clamp ceilings, specific status codes, byte-exact WS URLs (only
 // wss:// + bidiGenerateContent + model-id substrings), exact frame JSON paths.
 import { describe, it, expect, afterEach, vi, beforeEach } from "vitest";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
+import { makeTempDataDir, cleanupTempDataDir } from "../helpers/tempDb.js";
 
 import { handleSttCore } from "open-sse/handlers/sttCore.js";
 import { PROVIDER_MODELS } from "open-sse/config/providerModels.js";
@@ -353,15 +351,12 @@ describe("Custom-model transport persistence via POST /api/models/custom", () =>
   beforeEach(() => {
     // paths.js freezes DATA_DIR at module load — re-evaluate the db chain per test
     vi.resetModules();
-    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "9router-gemini-live-"));
-    process.env.DATA_DIR = tempDir;
+    tempDir = makeTempDataDir("9router-gemini-live-");
     delete global._dbAdapter;
   });
 
-  afterEach(() => {
-    try { global._dbAdapter?.instance?.close?.(); } catch { /* already closed */ }
-    delete global._dbAdapter;
-    if (tempDir) fs.rmSync(tempDir, { recursive: true, force: true });
+  afterEach(async () => {
+    await cleanupTempDataDir(tempDir);
     if (originalDataDir === undefined) delete process.env.DATA_DIR;
     else process.env.DATA_DIR = originalDataDir;
   });

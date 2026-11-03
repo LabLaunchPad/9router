@@ -1,13 +1,10 @@
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { makeTempDataDir, cleanupTempDataDir } from "../helpers/tempDb.js";
 
 const originalDataDir = process.env.DATA_DIR;
 
 async function setupDb() {
-  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "9router-model-routing-"));
-  process.env.DATA_DIR = tempDir;
+  const tempDir = makeTempDataDir("9router-model-routing-");
   vi.resetModules();
 
   const { createProviderNode } = await import("@/models/index.js");
@@ -16,8 +13,10 @@ async function setupDb() {
   return {
     createProviderNode,
     getModelInfo,
-    cleanup() {
-      fs.rmSync(tempDir, { recursive: true, force: true });
+    // The adapter holds an open handle on tempDir/db/data.sqlite; it has to be
+    // closed before the directory can be removed on Windows.
+    async cleanup() {
+      await cleanupTempDataDir(tempDir);
     },
   };
 }
@@ -29,11 +28,11 @@ describe("model routing", () => {
     vi.clearAllMocks();
   });
 
-  afterEach(() => {
-    vi.resetModules();
+  afterEach(async () => {
     vi.clearAllMocks();
-    cleanup();
+    await cleanup();
     cleanup = () => {};
+    vi.resetModules();
     if (originalDataDir === undefined) delete process.env.DATA_DIR;
     else process.env.DATA_DIR = originalDataDir;
   });

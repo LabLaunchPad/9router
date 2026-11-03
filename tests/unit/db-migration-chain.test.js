@@ -1,25 +1,22 @@
 // Verify schema migration chain runs correctly across versions.
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { makeTempDataDir, cleanupTempDataDir } from "../helpers/tempDb.js";
 
 let tempDir;
 const originalDataDir = process.env.DATA_DIR;
 
 beforeEach(() => {
-  tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "9router-mig-"));
-  process.env.DATA_DIR = tempDir;
+  tempDir = makeTempDataDir("9router-mig-");
   // Reset global singleton so each test gets fresh adapter pointed at tempDir
   delete global._dbAdapter;
   vi.resetModules();
 });
 
-afterEach(() => {
+afterEach(async () => {
   // Close adapter to release file handles before rm
-  try { global._dbAdapter?.instance?.close?.(); } catch {}
-  delete global._dbAdapter;
-  if (tempDir) fs.rmSync(tempDir, { recursive: true, force: true });
+  await cleanupTempDataDir(tempDir);
   if (originalDataDir === undefined) delete process.env.DATA_DIR;
   else process.env.DATA_DIR = originalDataDir;
 });

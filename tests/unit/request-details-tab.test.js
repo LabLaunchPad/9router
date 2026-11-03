@@ -5,6 +5,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, it, expect, beforeAll, afterAll, vi } from "vitest";
+import { makeTempDataDir, cleanupTempDataDir } from "../helpers/tempDb.js";
 
 const originalDataDir = process.env.DATA_DIR;
 let tempDir;
@@ -17,8 +18,7 @@ async function saveDetail(detail) {
 }
 
 beforeAll(async () => {
-  tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "9router-details-tab-"));
-  process.env.DATA_DIR = tempDir;
+  tempDir = makeTempDataDir("9router-details-tab-");
   vi.resetModules();
   db = await import("@/lib/db/index.js");
   await db.initDb();
@@ -30,8 +30,10 @@ beforeAll(async () => {
   adapter = await getAdapter();
 });
 
-afterAll(() => {
-  if (tempDir) fs.rmSync(tempDir, { recursive: true, force: true });
+afterAll(async () => {
+  // The adapter still holds tempDir/db/data.sqlite open; close it before the
+  // directory is removed, otherwise Windows fails the unlink with EBUSY.
+  await cleanupTempDataDir(tempDir);
   if (originalDataDir === undefined) delete process.env.DATA_DIR;
   else process.env.DATA_DIR = originalDataDir;
 });

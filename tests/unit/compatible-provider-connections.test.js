@@ -1,13 +1,10 @@
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { makeTempDataDir, cleanupTempDataDir } from "../helpers/tempDb.js";
 
 const originalDataDir = process.env.DATA_DIR;
 
 async function setupTestContext(nodeData) {
-  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "9router-compatible-provider-"));
-  process.env.DATA_DIR = tempDir;
+  const tempDir = makeTempDataDir("9router-compatible-provider-");
   vi.resetModules();
   vi.doMock("next/server", () => ({
     NextResponse: {
@@ -32,8 +29,10 @@ async function setupTestContext(nodeData) {
     node,
     POST,
     getProviderConnections,
-    cleanup() {
-      fs.rmSync(tempDir, { recursive: true, force: true });
+    // Close the SQLite handle first: on Windows an open handle makes the
+    // temp-dir unlink fail with EBUSY after the assertions already passed.
+    async cleanup() {
+      await cleanupTempDataDir(tempDir);
     },
   };
 }
@@ -73,12 +72,12 @@ describe("compatible provider connections API", () => {
     vi.clearAllMocks();
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    await cleanup();
+    cleanup = () => {};
     vi.doUnmock("next/server");
     vi.resetModules();
     vi.clearAllMocks();
-    cleanup();
-    cleanup = () => {};
     if (originalDataDir === undefined) delete process.env.DATA_DIR;
     else process.env.DATA_DIR = originalDataDir;
   });

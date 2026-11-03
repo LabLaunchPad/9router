@@ -114,3 +114,38 @@ export function getAdapterSync() {
   if (!state.instance) throw new Error("[DB] adapter not initialized — await getAdapter() first");
   return state.instance;
 }
+
+/**
+ * Close the current adapter and reset the singleton.
+ *
+ * The adapter holds an open file handle on DATA_DIR/data.sqlite. Anything that
+ * deletes that directory — a test tearing down its temp dir, a caller resetting
+ * state after changing DATA_DIR — must close the handle first, or on Windows the
+ * unlink fails with EBUSY. Resetting instance/initPromise also means the next
+ * getAdapter() opens the *current* DATA_DIR rather than reusing the old handle.
+ *
+ * Reads globalThis._dbAdapter instead of the module-level `state` on purpose:
+ * vi.resetModules() (and Next.js hot reload) creates a new module instance while
+ * the singleton stays on global, so a closed module's `state` can be stale.
+ *
+ * @returns {Promise<void>}
+ */
+export async function closeAdapter() {
+  const live = globalThis._dbAdapter;
+  if (!live) return;
+
+  const pending = live.initPromise;
+  if (pending) {
+    // Let an in-flight init finish so its handle is the one we close.
+    try { await pending; } catch { /* init failed; nothing to close */ }
+  }
+
+  const instance = live.instance;
+  live.instance = null;
+  live.initPromise = null;
+  live.logged = false;
+
+  if (instance && typeof instance.close === "function") {
+    try { instance.close(); } catch { /* already closed */ }
+  }
+}

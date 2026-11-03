@@ -9,11 +9,9 @@
 // Telemetry carries values that can contain one: a model id or endpoint taken
 // straight from the request, raw bytes out of a tool result, a diff. The write
 // must survive and must keep the whole value. (#4917)
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { stripNullBytes } from "@/lib/db/helpers/nullBytes.js";
+import { makeTempDataDir, cleanupTempDataDir } from "../helpers/tempDb.js";
 
 // Built at runtime so the source file itself holds no literal NUL byte.
 const NUL = String.fromCharCode(0);
@@ -23,18 +21,15 @@ let tempDir;
 const originalDataDir = process.env.DATA_DIR;
 
 beforeEach(() => {
-  tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "9router-nul-"));
-  process.env.DATA_DIR = tempDir;
+  tempDir = makeTempDataDir("9router-nul-");
   delete global._dbAdapter;
   // driver.js captures the shared state object at module load, so the module
   // has to be re-imported for each test to get a fresh (open) database.
   vi.resetModules();
 });
 
-afterEach(() => {
-  try { global._dbAdapter?.instance?.close?.(); } catch {}
-  delete global._dbAdapter;
-  if (tempDir) fs.rmSync(tempDir, { recursive: true, force: true });
+afterEach(async () => {
+  await cleanupTempDataDir(tempDir);
   if (originalDataDir === undefined) delete process.env.DATA_DIR;
   else process.env.DATA_DIR = originalDataDir;
 });
